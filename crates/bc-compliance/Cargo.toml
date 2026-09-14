@@ -1,0 +1,19 @@
+[package]
+name = "bc-compliance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-model = { path = "../bc-model" }
+bc-yaml = { path = "../bc-yaml" }
+bc-pathjail = { path = "../bc-pathjail" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rstest = { workspace = true }

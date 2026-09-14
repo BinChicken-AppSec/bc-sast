@@ -1,0 +1,39 @@
+[package]
+name = "bc-stage-s4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-model = { path = "../bc-model" }
+bc-pipeline-core = { path = "../bc-pipeline-core" }
+bc-llm-client = { path = "../bc-llm-client" }
+bc-llm-agentic = { path = "../bc-llm-agentic" }
+bc-json-repair = { path = "../bc-json-repair" }
+bc-repo-analysis = { path = "../bc-repo-analysis" }
+bc-redact = { path = "../bc-redact" }
+bc-prompts = { path = "../bc-prompts" }
+bc-yaml = { path = "../bc-yaml" }
+bc-pathjail = { path = "../bc-pathjail" }
+regex = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt"] }
+tracing = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+# Tests only, and only to hold one number to one number: the confidence
+# floor QUALITY_BAR hands the model for an unverifiable route guard must
+# stay at or above `Step5Config::min_pre_confidence`, or S5 drops every
+# such finding before a verifier with file access can adjudicate it. Not a
+# cycle — s5 does not depend on s4. Mirrors bc-stage-s6's own dependency
+# on s5, which holds its LANGUAGE FACTS to `route_gates`.
+bc-stage-s5 = { path = "../bc-stage-s5" }

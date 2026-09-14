@@ -1,0 +1,27 @@
+[package]
+name = "bc-sandbox-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-llm-client = { path = "../bc-llm-client" }
+bc-pathjail = { path = "../bc-pathjail" }
+bc-redact = { path = "../bc-redact" }
+# For DEFAULT_EXCLUDE_DIRS/DEFAULT_EXCLUDE_EXTS only: the fact tools' scan
+# scope must be the production walk's scope, exactly as Python's
+# `validation/tools/_scope.py` imports s1_preprocess's own exclude sets
+# rather than restating them.
+bc-repo-analysis = { path = "../bc-repo-analysis" }
+serde_json = { workspace = true }
+regex = { workspace = true }
+# The ported `_SECRET_RX` needs negative lookahead, which `regex` refuses.
+fancy-regex = { workspace = true }
+glob = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

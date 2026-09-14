@@ -1,0 +1,258 @@
+name: CI
+
+# Runs on every PR and every push to main: format/lint/test/100%-coverage
+# gate, cargo-deny (advisories/bans/licenses/sources), and a build-only
+# (never pushed) container build to catch a broken Dockerfile early.
+# Weekly schedule re-runs cargo-deny against the *unchanged* lockfile so a
+# newly disclosed advisory against a dependency nobody touched still trips
+# the build (advisory disclosure lags publication).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # Monday 06:17 UTC, an arbitrary off-peak minute
+
+# Least privilege: no job here writes to the repository, and none uses a
+# secret, so a pull request from a fork runs every check with a read-only
+# token. Deliberately `pull_request`, never `pull_request_target`, which
+# would run a contributor's code with a writable token.
+permissions:
+  contents: read
+
+# A new push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test + 100% coverage gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (per rust-toolchain.toml)
+        run: rustup show
+
+      # `aws-lc-sys` (the resolved rustls crypto backend, see Dockerfile) needs
+      # cmake + a C/C++ compiler + libclang-dev (for `bindgen`) to build from
+      # source. `clang`/`perl` ship on GitHub-hosted Ubuntu runners already,
+      # but `cmake` and, more importantly, the `-dev` libclang package are not
+      # reliably present. Install explicitly rather than assume the image.
+      - name: Install native build dependencies (aws-lc-sys)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake libclang-dev
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2.87.7
+        with:
+          tool: cargo-llvm-cov
+
+      - name: cargo llvm-cov (100% lines/functions gate, everything but bc-cli)
+        # Every crate excluded below (and the one file-level exclusion,
+        # `bc-interactive/src/blocking_io.rs`) has its full rationale
+        # (tool artifact vs. genuinely-unreachable defensive branch,
+        # verification method, and observed numbers) in
+        # docs/coverage-exceptions.md. Keep that doc in sync with this
+        # file's own thresholds when either changes.
+        run: |
+          cargo llvm-cov --workspace --exclude bc-cli --exclude bc-checkpoint --exclude bc-callgraph --exclude bc-repo-analysis --exclude bc-stage-s0 --exclude bc-stage-s1 --exclude bc-validation-scoring --exclude bc-thirdparty-api --exclude bc-diffcapture --exclude bc-sandbox-tools --exclude bc-orchestrator --exclude bc-parity-tests \
+            --ignore-filename-regex 'bc-interactive/src/blocking_io\.rs' \
+            --fail-under-lines 100 --fail-under-functions 100 \
+            --lcov --output-path lcov-workspace.info
+
+      - name: cargo llvm-cov (bc-cli, ~99.7% functions, ~99.4% lines)
+        # Full rationale: docs/coverage-exceptions.md#bc-cli.
+        run: |
+          cargo llvm-cov -p bc-cli \
+            --ignore-filename-regex 'bc-interactive/src/blocking_io\.rs' \
+            --fail-under-lines 99.37 --fail-under-functions 99.5 \
+            --lcov --output-path lcov-bc-cli.info
+
+      - name: cargo llvm-cov (bc-checkpoint, 100% functions, ~100% lines)
+        # Full rationale: docs/coverage-exceptions.md#bc-checkpoint.
+        run: |
+          cargo llvm-cov -p bc-checkpoint \
+            --fail-under-lines 99.5 --fail-under-functions 100 \
+            --lcov --output-path lcov-bc-checkpoint.info
+
+      - name: cargo llvm-cov (bc-callgraph, ~98.8% functions, ~98.75% lines)
+        # Full rationale: docs/coverage-exceptions.md#bc-callgraph.
+        run: |
+          cargo llvm-cov -p bc-callgraph \
+            --fail-under-lines 98.5 --fail-under-functions 98.5 \
+            --lcov --output-path lcov-bc-callgraph.info
+
+      - name: cargo llvm-cov (bc-repo-analysis, 100% functions, ~99.8% lines)
+        # Full rationale: docs/coverage-exceptions.md#bc-repo-analysis.
+        run: |
+          cargo llvm-cov -p bc-repo-analysis \
+            --fail-under-lines 99.5 --fail-under-functions 100 \
+            --lcov --output-path lcov-bc-repo-analysis.info
+
+      - name: cargo llvm-cov (bc-validation-scoring, 100% functions, ~99.7% lines)
+        # Full rationale: docs/coverage-exceptions.md#bc-validation-scoring.
+        run: |
+          cargo llvm-cov -p bc-validation-scoring \
+            --fail-under-lines 99.5 --fail-under-functions 100 \
+            --lcov --output-path lcov-bc-validation-scoring.info
+
+      - name: cargo llvm-cov (bc-stage-s0, 100% functions, ~99.7% lines)
+        # Full rationale: docs/coverage-exceptions.md#bc-stage-s0.
+        run: |
+          cargo llvm-cov -p bc-stage-s0 \
+            --fail-under-lines 99.5 --fail-under-functions 100 \
+            --lcov --output-path lcov-bc-stage-s0.info
+
+      - name: cargo llvm-cov (bc-stage-s1, 100% functions, ~100% lines)
+        # Full rationale: docs/coverage-exceptions.md#bc-stage-s1.
+        run: |
+          cargo llvm-cov -p bc-stage-s1 \
+            --fail-under-lines 99.5 --fail-under-functions 98 \
+            --lcov --output-path lcov-bc-stage-s1.info
+
+      - name: cargo llvm-cov (bc-thirdparty-api, ~99.5% functions, ~99.8% lines)
+        # Full rationale: docs/coverage-exceptions.md#bc-thirdparty-api.
+        run: |
+          cargo llvm-cov -p bc-thirdparty-api \
+            --fail-under-lines 99.5 --fail-under-functions 99.0 \
+            --lcov --output-path lcov-bc-thirdparty-api.info
+
+      - name: cargo llvm-cov (bc-diffcapture, ~99.3% functions, ~99.85% lines)
+        # Full rationale: docs/coverage-exceptions.md#bc-diffcapture.
+        run: |
+          cargo llvm-cov -p bc-diffcapture \
+            --fail-under-lines 99.7 --fail-under-functions 99.0 \
+            --lcov --output-path lcov-bc-diffcapture.info
+
+      - name: cargo llvm-cov (bc-sandbox-tools, 100% functions, ~99.94% lines)
+        # Full rationale: docs/coverage-exceptions.md#bc-sandbox-tools.
+        run: |
+          cargo llvm-cov -p bc-sandbox-tools \
+            --fail-under-lines 99.8 --fail-under-functions 100 \
+            --lcov --output-path lcov-bc-sandbox-tools.info
+
+      - name: cargo llvm-cov (bc-orchestrator, ~99.6% functions, ~99.97% lines)
+        # Full rationale: docs/coverage-exceptions.md#bc-orchestrator.
+        run: |
+          cargo llvm-cov -p bc-orchestrator \
+            --fail-under-lines 99.9 --fail-under-functions 99.4 \
+            --lcov --output-path lcov-bc-orchestrator.info
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lcov.info
+          path: |
+            lcov-workspace.info
+            lcov-bc-cli.info
+            lcov-bc-checkpoint.info
+            lcov-bc-callgraph.info
+            lcov-bc-repo-analysis.info
+            lcov-bc-validation-scoring.info
+            lcov-bc-stage-s0.info
+            lcov-bc-stage-s1.info
+            lcov-bc-thirdparty-api.info
+            lcov-bc-diffcapture.info
+            lcov-bc-sandbox-tools.info
+            lcov-bc-orchestrator.info
+          retention-days: 14
+
+  parity:
+    name: parity harness (bc-parity-tests vs real Python vvaharness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Read-only oracle source (never modified, see docs/parity-harness.md)
+      # for bc-parity-tests, checked out into a workspace subdirectory
+      # rather than the sibling-checkout layout parity/README.md describes
+      # for local dev, since CI has no reason to match a local disk
+      # convention. Pinned to a specific commit, not `main`: this repo has
+      # no control over what that upstream, unrelated project pushes next,
+      # and an upstream-only change would otherwise fail (or silently
+      # start skipping) THIS repo's CI for a reason having nothing to do
+      # with any change actually made here. Bump deliberately. Re-running
+      # the harness against a newer vvaharness commit is itself how a real
+      # parity drift would be caught, so don't bump reflexively.
+      - name: Checkout vvaharness (pinned)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: visa/visa-vulnerability-agentic-harness
+          ref: 3d972f679d8f5e3838b394edee0b5ea9c626b0fb
+          path: vvaharness
+
+      - name: Install Rust toolchain (per rust-toolchain.toml)
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build the parity venv
+        run: ./parity/setup.sh python3
+
+      - name: cargo test -p bc-parity-tests
+        # `--nocapture` so a SKIPPED note (venv/repo not resolved) is
+        # actually visible in the log rather than swallowed by cargo
+        # test's default per-passing-test output capture. This job just
+        # set both up explicitly, so a real run must never skip; the grep
+        # below turns a silent no-op pass into a hard failure instead, the
+        # same distinction docs/parity-harness.md tells a human to check
+        # by hand ("grep its output for SKIPPED").
+        env:
+          BC_PARITY_PYTHON: ${{ github.workspace }}/parity/.venv/bin/python3
+          BC_PARITY_REPO: ${{ github.workspace }}/vvaharness
+        run: |
+          cargo test -p bc-parity-tests -- --nocapture 2>&1 | tee parity-output.log
+          if grep -q "SKIPPED:" parity-output.log; then
+            echo "::error::parity tests were skipped despite this job setting up the venv/repo explicitly. See the SKIPPED note above for which one failed to resolve"
+            exit 1
+          fi
+
+  deny:
+    name: cargo-deny (advisories, bans, licenses, sources)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories bans licenses sources
+
+  container:
+    name: build container image (validation only, never pushed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build (no push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          tags: bc-sast:ci-validation
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

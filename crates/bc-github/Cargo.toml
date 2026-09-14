@@ -1,0 +1,22 @@
+[package]
+name = "bc-github"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-model = { path = "../bc-model" }
+bc-redact = { path = "../bc-redact" }
+bc-sarif = { path = "../bc-sarif" }
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+wiremock = { workspace = true }

@@ -1,0 +1,38 @@
+[package]
+name = "bc-stage-s10"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-model = { path = "../bc-model" }
+bc-llm-client = { path = "../bc-llm-client" }
+bc-llm-agentic = { path = "../bc-llm-agentic" }
+bc-sandbox-tools = { path = "../bc-sandbox-tools" }
+bc-policy-gate = { path = "../bc-policy-gate" }
+bc-diffcapture = { path = "../bc-diffcapture" }
+bc-json-repair = { path = "../bc-json-repair" }
+bc-sarif = { path = "../bc-sarif" }
+bc-report-md = { path = "../bc-report-md" }
+bc-checkpoint = { path = "../bc-checkpoint" }
+bc-pathjail = { path = "../bc-pathjail" }
+bc-repo-analysis = { path = "../bc-repo-analysis" }
+# Only for scrubbing the excerpt of an unparseable agent response that
+# goes into a verdict summary — see `unparseable_excerpt`.
+bc-redact = { path = "../bc-redact" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha1 = { workspace = true }
+# `process`/`time` only: the optional `verify_command` gate spawns
+# `sh -c <operator's command>` under a wall-clock timeout.
+tokio = { workspace = true, features = ["process", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+bc-config = { path = "../bc-config" }

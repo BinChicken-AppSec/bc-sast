@@ -1,0 +1,418 @@
+# OWASP ASVS v5.0.0 built-in compliance preset.
+#
+# Maps this tool's own detected-vulnerability CWEs (the complete set
+# `bc-cwe` recognizes by name, crates/bc-cwe/src/lib.rs::lookup_name) to
+# OWASP Application Security Verification Standard v5.0.0 (May 2025)
+# requirement IDs. This is a DIFFERENT document from
+# docs/compliance/CONTROL_MAPPING.md, which maps this TOOL's own security
+# posture to external standards, not detected findings in a scanned repo
+# — cited here only for its citation-rigor bar (primary sources, explicit
+# gaps, never a fabricated ID), which this file follows.
+#
+# Primary source: github.com/OWASP/ASVS, v5.0.0 tag, 5.0/en/*.md — fetched
+# and grepped directly against the raw chapter markdown (not paraphrased
+# from training-data memory), verified 2026-08-27. IMPORTANT: v5.0.0
+# substantially renumbered every requirement versus ASVS 4.x — there is
+# no dedicated "Architecture" chapter any more (V1 is now "Encoding and
+# Sanitization"; V15 "Secure Coding and Architecture" is the closest
+# analog for dangerous-functionality guidance). Chapters consulted: V1
+# Encoding & Sanitization, V2 Validation & Business Logic, V3 Web
+# Frontend Security, V4 API & Web Service, V5 File Handling, V6
+# Authentication, V7 Session Management, V8 Authorization, V9
+# Self-contained Tokens, V11 Cryptography, V12 Secure Communication, V13
+# Configuration, V14 Data Protection, V15 Secure Coding & Architecture,
+# V16 Security Logging & Error Handling. V10 (OAuth/OIDC) and V17
+# (WebRTC) were checked for scope and confirmed to contain no additional
+# CWEs from the input list.
+#
+# Re-verify whenever ASVS publishes a new version — v5.0.0's own
+# renumbering is exactly the kind of change that silently invalidates a
+# stale crosswalk if not re-checked.
+#
+# CWEs with NO direct ASVS v5.0.0 match, deliberately excluded below
+# rather than force-fit into a nearby bucket (a wrong control ID is worse
+# than none):
+#   - CWE-276 (Incorrect Default Permissions): OS/filesystem
+#     permission-bit issue; ASVS is scoped to application/API behavior,
+#     not POSIX permission bits.
+#   - CWE-426 (Untrusted Search Path): DLL/library search-path hijacking
+#     (native-binary/OS loader concern) — distinct from V5.3.2's
+#     data-file-path jailing, which is about untrusted filenames, not the
+#     dynamic linker's module search order.
+#   - CWE-476 (NULL Pointer Dereference): a crash/reliability bug, not an
+#     appsec control ASVS addresses (V1.4's memory-safety items cover
+#     overflow/UAF/integer-overflow but not null-deref specifically).
+#   - CWE-732 (Incorrect Permission Assignment for Critical Resource):
+#     OS/filesystem/cloud-resource ACL misconfiguration — CSPM/IaC
+#     territory, outside ASVS's appsec scope.
+#
+# A few mappings below are flagged in-line as general/imperfect fits
+# rather than exact matches (matching CONTROL_MAPPING.md's own practice
+# of citing a real but broad requirement when no narrower one exists):
+# CWE-269 -> V13.2.2 (that item is specifically about backend-service
+# least privilege, not general code-level privilege drop/escalation);
+# CWE-306 -> V6.3.3/V7.5.3 (both operate at whole-app/session-sensitivity
+# level, not the classic "one specific endpoint lacks auth" case); CWE-668
+# -> V8.4.1 (a broad parent CWE, mapped to ASVS's multi-tenant item
+# specifically); CWE-284 -> V8.2.1 (the parent of CWE-285/862/863,
+# converging on the same function-level-access-control item as its
+# children). Kept rather than omitted since each is a real, cited
+# requirement — just a broader fit than the "exact" rows.
+name: "OWASP ASVS v5.0.0"
+guidance: |
+  Findings are being evaluated for relevance to the OWASP Application
+  Security Verification Standard (ASVS) v5.0.0. Prioritize confirming
+  injection (SQL/OS command/LDAP/XPath/code-eval), SSRF, path traversal,
+  deserialization of untrusted data, broken access control/authorization
+  (including IDOR/BOLA), authentication and session-management weaknesses,
+  and cryptographic control failures — these map directly to ASVS's most
+  frequently cited requirements. When a finding's CWE or vulnerability
+  class doesn't clearly map to a specific ASVS requirement, still report
+  it; ASVS relevance is a prioritization signal, not a completeness gate.
+scope_mode: annotate
+requirements:
+  # V1 Encoding and Sanitization
+  - id: "V1.1.2"
+    title: "Output encoding/escaping as the final step before the interpreter"
+    cwes: ["CWE-74"]
+    vuln_classes: []
+  - id: "V1.2.1"
+    title: "Context-relevant output encoding for HTTP/HTML/XML responses"
+    cwes: ["CWE-79"]
+    vuln_classes: []
+  - id: "V1.2.4"
+    title: "Parameterized queries/ORMs for SQL, HQL, NoSQL, Cypher"
+    cwes: ["CWE-89"]
+    vuln_classes: []
+  - id: "V1.2.5"
+    title: "Protect against OS command injection; parameterized OS calls"
+    cwes: ["CWE-77", "CWE-78"]
+    vuln_classes: ["injection"]
+  - id: "V1.2.6"
+    title: "Protect against LDAP injection"
+    cwes: ["CWE-90"]
+    vuln_classes: []
+  - id: "V1.2.7"
+    title: "Protect against XPath injection via parameterization"
+    cwes: ["CWE-643"]
+    vuln_classes: []
+  - id: "V1.2.10"
+    title: "CSV/Formula Injection escaping per RFC 4180"
+    cwes: ["CWE-1236"]
+    vuln_classes: []
+  - id: "V1.3.2"
+    title: "Avoid eval()/dynamic code execution"
+    cwes: ["CWE-94", "CWE-95"]
+    vuln_classes: []
+  - id: "V1.3.6"
+    title: "SSRF protection via allowlist of protocol/domain/path/port"
+    cwes: ["CWE-918"]
+    vuln_classes: []
+  - id: "V1.3.10"
+    title: "Sanitize format strings before processing"
+    cwes: ["CWE-134"]
+    vuln_classes: ["format-string"]
+  - id: "V1.3.12"
+    title: "Regexes free of exponential backtracking (ReDoS)"
+    cwes: ["CWE-1333"]
+    vuln_classes: []
+  - id: "V1.4.1"
+    title: "Memory-safe string/copy/pointer handling to prevent buffer overflows"
+    cwes: ["CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125", "CWE-787"]
+    vuln_classes: ["heap-overflow", "stack-overflow"]
+  - id: "V1.4.2"
+    title: "Sign/range/input validation to prevent integer overflow"
+    cwes: ["CWE-190"]
+    vuln_classes: ["integer-overflow"]
+  - id: "V1.4.3"
+    title: "Release freed memory; null dangling pointers to prevent UAF"
+    cwes: ["CWE-416"]
+    vuln_classes: ["use-after-free"]
+  - id: "V1.5.1"
+    title: "Restrictive XML parser config; external entity resolution disabled"
+    cwes: ["CWE-611"]
+    vuln_classes: []
+  - id: "V1.5.2"
+    title: "Safe deserialization: allowlist of object types"
+    cwes: ["CWE-502"]
+    vuln_classes: ["unsafe-deserialization"]
+  - id: "V1.5.3"
+    title: "Consistent parser behavior across JSON/XML/URL parsers"
+    cwes: ["CWE-918"]
+    vuln_classes: []
+
+  # V2 Validation and Business Logic
+  - id: "V2.2.1"
+    title: "Input validated against allowlist/expected structure and logical limits"
+    cwes: ["CWE-20"]
+    vuln_classes: []
+  - id: "V2.3.1"
+    title: "Business logic flows processed only in expected step order"
+    cwes: ["CWE-841"]
+    vuln_classes: []
+  - id: "V2.3.2"
+    title: "Business logic limits implemented per documentation"
+    cwes: ["CWE-840"]
+    vuln_classes: ["logic-flaw"]
+  - id: "V2.4.1"
+    title: "Anti-automation controls against quota exhaustion, rate-limit breach, DoS"
+    cwes: ["CWE-400", "CWE-770"]
+    vuln_classes: []
+
+  # V3 Web Frontend Security
+  - id: "V3.2.2"
+    title: "Safe DOM rendering functions to prevent client-side script execution"
+    cwes: ["CWE-79"]
+    vuln_classes: []
+  - id: "V3.4.6"
+    title: "CSP frame-ancestors directive; disallow embedding by default"
+    cwes: ["CWE-1021"]
+    vuln_classes: []
+  - id: "V3.5.1"
+    title: "Anti-forgery tokens to validate request origin"
+    cwes: ["CWE-352"]
+    vuln_classes: []
+  - id: "V3.6.1"
+    title: "Subresource Integrity required for externally-hosted JS/CSS/fonts"
+    cwes: ["CWE-829"]
+    vuln_classes: []
+  - id: "V3.7.2"
+    title: "Auto-redirects only to allowlisted destinations"
+    cwes: ["CWE-601"]
+    vuln_classes: []
+
+  # V4 API and Web Service
+  - id: "V4.2.1"
+    title: "HTTP message boundaries determined per spec, to prevent request smuggling"
+    cwes: ["CWE-444"]
+    vuln_classes: []
+
+  # V5 File Handling
+  - id: "V5.2.2"
+    title: "File extension/content validated against declared type"
+    cwes: ["CWE-434"]
+    vuln_classes: []
+  - id: "V5.3.1"
+    title: "Uploaded/generated files in public folders not executed as server-side code"
+    cwes: ["CWE-434"]
+    vuln_classes: []
+  - id: "V5.3.2"
+    title: "File paths use internally-generated/trusted data, not user-submitted filenames"
+    cwes: ["CWE-22", "CWE-73"]
+    vuln_classes: []
+
+  # V6 Authentication
+  - id: "V6.3.3"
+    title: "MFA or combination of single factors required for access"
+    cwes: ["CWE-306", "CWE-1390"]
+    vuln_classes: []
+  - id: "V6.3.4"
+    title: "Consistent auth-strength enforcement across multiple auth pathways"
+    cwes: ["CWE-287"]
+    vuln_classes: []
+  - id: "V6.4.2"
+    title: "No password hints or knowledge-based secret questions"
+    cwes: ["CWE-640"]
+    vuln_classes: []
+  - id: "V6.4.3"
+    title: "Secure forgot-password process that doesn't bypass MFA"
+    cwes: ["CWE-640"]
+    vuln_classes: []
+  - id: "V6.5.1"
+    title: "Lookup secrets/OOB codes/TOTPs usable only once"
+    cwes: ["CWE-294"]
+    vuln_classes: []
+  - id: "V6.6.2"
+    title: "OOB codes bound to the original auth request, not reusable"
+    cwes: ["CWE-294"]
+    vuln_classes: []
+  - id: "V6.8.2"
+    title: "Digital signatures on auth assertions (JWT/SAML) always validated"
+    cwes: ["CWE-347"]
+    vuln_classes: []
+
+  # V7 Session Management
+  - id: "V7.2.4"
+    title: "New session token generated on authentication; old one terminated"
+    cwes: ["CWE-384"]
+    vuln_classes: []
+  - id: "V7.5.3"
+    title: "Re-authentication required before highly sensitive operations"
+    cwes: ["CWE-306"]
+    vuln_classes: []
+
+  # V8 Authorization
+  - id: "V8.2.1"
+    title: "Function-level access restricted to consumers with explicit permissions"
+    cwes: ["CWE-284", "CWE-285", "CWE-862", "CWE-863"]
+    vuln_classes: []
+  - id: "V8.2.2"
+    title: "Data-specific access restricted per data item (mitigates IDOR/BOLA)"
+    cwes: ["CWE-639"]
+    vuln_classes: []
+  - id: "V8.4.1"
+    title: "Multi-tenant cross-tenant access controls"
+    cwes: ["CWE-668"]
+    vuln_classes: []
+
+  # V9 Self-contained Tokens
+  - id: "V9.1.1"
+    title: "Self-contained tokens validated via digital signature/MAC before use"
+    cwes: ["CWE-347", "CWE-345"]
+    vuln_classes: []
+
+  # V11 Cryptography
+  - id: "V11.2.3"
+    title: "All cryptographic primitives use minimum 128-bit security"
+    cwes: ["CWE-326"]
+    vuln_classes: []
+  - id: "V11.3.1"
+    title: "No insecure block modes (ECB) or weak padding (PKCS#1 v1.5)"
+    cwes: ["CWE-327"]
+    vuln_classes: []
+  - id: "V11.3.2"
+    title: "Only approved ciphers/modes (e.g. AES-GCM)"
+    cwes: ["CWE-327"]
+    vuln_classes: []
+  - id: "V11.4.1"
+    title: "Only approved hash functions; MD5 disallowed cryptographically"
+    cwes: ["CWE-327"]
+    vuln_classes: []
+  - id: "V11.4.2"
+    title: "Passwords stored via an approved, computationally-intensive KDF"
+    cwes: ["CWE-522"]
+    vuln_classes: []
+  - id: "V11.5.1"
+    title: "Non-guessable random values via CSPRNG, >=128 bits entropy"
+    cwes: ["CWE-330"]
+    vuln_classes: []
+  - id: "V11.6.1"
+    title: "Only approved algorithms for key generation and signature verification"
+    cwes: ["CWE-345"]
+    vuln_classes: []
+
+  # V12 Secure Communication
+  - id: "V12.1.3"
+    title: "mTLS client certs validated as trusted before use"
+    cwes: ["CWE-295"]
+    vuln_classes: []
+  - id: "V12.2.1"
+    title: "TLS for all client-to-external-service connectivity, no cleartext fallback"
+    cwes: ["CWE-319"]
+    vuln_classes: []
+  - id: "V12.3.1"
+    title: "Encrypted protocol for all inbound/outbound connections"
+    cwes: ["CWE-319"]
+    vuln_classes: []
+  - id: "V12.3.2"
+    title: "TLS clients validate server certificates before communicating"
+    cwes: ["CWE-295"]
+    vuln_classes: []
+
+  # V13 Configuration
+  - id: "V13.1.2"
+    title: "Documented max concurrent-connection/connection-pool limits"
+    cwes: ["CWE-770"]
+    vuln_classes: []
+  - id: "V13.2.2"
+    title: "Backend-to-backend communication uses least-necessary-privilege accounts"
+    cwes: ["CWE-269"]
+    vuln_classes: []
+  - id: "V13.2.4"
+    title: "Allowlist defines external resources/systems the application may contact"
+    cwes: ["CWE-923"]
+    vuln_classes: []
+  - id: "V13.2.5"
+    title: "Web/app server configured with an outbound allowlist"
+    cwes: ["CWE-923"]
+    vuln_classes: []
+  - id: "V13.3.1"
+    title: "Secrets management solution; secrets not in source or build artifacts"
+    cwes: ["CWE-798"]
+    vuln_classes: []
+  - id: "V13.4.1"
+    title: ".git/.svn metadata inaccessible"
+    cwes: ["CWE-552"]
+    vuln_classes: []
+  - id: "V13.4.2"
+    title: "Debug modes disabled in production; secure defaults"
+    cwes: ["CWE-489", "CWE-1188"]
+    vuln_classes: []
+  - id: "V13.4.3"
+    title: "Web servers don't expose directory listings"
+    cwes: ["CWE-552"]
+    vuln_classes: []
+  - id: "V13.4.5"
+    title: "Internal API docs/monitoring endpoints not unintentionally exposed"
+    cwes: ["CWE-552"]
+    vuln_classes: []
+
+  # V14 Data Protection
+  - id: "V14.2.4"
+    title: "Encryption/integrity/retention/access controls per documented data sensitivity"
+    cwes: ["CWE-311", "CWE-312"]
+    vuln_classes: []
+  - id: "V14.2.6"
+    title: "Only minimum required sensitive data returned"
+    cwes: ["CWE-200"]
+    vuln_classes: ["info-leak"]
+
+  # V15 Secure Coding and Architecture
+  - id: "V15.1.1"
+    title: "Documented risk-based remediation timeframes for vulnerable 3rd-party components"
+    cwes: ["CWE-1104"]
+    vuln_classes: []
+  - id: "V15.1.2"
+    title: "SBOM/inventory of third-party libraries, sourced from trusted repos"
+    cwes: ["CWE-1104"]
+    vuln_classes: []
+  - id: "V15.1.4"
+    title: "Documentation and sandboxing/isolation for dangerous functionality"
+    cwes: ["CWE-502"]
+    vuln_classes: []
+  - id: "V15.1.5"
+    title: "Additional protections for risky components (deserialization named explicitly)"
+    cwes: ["CWE-502"]
+    vuln_classes: []
+  - id: "V15.2.2"
+    title: "Defenses against availability loss from resource-demanding functionality"
+    cwes: ["CWE-400", "CWE-770"]
+    vuln_classes: []
+  - id: "V15.2.4"
+    title: "Third-party components sourced from expected repo, no dependency confusion"
+    cwes: ["CWE-829"]
+    vuln_classes: []
+  - id: "V15.2.5"
+    title: "Encapsulation/isolation for dangerous functionality"
+    cwes: ["CWE-502"]
+    vuln_classes: []
+  - id: "V15.3.3"
+    title: "Countermeasures against mass assignment"
+    cwes: ["CWE-915"]
+    vuln_classes: []
+  - id: "V15.3.5"
+    title: "Explicit type checking and strict equality, to avoid type confusion"
+    cwes: ["CWE-843"]
+    vuln_classes: ["type-confusion"]
+  - id: "V15.4.1"
+    title: "Thread-safe access to shared multi-threaded objects, to avoid race conditions"
+    cwes: ["CWE-362"]
+    vuln_classes: ["race-condition"]
+  - id: "V15.4.2"
+    title: "Atomic check-then-act to prevent TOCTOU race conditions"
+    cwes: ["CWE-367"]
+    vuln_classes: []
+
+  # V16 Security Logging and Error Handling
+  - id: "V16.2.5"
+    title: "Logging enforced per data protection level; credentials/payment masked"
+    cwes: ["CWE-532"]
+    vuln_classes: []
+  - id: "V16.5.1"
+    title: "Generic error messages; no stack traces/queries/secrets exposed on error"
+    cwes: ["CWE-209", "CWE-200"]
+    vuln_classes: []
+  - id: "V16.5.3"
+    title: "Application fails gracefully/securely on exception, no fail-open"
+    cwes: ["CWE-693"]
+    vuln_classes: []

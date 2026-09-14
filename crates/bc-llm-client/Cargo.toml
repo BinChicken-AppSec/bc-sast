@@ -1,0 +1,14 @@
+[package]
+name = "bc-llm-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-redact = { path = "../bc-redact" }
+serde_json = { workspace = true }
+async-trait = { workspace = true }

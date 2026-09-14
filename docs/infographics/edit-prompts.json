@@ -1,0 +1,18 @@
+[
+  {
+    "file": "01-scan-options",
+    "prompt": "Edit this executive infographic. Preserve ALL layout, colors, icons, title, other wording and resolution exactly. Correct ONLY the subtitle in the middle PR DIFF SCAN card: it must read exactly \"Review changed code in context\" with no apostrophe or stray mark after changed. Do not alter anything else."
+  },
+  {
+    "file": "05-remediation-and-testing",
+    "prompt": "Edit this executive infographic. Preserve title, subtitle, six cards, icons, numbered stage headings, output chips, colors, and the execution-authorization footer exactly. Remove ALL the extra explanatory body paragraphs below the thin horizontal divider within each of the six cards. Keep the cards clean and use the freed space as negative space or shorten the six cards slightly for balance. In particular remove the text \"Find and run the target application's existing tests.\" Do NOT add any replacement prose. The six stage headings alone must explain the workflow. No other wording changes."
+  },
+  {
+    "file": "01-scan-options",
+    "prompt": "Edit this slide. Replace the ENTIRE subtitle sentence beneath \"PR DIFF SCAN\" with exactly \"Assess code changes in context\". Erase the old sentence entirely first. This is the only change; preserve every other word, panel, color, icon and layout. Ensure clean typography with no apostrophes in this new sentence."
+  },
+  {
+    "file": "02-full-scan",
+    "prompt": "Edit this infographic with exactly one localized icon change: in the center upper card labeled \"Discover vulnerabilities\", replace the small red inner circle inside the white magnifying glass lens with a recognizable red software bug icon, a simple beetle silhouette or outline with six short legs and antennae. The bug should appear under the magnifying glass, centered inside its lens. Preserve the white lens rim and handle, all text verbatim, every other icon, layout, charcoal background, red and white palette, and original dimensions. Do not add any text or change other panels."
+  }
+]

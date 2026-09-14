@@ -1,0 +1,15 @@
+[package]
+name = "bc-yaml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }

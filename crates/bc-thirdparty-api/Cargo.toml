@@ -1,0 +1,35 @@
+[package]
+name = "bc-thirdparty-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-model = { path = "../bc-model" }
+bc-thirdparty = { path = "../bc-thirdparty" }
+reqwest = { workspace = true, features = ["json", "query", "form"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Real (not dev-only) dependencies: TokenCache (oauth2.rs) uses
+# tokio::sync::Mutex and the shared retry helper (retry.rs) uses
+# tokio::time::sleep, both in production code, not just in #[tokio::test]
+# bodies.
+tokio = { workspace = true, features = ["sync", "time"] }
+# Chronological (not lexical) comparison of vendor timestamps when picking
+# "the latest" scan/report — Sonatype's `evaluationDate` and Checkmarx's
+# `createdAt` are both RFC 3339 WITH a UTC offset, so a plain string compare
+# orders `...T00:00:00+02:00` before an actually-earlier `...T23:00:00Z`.
+time = { workspace = true, features = ["parsing"] }
+
+[dev-dependencies]
+# `test-util` (not part of `full`) gives `#[tokio::test(start_paused = true)]`,
+# which lets retry.rs's exponential-backoff path be tested without the test
+# suite actually sleeping for it.
+tokio = { workspace = true, features = ["full", "test-util"] }
+wiremock = { workspace = true }
+rstest = { workspace = true }

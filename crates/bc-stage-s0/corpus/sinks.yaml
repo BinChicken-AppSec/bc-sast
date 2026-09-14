@@ -1,0 +1,1358 @@
+# S0 starter sink corpus — bundled default for `step0.enabled: true` when
+# no custom `sinks_yaml` is configured. Not a port: the Python original's
+# real `generic_pack.py`-produced corpus was never vendored anywhere in
+# this repo, so this is hand-authored from scratch, not transcribed.
+#
+# Scope, deliberately bounded ("starter-sized", not exhaustive):
+#   - Covers all 11 keys in `bc_callgraph::families::VVAH_LANGUAGES`:
+#     the six with full extractors (python/java/javascript/typescript/
+#     go/csharp) and the five on the lite path (php/ruby/kotlin/rust/
+#     c-cpp, the last spelled `c` and `cpp` in a rule's `languages`
+#     list). Java's rules also claim `kotlin`, since Kotlin calls the
+#     same JVM APIs.
+#   - Rules use four call shapes, all of which `bc_callgraph::rules`
+#     parses and `bc_callgraph::scan::match_call` matches:
+#       * "module_attr" — `<module>.<function>(...)`, the bulk of the file
+#       * "qualified" — `codeql_pkg`/`codeql_class`/`$METHOD` metadata
+#         (the two rules explicitly marked `codeql`), proven correct by
+#         `load_rulepacks_parses_a_codeql_qualified_sink_rule`
+#       * "bare_call" — `open(...)`, a receiver-less call
+#       * "receiver_method" — `$CUR.execute(...)`, semgrep's own receiver
+#         -metavariable syntax: any receiver, named method
+#     The last two were added 2026-09-06. Before that, `open(...)` /
+#     `eval(...)` / `exec(...)` parsed to *zero* match specs (the
+#     module-attr regex requires a `.`), so `py.open-file`, `py.eval-exec`
+#     and `js.eval` were silently dead; and instance-method sinks such as
+#     `cursor.execute` were not expressible at all, which is why this file
+#     used to carry a `sqlite3.connect(...)` proxy in their place.
+#   - Every API named below is a real, standard-library or well-known-
+#     framework function, not invented — cross-check against each
+#     language's own documentation if extending this file.
+#   - `semantic_family` values are the canonical set from
+#     `bc_callgraph::families::CANONICAL_FAMILIES`.
+#
+# Re-verify/extend this file freely — it's a starting point, not a
+# ceiling. See `crates/bc-stage-s0/corpus/sources.yaml` for the source
+# -side counterpart, and `crates/bc-stage-s4/src/cwe_kb.rs` for the
+# separate (CWE-guidance, not corpus) `CweKB` content.
+rules:
+  # ── command-exec (CWE-78) ──────────────────────────────────────────
+  - id: py.os-system
+    languages: [python]
+    pattern: os.system(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: py.os-popen
+    languages: [python]
+    pattern: os.popen(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: py.subprocess-call
+    languages: [python]
+    pattern-either:
+      - pattern: subprocess.call(...)
+      - pattern: subprocess.run(...)
+      - pattern: subprocess.Popen(...)
+      - pattern: subprocess.check_output(...)
+      - pattern: subprocess.check_call(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: js.child-process-exec
+    languages: [javascript, typescript]
+    pattern-either:
+      - pattern: child_process.exec(...)
+      - pattern: child_process.execSync(...)
+      - pattern: child_process.spawn(...)
+      - pattern: child_process.spawnSync(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: go.exec-command
+    languages: [go]
+    pattern: exec.Command(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: java.codeql.runtime-exec
+    languages: [java, kotlin]
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+      codeql_pkg: java.lang
+      codeql_class: Runtime
+    patterns:
+      - metavariable-regex:
+          metavariable: $METHOD
+          regex: "^(exec)$"
+
+  # ── sql-exec (CWE-89) ───────────────────────────────────────────────
+  #
+  # REMOVED 2026-09-06: `py.sqlite3-connect-execute`, `pattern:
+  # sqlite3.connect(...)`. It was a documented proxy for the real
+  # `cursor.execute(...)` sink, adopted only because the receiver-method
+  # call shape could not be expressed. It was worse than nothing:
+  # `sqlite3.connect(path)` takes a *database path*, never a query, so
+  # the sink call site carried no query symbol and no Python SQL path
+  # could ever ground in taint evidence — it produced a sink attributed
+  # to whatever helper opened the connection (`db.py::_cursor` in the
+  # 2026-09-06 field repro) and a permanent false negative on the real
+  # injection two lines away. The receiver-method rule below replaces it.
+  - id: py.dbapi-cursor-execute
+    languages: [python]
+    # DB-API 2.0 (`sqlite3`, `psycopg2`, `pymysql`, `cx_Oracle`, …) and
+    # SQLAlchemy all expose query execution as an INSTANCE method on a
+    # cursor/connection/session, so no `<module>.<attr>(...)` shape can
+    # reach it.
+    #
+    # `requires_dynamic_arg` is what keeps this precise: a call whose
+    # first positional argument is a *static* string literal is a
+    # parameterized query — `cur.execute("… WHERE email LIKE ?",
+    # (email,))` binds its values and is NOT an injection sink — while
+    # `cur.execute("… LIKE '" + pattern + "'")` and `cur.execute(query)`
+    # both are.
+    pattern-either:
+      - pattern: $CUR.execute(...)
+      - pattern: $CUR.executemany(...)
+      - pattern: $CUR.executescript(...)
+    metadata:
+      cwe: CWE-89
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+  - id: java.jdbc-statement-execute
+    languages: [java, kotlin]
+    # The `Statement.executeQuery` family the header used to call out as
+    # deliberately omitted. `prepareStatement` is included because the
+    # injection is in the *template* it is handed, not in the later
+    # `setString` binds; a fully static template is filtered out by
+    # `requires_dynamic_arg` exactly as it should be.
+    pattern-either:
+      - pattern: $ST.executeQuery(...)
+      - pattern: $ST.executeUpdate(...)
+      - pattern: $ST.prepareStatement(...)
+    metadata:
+      cwe: CWE-89
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+      # `statement.executeQuery()` with NO argument is the
+      # `PreparedStatement` form: the SQL text was fixed when the
+      # statement was prepared, so there is nothing at this call site to
+      # inject into. Without this the parameterized query that every
+      # JDBC tutorial teaches — and that the polyglot bed carries as its
+      # deliberate negative control — reports as a SQL sink.
+      requires_any_arg: true
+  - id: cs.dbcommand-execute
+    languages: [csharp]
+    # ADO.NET. These usually take no argument at all (the SQL lives in
+    # `cmd.CommandText`), which `requires_dynamic_arg` treats as dynamic
+    # — there is no static literal at the call site to vouch for it.
+    pattern-either:
+      - pattern: $CMD.ExecuteReader(...)
+      - pattern: $CMD.ExecuteNonQuery(...)
+      - pattern: $CMD.ExecuteScalar(...)
+    metadata:
+      cwe: CWE-89
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+
+  # ╔══════════════════════════════════════════════════════════════════╗
+  # ║ C# — added 2026-09-07                                            ║
+  # ╚══════════════════════════════════════════════════════════════════╝
+  #
+  # Before this block C# had exactly one rule in the whole corpus
+  # (`cs.dbcommand-execute`, above) and — until the same day's source
+  # additions — no source rule at all, so the language had extractors
+  # that nothing could ever match against.
+  #
+  # Deliberately NOT expressible, for the record rather than by
+  # oversight: `cmd.CommandText = sql` (an assignment to a property, not
+  # a call, and the extractor's property-read call sites cover reads
+  # only) and `searcher.Filter = f` for LDAP. The `new SqlCommand(sql,
+  # conn)` and `new DirectorySearcher(filter)` constructors below are
+  # the injection shapes that ARE call-shaped, and they carry the
+  # attacker-controlled string as an argument, which is what the taint
+  # plane needs.
+  - id: cs.sqlcommand-ctor
+    languages: [csharp]
+    # `new SqlCommand(query, conn)` — the query template is argument 0.
+    pattern-either:
+      - pattern: SqlCommand(...)
+      - pattern: MySqlCommand(...)
+      - pattern: NpgsqlCommand(...)
+      - pattern: OleDbCommand(...)
+      - pattern: SqliteCommand(...)
+    metadata:
+      cwe: CWE-89
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+  - id: cs.ef-raw-sql
+    languages: [csharp]
+    # Entity Framework Core's escape hatches. `FromSqlInterpolated` /
+    # `ExecuteSqlInterpolated` are the *safe* pair (they parameterize
+    # the interpolation holes) and are deliberately absent.
+    pattern-either:
+      - pattern: $CTX.FromSqlRaw(...)
+      - pattern: $CTX.ExecuteSqlRaw(...)
+      - pattern: $CTX.ExecuteSqlRawAsync(...)
+    metadata:
+      cwe: CWE-89
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+  - id: cs.process-start
+    languages: [csharp]
+    pattern-either:
+      - pattern: Process.Start(...)
+      - pattern: ProcessStartInfo(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: cs.file-io
+    languages: [csharp]
+    # `Path.Combine` is listed because a request-derived segment makes
+    # the *combined* path traversable; the read/write that follows is
+    # the one that leaks, and both are here.
+    pattern-either:
+      - pattern: File.ReadAllText(...)
+      - pattern: File.ReadAllBytes(...)
+      - pattern: File.ReadAllLines(...)
+      - pattern: File.WriteAllText(...)
+      - pattern: File.WriteAllBytes(...)
+      - pattern: File.Open(...)
+      - pattern: File.OpenRead(...)
+      - pattern: File.Delete(...)
+      - pattern: Path.Combine(...)
+    metadata:
+      cwe: CWE-22
+      sink_kind: path
+      semantic_family: file-io
+  - id: cs.deserialize
+    languages: [csharp]
+    # `BinaryFormatter.Deserialize` is the classic .NET gadget chain
+    # entry point. `JsonConvert.DeserializeObject` is only unsafe with
+    # a `TypeNameHandling` other than `None`, which this extractor
+    # cannot read off the settings argument — flagged as a candidate,
+    # exactly as `py.yaml-load` is, and left for S4 to judge.
+    pattern-either:
+      - pattern: $F.Deserialize(...)
+      - pattern: JsonConvert.DeserializeObject(...)
+      - pattern: JavaScriptSerializer(...)
+    metadata:
+      cwe: CWE-502
+      sink_kind: deserialize
+      semantic_family: deserialization
+  - id: cs.xxe
+    languages: [csharp]
+    # `XmlReader.Create` and `XmlDocument.LoadXml` are unsafe only with
+    # DTD processing enabled, which lives on an `XmlReaderSettings`
+    # this extractor cannot inspect — a candidate, not a verdict.
+    pattern-either:
+      - pattern: XmlReader.Create(...)
+      - pattern: $DOC.LoadXml(...)
+      - pattern: XmlTextReader(...)
+    metadata:
+      cwe: CWE-611
+      sink_kind: xxe
+      semantic_family: other
+  - id: cs.http-fetch
+    languages: [csharp]
+    pattern-either:
+      - pattern: $C.GetAsync(...)
+      - pattern: $C.SendAsync(...)
+      - pattern: $C.GetStringAsync(...)
+      - pattern: $C.GetStreamAsync(...)
+      - pattern: WebRequest.Create(...)
+    metadata:
+      cwe: CWE-918
+      sink_kind: ssrf
+      semantic_family: url-fetch
+  - id: cs.open-redirect
+    languages: [csharp]
+    # ASP.NET MVC controller helpers. `LocalRedirect` is the safe one
+    # and is absent.
+    pattern-either:
+      - pattern: Redirect(...)
+      - pattern: RedirectPermanent(...)
+    metadata:
+      cwe: CWE-601
+      sink_kind: redirect
+      semantic_family: other
+  - id: cs.ldap-search
+    languages: [csharp]
+    # `new DirectorySearcher(filter)` takes the LDAP filter as argument
+    # 0; the `searcher.Filter = f` property form is not a call shape.
+    pattern: DirectorySearcher(...)
+    metadata:
+      cwe: CWE-90
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+  - id: cs.weak-crypto
+    languages: [csharp]
+    pattern-either:
+      - pattern: MD5.Create(...)
+      - pattern: SHA1.Create(...)
+      - pattern: DES.Create(...)
+      - pattern: TripleDES.Create(...)
+      - pattern: MD5CryptoServiceProvider(...)
+      - pattern: SHA1CryptoServiceProvider(...)
+      - pattern: DESCryptoServiceProvider(...)
+    metadata:
+      cwe: CWE-327
+      sink_kind: crypto
+      semantic_family: other
+
+  # ╔══════════════════════════════════════════════════════════════════╗
+  # ║ Go — added 2026-09-07                                            ║
+  # ╚══════════════════════════════════════════════════════════════════╝
+  #
+  # `go.exec-command`, `go.http-get` and `go.os-open` live in the
+  # family-ordered sections further down; this block is everything else.
+  #
+  # A note on `database/sql`: `Query` and `Exec` are spelled as
+  # module_attr rules bound to the conventional handle names
+  # (`db`/`tx`/`conn`/`stmt`) rather than as receiver-method rules,
+  # because a receiver-agnostic `$X.Query(...)` would also match
+  # `r.URL.Query()` — net/http's query-string accessor, which this
+  # corpus lists as a SOURCE. That pair would make every Go handler a
+  # self-contained SQL injection. The `…Context`/`sqlx` variants below
+  # have no such collision and are receiver-agnostic.
+  - id: go.sql-handle-query
+    languages: [go]
+    pattern-either:
+      - pattern: db.Query(...)
+      - pattern: db.QueryRow(...)
+      - pattern: db.Exec(...)
+      - pattern: tx.Query(...)
+      - pattern: tx.QueryRow(...)
+      - pattern: tx.Exec(...)
+      - pattern: conn.Query(...)
+      - pattern: conn.Exec(...)
+      - pattern: stmt.Query(...)
+      - pattern: stmt.Exec(...)
+    metadata:
+      cwe: CWE-89
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+  - id: go.sql-context-and-sqlx
+    languages: [go]
+    pattern-either:
+      - pattern: $DB.QueryContext(...)
+      - pattern: $DB.QueryRowContext(...)
+      - pattern: $DB.ExecContext(...)
+      - pattern: $DB.Queryx(...)
+      - pattern: $DB.QueryRowx(...)
+      - pattern: $DB.NamedExec(...)
+      - pattern: $DB.MustExec(...)
+    metadata:
+      cwe: CWE-89
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+  - id: go.exec-command-context
+    languages: [go]
+    pattern: exec.CommandContext(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: go.path-io
+    languages: [go]
+    # `os.Open`/`os.OpenFile`/`ioutil.ReadFile` are `go.os-open` in the
+    # file-io section below; these are the rest of the family.
+    pattern-either:
+      - pattern: os.ReadFile(...)
+      - pattern: os.Create(...)
+      - pattern: os.WriteFile(...)
+      - pattern: os.Remove(...)
+      - pattern: ioutil.WriteFile(...)
+      - pattern: filepath.Join(...)
+    metadata:
+      cwe: CWE-22
+      sink_kind: path
+      semantic_family: file-io
+  - id: go.http-client
+    languages: [go]
+    pattern-either:
+      - pattern: http.NewRequest(...)
+      - pattern: http.NewRequestWithContext(...)
+      - pattern: http.Head(...)
+      - pattern: http.PostForm(...)
+      - pattern: $C.Do(...)
+    metadata:
+      cwe: CWE-918
+      sink_kind: ssrf
+      semantic_family: url-fetch
+  - id: go.template-raw
+    languages: [go]
+    # `template.HTML`/`JS`/`URL`/`HTMLAttr` are html/template's explicit
+    # "trust me, do not escape this" conversions.
+    pattern-either:
+      - pattern: template.HTML(...)
+      - pattern: template.HTMLAttr(...)
+      - pattern: template.JS(...)
+      - pattern: template.URL(...)
+    metadata:
+      cwe: CWE-79
+      sink_kind: xss
+      semantic_family: html-response
+  - id: go.open-redirect
+    languages: [go]
+    pattern: http.Redirect(...)
+    metadata:
+      cwe: CWE-601
+      sink_kind: redirect
+      semantic_family: other
+  - id: go.weak-crypto
+    languages: [go]
+    pattern-either:
+      - pattern: md5.New(...)
+      - pattern: md5.Sum(...)
+      - pattern: sha1.New(...)
+      - pattern: sha1.Sum(...)
+      - pattern: des.NewCipher(...)
+      - pattern: rc4.NewCipher(...)
+    metadata:
+      cwe: CWE-327
+      sink_kind: crypto
+      semantic_family: other
+
+  # ╔══════════════════════════════════════════════════════════════════╗
+  # ║ JavaScript / TypeScript — added 2026-09-07                       ║
+  # ╚══════════════════════════════════════════════════════════════════╝
+  #
+  # `js.child-process-exec`, `js.fetch-like` and `js.eval` live in the
+  # family-ordered sections further down; this block is everything else.
+  #
+  # The receiver-agnostic `$DB.query(...)` below is safe precisely
+  # because `req.query` is a property READ, and a property read can
+  # never match a sink rule (see `RawCall::property_read`) — otherwise
+  # this one rule would make every Express handler a SQL injection.
+  - id: js.db-query
+    languages: [javascript, typescript]
+    # `connection.query(sql)` (mysql/mysql2/pg), `sequelize.query(sql)`,
+    # `knex.raw(sql)`. A `db.query("… WHERE id = ?", [id])` call is
+    # parameterized and `requires_dynamic_arg` keeps it out.
+    pattern-either:
+      - pattern: $DB.query(...)
+      - pattern: $DB.execute(...)
+      - pattern: $DB.raw(...)
+      - pattern: $DB.$queryRawUnsafe(...)
+    metadata:
+      cwe: CWE-89
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+  - id: js.child-process-more
+    languages: [javascript, typescript]
+    # `const { exec } = require("child_process")` leaves the call
+    # receiver-less, which the bare-call shapes cover. `spawn`/
+    # `execFile` are only injectable with `shell: true`, which this
+    # extractor cannot read off the options object — a candidate, not a
+    # verdict, exactly as `py.yaml-load` is.
+    pattern-either:
+      - pattern: child_process.execFile(...)
+      - pattern: child_process.execFileSync(...)
+      - pattern: exec(...)
+      - pattern: execSync(...)
+      - pattern: execFileSync(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: js.fs-path
+    languages: [javascript, typescript]
+    # `path.join` is deliberately absent: it composes a path rather than
+    # opening one, and the composition is already visible to the taint
+    # plane through the argument walk.
+    pattern-either:
+      - pattern: fs.readFile(...)
+      - pattern: fs.readFileSync(...)
+      - pattern: fs.writeFile(...)
+      - pattern: fs.writeFileSync(...)
+      - pattern: fs.createReadStream(...)
+      - pattern: fs.createWriteStream(...)
+      - pattern: fs.open(...)
+      - pattern: fs.unlink(...)
+      - pattern: $RES.sendFile(...)
+    metadata:
+      cwe: CWE-22
+      sink_kind: path
+      semantic_family: file-io
+  - id: js.vm-eval
+    languages: [javascript, typescript]
+    # `eval(...)` is `js.eval` in the dyn-eval section below. `new
+    # Function(code)` is NOT here: the extractor records no call site
+    # for a `new` expression in JavaScript, so the rule would be dead.
+    pattern-either:
+      - pattern: vm.runInContext(...)
+      - pattern: vm.runInNewContext(...)
+      - pattern: vm.runInThisContext(...)
+      - pattern: vm.compileFunction(...)
+    metadata:
+      cwe: CWE-95
+      sink_kind: dyn-eval
+      semantic_family: other
+  - id: js.http-fetch
+    languages: [javascript, typescript]
+    pattern-either:
+      - pattern: axios.request(...)
+      - pattern: axios.put(...)
+      - pattern: axios.delete(...)
+      - pattern: http.get(...)
+      - pattern: http.request(...)
+      - pattern: https.get(...)
+      - pattern: https.request(...)
+      - pattern: fetch(...)
+      - pattern: request(...)
+    metadata:
+      cwe: CWE-918
+      sink_kind: ssrf
+      semantic_family: url-fetch
+  - id: js.open-redirect
+    languages: [javascript, typescript]
+    pattern: $RES.redirect(...)
+    metadata:
+      cwe: CWE-601
+      sink_kind: redirect
+      semantic_family: other
+  - id: js.deserialize
+    languages: [javascript, typescript]
+    # `node-serialize`'s `unserialize` executes an embedded IIFE — the
+    # classic Node RCE gadget. `yaml.load` without `{ schema:
+    # JSON_SCHEMA }` (or js-yaml v4's safe default) is the same shape as
+    # `py.yaml-load`, and is flagged on the same "candidate, not
+    # verdict" basis.
+    pattern-either:
+      - pattern: serialize.unserialize(...)
+      - pattern: unserialize(...)
+      - pattern: yaml.load(...)
+      - pattern: jsyaml.load(...)
+    metadata:
+      cwe: CWE-502
+      sink_kind: deserialize
+      semantic_family: deserialization
+  - id: js.xxe
+    languages: [javascript, typescript]
+    # `libxmljs.parseXml(xml, { noent: true })` resolves entities; the
+    # option itself is not readable from a call shape.
+    pattern-either:
+      - pattern: libxmljs.parseXml(...)
+      - pattern: libxmljs.parseXmlString(...)
+    metadata:
+      cwe: CWE-611
+      sink_kind: xxe
+      semantic_family: other
+  - id: js.weak-crypto
+    languages: [javascript, typescript]
+    # `crypto.createHash("md5")` — the algorithm is argument 0 and this
+    # extractor cannot read a literal's value, so every `createHash` is
+    # a candidate.
+    pattern-either:
+      - pattern: crypto.createHash(...)
+      - pattern: crypto.createCipheriv(...)
+    metadata:
+      cwe: CWE-327
+      sink_kind: crypto
+      semantic_family: other
+
+  # ╔══════════════════════════════════════════════════════════════════╗
+  # ║ Java / Kotlin — added 2026-09-07                                 ║
+  # ╚══════════════════════════════════════════════════════════════════╝
+  #
+  # `java.codeql.runtime-exec` and `java.jdbc-statement-execute` live in
+  # the family-ordered sections; this block is everything else. Java had
+  # two sink rules and one source rule, so a Spring app produced taint
+  # paths for its SQL injection and nothing else.
+  #
+  # **Every rule here also claims `kotlin`.** Kotlin calls the same JVM
+  # APIs by the same names, and `MatchSpec.languages` is a set the
+  # matcher tests with `contains(language)` — so one rule covers both
+  # the moment a Kotlin extractor is wired, with no second corpus to
+  # keep in step. Rules are filtered against the operator's active
+  # languages before they are ever indexed, so claiming a language with
+  # no extractor yet costs nothing.
+  #
+  # Deliberately NOT expressible, for the record: `Pattern.compile` and
+  # `XPathExpression.compile` are spelled identically, so an XPath
+  # `compile(` rule would flag every regex in the repo — `evaluate(` is
+  # the XPath-only half and is used instead. `HttpClient.send(` is
+  # likewise dropped: `send` is far too common a method name to claim
+  # receiver-agnostically, and the `URL`/`RestTemplate` shapes below
+  # cover the same SSRF. Raw template rendering has no crisp Java call
+  # signature; `bc_callgraph::scan::semantic_sink_override` already
+  # catches the `response.getWriter().print(...)` HTML shape.
+  - id: java.runtime-exec
+    languages: [java, kotlin]
+    # `Runtime.getRuntime().exec(cmd)` reduces to an `exec` call whose
+    # leftmost identifier is `Runtime`. The existing
+    # `java.codeql.runtime-exec` rule cannot match it: a qualified rule
+    # needs the receiver to resolve through the import table, and
+    # `java.lang.Runtime` is implicitly imported, so it never does.
+    pattern-either:
+      - pattern: Runtime.exec(...)
+      - pattern: ProcessBuilder(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: java.file-io
+    languages: [java, kotlin]
+    # `Path.resolve` is listed because resolving an unvalidated segment
+    # against a trusted root IS the traversal; the read that follows is
+    # what leaks, and both are here.
+    pattern-either:
+      - pattern: Files.readAllBytes(...)
+      - pattern: Files.readAllLines(...)
+      - pattern: Files.readString(...)
+      - pattern: Files.newInputStream(...)
+      - pattern: Files.newOutputStream(...)
+      - pattern: Files.newBufferedReader(...)
+      - pattern: Files.write(...)
+      - pattern: Files.copy(...)
+      - pattern: Files.delete(...)
+      - pattern: Paths.get(...)
+      - pattern: File(...)
+      - pattern: FileInputStream(...)
+      - pattern: FileOutputStream(...)
+      - pattern: FileReader(...)
+      - pattern: FileWriter(...)
+      - pattern: $P.resolve(...)
+    metadata:
+      cwe: CWE-22
+      sink_kind: path
+      semantic_family: file-io
+  - id: java.deserialize
+    languages: [java, kotlin]
+    # `ObjectInputStream.readObject` is the classic JVM gadget-chain
+    # entry point. XStream's `fromXML` and Jackson's
+    # `enableDefaultTyping` are the two configuration-dependent ones,
+    # flagged as candidates on the same basis as `py.yaml-load`.
+    pattern-either:
+      - pattern: $OIS.readObject(...)
+      - pattern: ObjectInputStream(...)
+      - pattern: XStream(...)
+      - pattern: $X.fromXML(...)
+      - pattern: $M.enableDefaultTyping(...)
+    metadata:
+      cwe: CWE-502
+      sink_kind: deserialize
+      semantic_family: deserialization
+  - id: java.xxe
+    languages: [java, kotlin]
+    # Each factory resolves external entities unless the caller disables
+    # the feature afterwards, which this extractor cannot see — a
+    # candidate, not a verdict.
+    pattern-either:
+      - pattern: DocumentBuilderFactory.newInstance(...)
+      - pattern: SAXParserFactory.newInstance(...)
+      - pattern: XMLInputFactory.newInstance(...)
+      - pattern: TransformerFactory.newInstance(...)
+      - pattern: SchemaFactory.newInstance(...)
+      - pattern: SAXReader(...)
+    metadata:
+      cwe: CWE-611
+      sink_kind: xxe
+      semantic_family: other
+  - id: java.http-fetch
+    languages: [java, kotlin]
+    pattern-either:
+      - pattern: URL(...)
+      - pattern: $U.openConnection(...)
+      - pattern: $U.openStream(...)
+      - pattern: $R.getForObject(...)
+      - pattern: $R.getForEntity(...)
+      - pattern: $R.postForObject(...)
+      - pattern: $R.exchange(...)
+    metadata:
+      cwe: CWE-918
+      sink_kind: ssrf
+      semantic_family: url-fetch
+  - id: java.open-redirect
+    languages: [java, kotlin]
+    pattern: $RES.sendRedirect(...)
+    metadata:
+      cwe: CWE-601
+      sink_kind: redirect
+      semantic_family: other
+  - id: java.ldap-xpath
+    languages: [java, kotlin]
+    # JNDI `DirContext.search(filter)` and `XPathExpression.evaluate`.
+    pattern-either:
+      - pattern: $CTX.search(...)
+      - pattern: $XP.evaluate(...)
+    metadata:
+      cwe: CWE-90
+      sink_kind: sql
+      semantic_family: sql-exec
+  - id: java.spel-eval
+    languages: [java, kotlin]
+    # Spring Expression Language: a request-derived expression string is
+    # remote code execution.
+    pattern-either:
+      - pattern: $P.parseExpression(...)
+      - pattern: SpelExpressionParser(...)
+    metadata:
+      cwe: CWE-95
+      sink_kind: dyn-eval
+      semantic_family: other
+  - id: java.weak-crypto
+    languages: [java, kotlin]
+    # The algorithm is argument 0 and this extractor cannot read a
+    # literal's value, so every `getInstance` is a candidate — the same
+    # basis as `js.weak-crypto`'s `createHash`.
+    pattern-either:
+      - pattern: MessageDigest.getInstance(...)
+      - pattern: Cipher.getInstance(...)
+      - pattern: DESKeySpec(...)
+    metadata:
+      cwe: CWE-327
+      sink_kind: crypto
+      semantic_family: other
+
+  # ╔══════════════════════════════════════════════════════════════════╗
+  # ║ PHP / Ruby / Rust — added 2026-09-07                             ║
+  # ╚══════════════════════════════════════════════════════════════════╝
+  #
+  # These three were wired for their framework entry points only, so
+  # every handler the route plane found led nowhere: no sink rule
+  # existed for them at all. `scan::lite` gives them functions, calls
+  # and a static-first-argument answer, which is everything a rule here
+  # needs.
+  #
+  # Two shapes recur and are worth stating once. PHP's `$` sigil is part
+  # of its variable token, not of the name a rule spells, so
+  # `$pdo->query(...)` is written `pdo.query(...)`. And a receiver-less
+  # `bare_call` is the normal shape in PHP and Ruby, where most of the
+  # dangerous surface is a global function or an implicit-self method.
+  #
+  # Deliberately NOT expressible, for the record: PHP's
+  # `include`/`require` are their own expression kind, not calls, and a
+  # backtick shell is an operator; Rust's `unsafe` is a block, not a
+  # call (the raw-pointer read inside it IS a call and is covered);
+  # Rust's `query!`/`sqlx::query!` macro form binds its parameters and
+  # is safe by construction, so only the function form is listed.
+  - id: php.sql
+    languages: [php]
+    pattern-either:
+      - pattern: mysqli_query(...)
+      - pattern: mysql_query(...)
+      - pattern: pg_query(...)
+      - pattern: pdo.query(...)
+      - pattern: pdo.exec(...)
+      - pattern: db.query(...)
+      - pattern: dbh.query(...)
+      - pattern: conn.query(...)
+      - pattern: DB.select(...)
+      - pattern: DB.statement(...)
+      - pattern: DB.raw(...)
+    metadata:
+      cwe: CWE-89
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+  - id: php.command-exec
+    languages: [php]
+    pattern-either:
+      - pattern: exec(...)
+      - pattern: shell_exec(...)
+      - pattern: system(...)
+      - pattern: passthru(...)
+      - pattern: popen(...)
+      - pattern: proc_open(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: php.file-io
+    languages: [php]
+    pattern-either:
+      - pattern: file_get_contents(...)
+      - pattern: file_put_contents(...)
+      - pattern: fopen(...)
+      - pattern: readfile(...)
+      - pattern: unlink(...)
+    metadata:
+      cwe: CWE-22
+      sink_kind: path
+      semantic_family: file-io
+  - id: php.file-inclusion
+    languages: [php]
+    # `include`/`require`(`_once`) with a request-derived path is PHP's
+    # own CWE-98: the included file is EXECUTED, not read. The four
+    # spellings are one node kind apart and `scan::lite` reports them
+    # all as `include`; `requires_dynamic_arg` keeps a fixed
+    # `require __DIR__.'/vendor/autoload.php'` out.
+    pattern: include(...)
+    metadata:
+      cwe: CWE-98
+      sink_kind: path
+      semantic_family: file-io
+      requires_dynamic_arg: true
+  - id: php.eval
+    languages: [php]
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: assert(...)
+      - pattern: create_function(...)
+    metadata:
+      cwe: CWE-95
+      sink_kind: dyn-eval
+      semantic_family: other
+  - id: php.deserialize
+    languages: [php]
+    pattern: unserialize(...)
+    metadata:
+      cwe: CWE-502
+      sink_kind: deserialize
+      semantic_family: deserialization
+  - id: php.open-redirect
+    languages: [php]
+    # `header('Location: '.$next)`. A fully literal header line is
+    # filtered by `requires_dynamic_arg`, which is what keeps every
+    # `header('Content-Type: …')` in the repo out.
+    pattern: header(...)
+    metadata:
+      cwe: CWE-601
+      sink_kind: redirect
+      semantic_family: other
+      requires_dynamic_arg: true
+  - id: php.xxe
+    languages: [php]
+    pattern-either:
+      - pattern: simplexml_load_string(...)
+      - pattern: simplexml_load_file(...)
+      - pattern: doc.loadXML(...)
+    metadata:
+      cwe: CWE-611
+      sink_kind: xxe
+      semantic_family: other
+  - id: php.weak-crypto
+    languages: [php]
+    pattern-either:
+      - pattern: md5(...)
+      - pattern: sha1(...)
+    metadata:
+      cwe: CWE-327
+      sink_kind: crypto
+      semantic_family: other
+
+  - id: ruby.sql
+    languages: [ruby]
+    # `where`/`order`/`pluck` are safe with a bound placeholder and are
+    # injections with an interpolated string, which is exactly the
+    # distinction `requires_dynamic_arg` draws now that `scan::lite`
+    # answers it: `where('owner = ?', x)` is static, `where("owner =
+    # '#{x}'")` is not.
+    pattern-either:
+      - pattern: find_by_sql(...)
+      - pattern: where(...)
+      - pattern: order(...)
+      - pattern: pluck(...)
+      - pattern: ActiveRecord.execute(...)
+      - pattern: connection.execute(...)
+    metadata:
+      cwe: CWE-89
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+  - id: ruby.command-exec
+    languages: [ruby]
+    pattern-either:
+      - pattern: system(...)
+      - pattern: exec(...)
+      - pattern: spawn(...)
+      - pattern: IO.popen(...)
+      - pattern: Open3.capture2(...)
+      - pattern: Open3.capture2e(...)
+      - pattern: Open3.capture3(...)
+      - pattern: Open3.popen3(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: ruby.dynamic-dispatch
+    languages: [ruby]
+    # `public_send(params[:metric])` hands the request the choice of
+    # method — CWE-470, and the idiomatic Ruby foot-gun.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: instance_eval(...)
+      - pattern: class_eval(...)
+      - pattern: send(...)
+      - pattern: public_send(...)
+      - pattern: constantize(...)
+      - pattern: const_get(...)
+    metadata:
+      cwe: CWE-470
+      sink_kind: dyn-eval
+      semantic_family: other
+  - id: ruby.file-io
+    languages: [ruby]
+    pattern-either:
+      - pattern: File.read(...)
+      - pattern: File.binread(...)
+      - pattern: File.open(...)
+      - pattern: File.write(...)
+      - pattern: File.join(...)
+      - pattern: IO.read(...)
+      - pattern: send_file(...)
+      - pattern: send_data(...)
+    metadata:
+      cwe: CWE-22
+      sink_kind: path
+      semantic_family: file-io
+  - id: ruby.open-redirect
+    languages: [ruby]
+    pattern: redirect_to(...)
+    metadata:
+      cwe: CWE-601
+      sink_kind: redirect
+      semantic_family: other
+      requires_dynamic_arg: true
+  - id: ruby.weak-crypto
+    languages: [ruby]
+    pattern-either:
+      - pattern: Digest.hexdigest(...)
+      - pattern: Digest.digest(...)
+    metadata:
+      cwe: CWE-327
+      sink_kind: crypto
+      semantic_family: other
+
+  - id: rust.sql
+    languages: [rust]
+    # `sqlx::query(&format!(…))` and `diesel::sql_query(s)`. The
+    # `sqlx::query!` MACRO form is bound at compile time and safe, and
+    # is a different node kind, so it never reaches here.
+    pattern-either:
+      - pattern: sqlx.query(...)
+      - pattern: sqlx.query_as(...)
+      - pattern: sqlx.query_scalar(...)
+      - pattern: diesel.sql_query(...)
+      - pattern: $D.execute(...)
+    metadata:
+      cwe: CWE-89
+      sink_kind: sql
+      semantic_family: sql-exec
+      requires_dynamic_arg: true
+  - id: rust.command-exec
+    languages: [rust]
+    pattern-either:
+      - pattern: Command.new(...)
+      - pattern: process.Command(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: rust.file-io
+    languages: [rust]
+    pattern-either:
+      - pattern: fs.read(...)
+      - pattern: fs.read_to_string(...)
+      - pattern: fs.write(...)
+      - pattern: fs.remove_file(...)
+      - pattern: fs.copy(...)
+      - pattern: File.open(...)
+      - pattern: File.create(...)
+    metadata:
+      cwe: CWE-22
+      sink_kind: path
+      semantic_family: file-io
+  - id: rust.http-fetch
+    languages: [rust]
+    pattern-either:
+      - pattern: reqwest.get(...)
+      - pattern: reqwest.post(...)
+      - pattern: Client.get(...)
+      - pattern: Client.post(...)
+    metadata:
+      cwe: CWE-918
+      sink_kind: ssrf
+      semantic_family: url-fetch
+  - id: rust.raw-pointer-read
+    languages: [rust]
+    # `std::slice::from_raw_parts(ptr, len)` with a request-derived
+    # length reads past the allocation — CWE-125. The `unsafe` block
+    # around it is not a call, but this is.
+    pattern-either:
+      - pattern: slice.from_raw_parts(...)
+      - pattern: slice.from_raw_parts_mut(...)
+      - pattern: ptr.copy_nonoverlapping(...)
+    metadata:
+      cwe: CWE-125
+      sink_kind: memory
+      semantic_family: other
+  - id: rust.weak-crypto
+    languages: [rust]
+    pattern-either:
+      - pattern: Md5.new(...)
+      - pattern: Sha1.new(...)
+    metadata:
+      cwe: CWE-327
+      sink_kind: crypto
+      semantic_family: other
+
+  # ╔══════════════════════════════════════════════════════════════════╗
+  # ║ C / C++ — added 2026-09-07                                       ║
+  # ╚══════════════════════════════════════════════════════════════════╝
+  #
+  # C and C++ share ONE language key and one grammar: `ext_to_lang` maps
+  # `.c`, `.h`, `.cpp`, `.cc`, `.cxx` and `.hpp` all onto `c-cpp`, and
+  # C++'s tree-sitter grammar parses plain C. Every rule below therefore
+  # claims both spellings, which `semgrep_to_vvah` folds back into that
+  # one key.
+  #
+  # Deliberately NOT expressible, for the record: use-after-free is a
+  # temporal property of one pointer across two statements, not a
+  # source→sink pair, so the polyglot bed's `uaf-1` seed is left to S4's
+  # own reasoning rather than faked as a rule here.
+  #
+  # Integer-overflow allocation IS expressible, and the
+  # `alloc-size-overflow` rules below express it. It needs an arithmetic
+  # predicate over an argument, which is the same kind of predicate the
+  # format-string rules already use — `requires_dynamic_arg` asks
+  # whether an argument is a literal, `requires_arithmetic_arg` asks
+  # whether it is a `*`/`+` expression, `requires_unit_arg` asks whether
+  # it is the integer literal `1` — so `malloc` can be named without
+  # flagging every allocation in the program.
+  #
+  # C++'s array `new T[n]` is covered too. The grammar parses it as a
+  # `new_expression` with no argument list at all, so the extractor
+  # reads the `new_declarator`'s length as argument 0 and records the
+  # allocation under the name C++ gives it, `operator_new_array`
+  # (brackets spelled out, since a rule leaf must be an identifier).
+  # `new T[n * m]` then meets the same predicate `malloc(n * m)` does.
+  # The non-array `new T` and `new T(args)` allocate exactly one object,
+  # have no size to compute, and are not recorded.
+  #
+  # `snprintf` is absent from the overflow family on purpose — it is the
+  # BOUNDED alternative to `sprintf` and the fix a reviewer would
+  # recommend; it appears only in the format-string family, where an
+  # attacker-controlled format is dangerous whatever the bound.
+  - id: c.buffer-overflow
+    languages: [c, cpp]
+    # The unbounded string operations. Each writes until it meets a NUL
+    # in the SOURCE, so a destination sized for anything less overflows.
+    pattern-either:
+      - pattern: strcpy(...)
+      - pattern: strcat(...)
+      - pattern: sprintf(...)
+      - pattern: vsprintf(...)
+      - pattern: gets(...)
+      - pattern: stpcpy(...)
+    metadata:
+      cwe: CWE-121
+      sink_kind: memory
+      semantic_family: other
+  - id: c.format-string
+    languages: [c, cpp]
+    # CWE-134: the format argument is not a literal, so an attacker who
+    # controls it controls `%n` and the whole varargs walk.
+    # `dynamic_arg_index` is what makes this precise — `printf` takes
+    # its format first, `fprintf`/`sprintf` second, `snprintf` third —
+    # and it is why a fixed-format `fprintf(stderr, "…")` is not
+    # flagged.
+    pattern-either:
+      - pattern: printf(...)
+      - pattern: vprintf(...)
+      - pattern: syslog(...)
+    metadata:
+      cwe: CWE-134
+      sink_kind: format
+      semantic_family: other
+      requires_dynamic_arg: true
+  - id: c.format-string-second-arg
+    languages: [c, cpp]
+    pattern-either:
+      - pattern: fprintf(...)
+      - pattern: sprintf(...)
+      - pattern: vfprintf(...)
+      - pattern: vsprintf(...)
+      - pattern: sscanf(...)
+      - pattern: fscanf(...)
+    metadata:
+      cwe: CWE-134
+      sink_kind: format
+      semantic_family: other
+      requires_dynamic_arg: true
+      dynamic_arg_index: 1
+  - id: c.format-string-third-arg
+    languages: [c, cpp]
+    pattern-either:
+      - pattern: snprintf(...)
+      - pattern: vsnprintf(...)
+    metadata:
+      cwe: CWE-134
+      sink_kind: format
+      semantic_family: other
+      requires_dynamic_arg: true
+      dynamic_arg_index: 2
+  - id: c.command-exec
+    languages: [c, cpp]
+    pattern-either:
+      - pattern: system(...)
+      - pattern: popen(...)
+      - pattern: execl(...)
+      - pattern: execlp(...)
+      - pattern: execle(...)
+      - pattern: execv(...)
+      - pattern: execvp(...)
+      - pattern: execve(...)
+      - pattern: std.system(...)
+    metadata:
+      cwe: CWE-78
+      sink_kind: cmd
+      semantic_family: command-exec
+  - id: c.alloc-size-overflow
+    languages: [c, cpp]
+    # CWE-190: the allocation size is COMPUTED at the call site, so an
+    # attacker-derived operand can wrap the arithmetic and hand back a
+    # buffer far smaller than the loop that fills it believes.
+    # `malloc(count * size)` is the canonical shape;
+    # `requires_arithmetic_arg` is what makes it precise, and it is why
+    # `malloc(len)` — which allocates exactly what it was asked for and
+    # cannot wrap — is not flagged. Without the predicate this rule
+    # would have to report every allocation in the program, which is
+    # why no allocation rule existed here before the predicate did.
+    #
+    # The predicate is syntactic: it asks whether the size argument is
+    # COMPUTED, not whether it can actually overflow. An all-constant
+    # `malloc(MAX * sizeof(row))` therefore matches. That is deliberate
+    # and matches every other rule in this corpus — a rule proposes a
+    # candidate and the taint path decides. Folding constants is not
+    # possible here anyway: tree-sitter does not run the preprocessor, so
+    # `MAX` is an identifier like any other.
+    #
+    # `calloc` is deliberately EXCLUDED from THIS rule, not merely
+    # unlisted. `calloc(n, size)` is the SAFE idiom: it takes the two
+    # factors apart and multiplies them internally with an overflow
+    # check, and it is exactly the remediation a reviewer recommends for
+    # `malloc(n * size)`. A scanner that flags the fix it just asked for
+    # sends remediation in a circle, so a bare `requires_arithmetic_arg`
+    # over `calloc` — which would report `calloc(len + 1, size)` and
+    # every other correct call in the tree — stays out. The ONE
+    # `calloc` shape that is genuinely unsafe has its own rule below,
+    # `c.calloc-hand-multiplied-size`, which is narrow enough to keep
+    # every idiomatic call unflagged.
+    #
+    # `operator_new_array` is C++'s `new T[n]`; see the family comment
+    # above for why it is spelled that way. Its size is argument 0, the
+    # same slot `malloc`'s is, so it needs no index of its own.
+    #
+    # Ordered BEFORE `c.unbounded-copy`, which also names `alloca`:
+    # first match wins, so `alloca(n * m)` gets the precise CWE-190
+    # verdict here and `alloca(len)` still falls through to CWE-787,
+    # which is the right class for an unbounded stack allocation.
+    pattern-either:
+      - pattern: malloc(...)
+      - pattern: alloca(...)
+      - pattern: operator_new_array(...)
+    metadata:
+      cwe: CWE-190
+      sink_kind: memory
+      semantic_family: other
+      requires_arithmetic_arg: true
+  - id: c.alloc-size-overflow-second-arg
+    languages: [c, cpp]
+    # `realloc(ptr, n * size)` puts the computed size second, the same
+    # reason the format-string family needs `dynamic_arg_index`.
+    pattern-either:
+      - pattern: realloc(...)
+    metadata:
+      cwe: CWE-190
+      sink_kind: memory
+      semantic_family: other
+      requires_arithmetic_arg: true
+      arithmetic_arg_index: 1
+  - id: c.calloc-hand-multiplied-size
+    languages: [c, cpp]
+    # The one `calloc` shape that is not the safe idiom.
+    # `calloc(n, size)` multiplies its two factors internally under an
+    # overflow check; `calloc(n * size, 1)` does that multiply by hand
+    # in the caller — where it can wrap silently — and then passes an
+    # element size of `1`, which makes `calloc`'s own check a no-op.
+    # The protection is thrown away by the call itself, and the fix is
+    # to split the factors back apart.
+    #
+    # Both halves of that shape must hold, so the rule carries TWO
+    # argument predicates: `requires_arithmetic_arg` at index 0 and
+    # `requires_unit_arg` at index 1. A spec's predicates are ANDed, so
+    # naming both is how a rule states a condition across two arguments
+    # — no new matching machinery, and the rule still lives here rather
+    # than as a `calloc` special case in the engine.
+    #
+    # That conjunction is what keeps the family's whole point intact.
+    # `calloc(n, size)` fails the first predicate (a bare name is not
+    # arithmetic). `calloc(len + 1, sizeof(char))` fails the second:
+    # `sizeof(char)` IS one byte, but it names the element type instead
+    # of asserting the caller already did the multiply, and it is the
+    # textbook string allocation. `calloc(1, sizeof(x))` fails both.
+    pattern-either:
+      - pattern: calloc(...)
+    metadata:
+      cwe: CWE-190
+      sink_kind: memory
+      semantic_family: other
+      requires_arithmetic_arg: true
+      arithmetic_arg_index: 0
+      requires_unit_arg: true
+      unit_arg_index: 1
+  - id: c.unbounded-copy
+    languages: [c, cpp]
+    # `memcpy(dst, src, n)` with an attacker-derived `n` is CWE-787.
+    # The length is argument 2 and no call-shape rule can prove it
+    # constant, so these are candidates rather than verdicts — the same
+    # basis as `py.yaml-load`.
+    pattern-either:
+      - pattern: memcpy(...)
+      - pattern: memmove(...)
+      - pattern: alloca(...)
+    metadata:
+      cwe: CWE-787
+      sink_kind: memory
+      semantic_family: other
+  - id: c.path-io
+    languages: [c, cpp]
+    pattern-either:
+      - pattern: fopen(...)
+      - pattern: freopen(...)
+      - pattern: open(...)
+      - pattern: unlink(...)
+      - pattern: remove(...)
+      - pattern: rename(...)
+    metadata:
+      cwe: CWE-22
+      sink_kind: path
+      semantic_family: file-io
+
+  # ── url-fetch / SSRF (CWE-918) ──────────────────────────────────────
+  - id: py.requests-get
+    languages: [python]
+    pattern-either:
+      - pattern: requests.get(...)
+      - pattern: requests.post(...)
+      - pattern: urllib.request.urlopen(...)
+    metadata:
+      cwe: CWE-918
+      sink_kind: ssrf
+      semantic_family: url-fetch
+  - id: js.fetch-like
+    languages: [javascript, typescript]
+    pattern-either:
+      - pattern: axios.get(...)
+      - pattern: axios.post(...)
+    metadata:
+      cwe: CWE-918
+      sink_kind: ssrf
+      semantic_family: url-fetch
+  - id: go.http-get
+    languages: [go]
+    pattern-either:
+      - pattern: http.Get(...)
+      - pattern: http.Post(...)
+    metadata:
+      cwe: CWE-918
+      sink_kind: ssrf
+      semantic_family: url-fetch
+
+  # ── deserialization (CWE-502) ───────────────────────────────────────
+  - id: py.pickle-loads
+    languages: [python]
+    pattern-either:
+      - pattern: pickle.loads(...)
+      - pattern: pickle.load(...)
+    metadata:
+      cwe: CWE-502
+      sink_kind: deserialize
+      semantic_family: deserialization
+  - id: py.yaml-load
+    languages: [python]
+    # `yaml.load(...)` WITHOUT an explicit `Loader=yaml.SafeLoader` is
+    # the classic PyYAML RCE gadget — this simplified extractor can't
+    # check for the presence/absence of that keyword arg, so this rule
+    # flags every `yaml.load` call and lets S4's own analysis judge
+    # whether a safe loader is actually in use, matching how the taint
+    # -confirm prompt already treats a flagged sink as a candidate, not
+    # a verdict.
+    pattern: yaml.load(...)
+    metadata:
+      cwe: CWE-502
+      sink_kind: deserialize
+      semantic_family: deserialization
+  - id: py.marshal-loads
+    languages: [python]
+    pattern: marshal.loads(...)
+    metadata:
+      cwe: CWE-502
+      sink_kind: deserialize
+      semantic_family: deserialization
+
+  # ── code injection / dynamic eval (CWE-94/CWE-95) ───────────────────
+  - id: py.eval-exec
+    languages: [python]
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+    metadata:
+      cwe: CWE-95
+      sink_kind: dyn-eval
+      semantic_family: other
+  - id: js.eval
+    languages: [javascript, typescript]
+    pattern: eval(...)
+    metadata:
+      cwe: CWE-95
+      sink_kind: dyn-eval
+      semantic_family: other
+
+  # ── file-io / path traversal (CWE-22) ───────────────────────────────
+  - id: py.open-file
+    languages: [python]
+    # A bare-call shape. Parsed to nothing at all before the
+    # `bare_call` category existed, so this rule never fired.
+    pattern: open(...)
+    metadata:
+      cwe: CWE-22
+      sink_kind: path
+      semantic_family: file-io
+  - id: py.flask-send-file
+    languages: [python]
+    # `send_file` hands the client whatever path it is given, so a
+    # request-derived filename is a directory traversal. Both import
+    # styles are spelled out: `from flask import send_file` leaves the
+    # call receiver-less (bare_call), `import flask` makes it
+    # `flask.send_file(...)` (module_attr). `send_from_directory` is
+    # deliberately absent — it resolves against a fixed base directory
+    # and rejects escapes, which is the safe API to migrate to.
+    pattern-either:
+      - pattern: send_file(...)
+      - pattern: flask.send_file(...)
+    metadata:
+      cwe: CWE-22
+      sink_kind: path
+      semantic_family: file-io
+  - id: go.os-open
+    languages: [go]
+    pattern-either:
+      - pattern: os.Open(...)
+      - pattern: os.OpenFile(...)
+      - pattern: ioutil.ReadFile(...)
+    metadata:
+      cwe: CWE-22
+      sink_kind: path
+      semantic_family: file-io

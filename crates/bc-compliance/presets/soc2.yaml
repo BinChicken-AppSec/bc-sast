@@ -1,0 +1,87 @@
+# SOC 2 (AICPA Trust Services Criteria) built-in compliance preset.
+#
+# DELIBERATELY MINIMAL — read this before extending it. Unlike
+# `asvs.yaml`, this is NOT a full per-CWE crosswalk, because one genuinely
+# isn't defensible: the TSC is principle-based and auditor-interpreted
+# (~33 broad criteria, each a few sentences of "points of focus"), not a
+# prescriptive technical control list like ASVS's ~300 numbered
+# requirements. A dedicated research pass read the full text of every
+# Common Criteria section (CC1.1-CC9.2) plus the Availability,
+# Confidentiality, and Processing Integrity additional categories and
+# grepped it for the vocabulary an ASVS-style mapping would need
+# (injection, session, buffer, XSS, deserialization, SSRF, race
+# condition, path traversal, ...). Zero matches on all of them. The TSC
+# text simply never names a vulnerability class or attack technique —
+# only broad control objectives like "logical access security" (CC6.1).
+#
+# Consequently: of the 77 CWEs `bc-cwe` recognizes, only 3 have a
+# genuinely specific (not "everything funnels into one broad bucket")
+# textual basis in the TSC. The other 74 are left unmapped here rather
+# than force-fit into CC6.1 — a wrong or padded-out mapping is worse than
+# an honest gap (same principle docs/compliance/CONTROL_MAPPING.md
+# applies to this tool's own posture, cited here for its rigor bar only,
+# not its content). `guidance` below carries the prioritization signal
+# for everything the `requirements` list can't specifically cite.
+#
+# Primary source: AICPA "2017 Trust Services Criteria (with Revised
+# Points of Focus - 2022)". AICPA's own portal is a JS-gated download
+# page, not directly fetchable; content was verified against a
+# third-party-hosted copy of the same publication (structurally
+# confirmed complete: all 9 Common Criteria categories plus Availability/
+# Confidentiality/Processing Integrity, page count consistent with the
+# known ~60-page document) — flagged as secondary-access-to-primary-text,
+# not a secondary paraphrase, matching the same caveat
+# CONTROL_MAPPING.md already applies to its own PCI Secure SLC citations.
+# Verified 2026-08-27.
+#
+# The 3 requirements below:
+#   - CC6.3 (CWE-269): criterion text explicitly names "the concepts of
+#     least privilege and segregation of duties."
+#   - CC6.7 (CWE-319): points of focus explicitly call out "Uses
+#     Encryption Technologies or Secure Communication Channels to
+#     Protect Data" in transit — distinct from CC6.1's data-at-rest
+#     language.
+#   - CC6.8 (CWE-829): criterion covers "controls to prevent or detect
+#     and act upon the introduction of unauthorized or malicious
+#     software"; points of focus include restricting application/
+#     software installation. Flagged as a moderate fit — CC6.8's own
+#     points of focus lean toward endpoint/antivirus controls more than
+#     dependency vetting, but it's the closest genuine textual match.
+#
+# NEVER set scope_mode: filter for this preset. SOC2-relevant findings
+# vastly outnumber what the TSC's own text can specifically name — unlike
+# ASVS, where a Filter-mode preset narrows to a still-broad, genuinely
+# comprehensive requirement set, filtering here would silently drop
+# nearly every real SOC2-relevant finding down to just 3 requirement IDs.
+name: "SOC 2 (AICPA Trust Services Criteria)"
+guidance: |
+  Findings are being evaluated for relevance to a SOC 2 audit (AICPA
+  Trust Services Criteria). The TSC is principle-based, not a technical
+  checklist, so most relevance here is a matter of judgment rather than a
+  fixed CWE mapping. Prioritize confirming: broken or missing access
+  control and authorization (logical access security is the single
+  largest SOC 2 control area); authentication weaknesses and credential
+  handling (hard-coded credentials, weak password recovery, insufficient
+  MFA); privilege management (least privilege, segregation of duties);
+  encryption of data in transit and at rest; and supply-chain integrity
+  (untrusted/unmaintained third-party components, unauthorized software).
+  Availability-impacting issues (uncontrolled resource consumption,
+  missing rate limiting) are relevant if the engagement's Trust Services
+  Category selection includes Availability. Still report findings outside
+  these categories — SOC 2 relevance is a prioritization signal, not a
+  completeness gate, and a human auditor ultimately judges relevance, not
+  this tool.
+scope_mode: annotate
+requirements:
+  - id: "CC6.3"
+    title: "Least privilege and segregation of duties in access management"
+    cwes: ["CWE-269"]
+    vuln_classes: []
+  - id: "CC6.7"
+    title: "Encryption/secure channels to protect data in transit"
+    cwes: ["CWE-319"]
+    vuln_classes: []
+  - id: "CC6.8"
+    title: "Controls to prevent/detect unauthorized or malicious software"
+    cwes: ["CWE-829"]
+    vuln_classes: []

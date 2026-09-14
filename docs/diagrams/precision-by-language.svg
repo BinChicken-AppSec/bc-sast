@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="470" viewBox="0 0 900 470" role="img" aria-label="Precision by language, Python harness versus Rust port. The Rust port scores higher in all eight languages.">
+<text x="54" y="26" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#3d7ab8">Precision by language</text>
+<text x="54" y="46" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b929b">Matched findings as a share of all findings reported. Same model, same targets, same scorer.</text>
+<rect x="54" y="60" width="11" height="11" rx="2" fill="#c2762a"/>
+<text x="71" y="70" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#c2762a">Python harness v1.2.0</text>
+<rect x="216" y="60" width="11" height="11" rx="2" fill="#3d7ab8"/>
+<text x="233" y="70" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#3d7ab8">Rust port</text>
+<line x1="58" y1="394.0" x2="876" y2="394.0" stroke="#8b929b" stroke-width="1" opacity="0.28"/>
+<text x="49" y="398.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="end">0%</text>
+<line x1="58" y1="317.5" x2="876" y2="317.5" stroke="#8b929b" stroke-width="1" opacity="0.28"/>
+<text x="49" y="321.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="end">25%</text>
+<line x1="58" y1="241.0" x2="876" y2="241.0" stroke="#8b929b" stroke-width="1" opacity="0.28"/>
+<text x="49" y="245.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="end">50%</text>
+<line x1="58" y1="164.5" x2="876" y2="164.5" stroke="#8b929b" stroke-width="1" opacity="0.28"/>
+<text x="49" y="168.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="end">75%</text>
+<line x1="58" y1="88.0" x2="876" y2="88.0" stroke="#8b929b" stroke-width="1" opacity="0.28"/>
+<text x="49" y="92.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="end">100%</text>
+<rect x="74.4" y="258.1" width="32.8" height="135.9" rx="2" fill="#c2762a"/>
+<text x="90.7" y="253.1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#c2762a" text-anchor="middle">44.4</text>
+<rect x="111.1" y="88.0" width="32.8" height="306.0" rx="2" fill="#3d7ab8"/>
+<text x="127.5" y="83.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#3d7ab8" text-anchor="middle">100</text>
+<text x="109.1" y="412" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="middle">java-spring</text>
+<rect x="176.6" y="175.5" width="32.8" height="218.5" rx="2" fill="#c2762a"/>
+<text x="193.0" y="170.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#c2762a" text-anchor="middle">71.4</text>
+<rect x="213.4" y="164.5" width="32.8" height="229.5" rx="2" fill="#3d7ab8"/>
+<text x="229.8" y="159.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#3d7ab8" text-anchor="middle">75</text>
+<text x="211.4" y="412" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="middle">csharp-aspnet</text>
+<rect x="278.9" y="241.0" width="32.8" height="153.0" rx="2" fill="#c2762a"/>
+<text x="295.2" y="236.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#c2762a" text-anchor="middle">50</text>
+<rect x="315.6" y="210.4" width="32.8" height="183.6" rx="2" fill="#3d7ab8"/>
+<text x="332.0" y="205.4" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#3d7ab8" text-anchor="middle">60</text>
+<text x="313.6" y="412" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="middle">go-gin</text>
+<rect x="381.1" y="262.7" width="32.8" height="131.3" rx="2" fill="#c2762a"/>
+<text x="397.5" y="257.7" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#c2762a" text-anchor="middle">42.9</text>
+<rect x="417.9" y="164.5" width="32.8" height="229.5" rx="2" fill="#3d7ab8"/>
+<text x="434.3" y="159.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#3d7ab8" text-anchor="middle">75</text>
+<text x="415.9" y="412" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="middle">php-laravel</text>
+<rect x="483.4" y="241.0" width="32.8" height="153.0" rx="2" fill="#c2762a"/>
+<text x="499.7" y="236.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#c2762a" text-anchor="middle">50</text>
+<rect x="520.1" y="210.4" width="32.8" height="183.6" rx="2" fill="#3d7ab8"/>
+<text x="536.5" y="205.4" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#3d7ab8" text-anchor="middle">60</text>
+<text x="518.1" y="412" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="middle">ruby-rails</text>
+<rect x="585.6" y="312.3" width="32.8" height="81.7" rx="2" fill="#c2762a"/>
+<text x="602.0" y="307.3" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#c2762a" text-anchor="middle">26.7</text>
+<rect x="622.4" y="219.3" width="32.8" height="174.7" rx="2" fill="#3d7ab8"/>
+<text x="638.8" y="214.3" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#3d7ab8" text-anchor="middle">57.1</text>
+<text x="620.4" y="412" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="middle">kotlin-ktor</text>
+<rect x="687.9" y="292.1" width="32.8" height="101.9" rx="2" fill="#c2762a"/>
+<text x="704.2" y="287.1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#c2762a" text-anchor="middle">33.3</text>
+<rect x="724.6" y="227.2" width="32.8" height="166.8" rx="2" fill="#3d7ab8"/>
+<text x="741.0" y="222.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#3d7ab8" text-anchor="middle">54.5</text>
+<text x="722.6" y="412" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="middle">rust-axum</text>
+<rect x="790.1" y="210.4" width="32.8" height="183.6" rx="2" fill="#c2762a"/>
+<text x="806.5" y="205.4" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#c2762a" text-anchor="middle">60</text>
+<rect x="826.9" y="175.5" width="32.8" height="218.5" rx="2" fill="#3d7ab8"/>
+<text x="843.3" y="170.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" font-weight="600" fill="#3d7ab8" text-anchor="middle">71.4</text>
+<text x="824.9" y="412" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b929b" text-anchor="middle">c-cli</text>
+<line x1="58" y1="394.0" x2="876" y2="394.0" stroke="#8b929b" stroke-width="1.5" opacity="0.55"/>
+<text x="54" y="448" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b929b">All eight apps: <tspan fill="#c2762a" font-weight="600">Python 44.2%</tspan> vs <tspan fill="#3d7ab8" font-weight="600">Rust 66.1%</tspan> &#183; recall is a tie at 28/32 each.</text>
+</svg>

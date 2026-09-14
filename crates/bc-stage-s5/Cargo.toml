@@ -1,0 +1,24 @@
+[package]
+name = "bc-stage-s5"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+bc-model = { path = "../bc-model" }
+bc-pipeline-core = { path = "../bc-pipeline-core" }
+bc-llm-client = { path = "../bc-llm-client" }
+bc-pathjail = { path = "../bc-pathjail" }
+bc-repo-analysis = { path = "../bc-repo-analysis" }
+bc-stage-s7 = { path = "../bc-stage-s7" }
+regex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+async-trait = { workspace = true }
+tempfile = { workspace = true }

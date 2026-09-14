@@ -1,0 +1,288 @@
+# NIST SP 800-218 (SSDF) v1.1 + SP 800-218A built-in compliance preset.
+#
+# Maps this tool's own detected-vulnerability CWEs (the complete set
+# `bc-cwe` recognizes by name, crates/bc-cwe/src/lib.rs::lookup_name) to
+# NIST Secure Software Development Framework (SSDF) v1.1 practice/task
+# IDs (PO.x/PS.x/PW.x/RV.x). This is a DIFFERENT document from
+# docs/compliance/CONTROL_MAPPING.md, which maps this TOOL's own security
+# posture to external standards, not detected findings in a scanned repo
+# — cited here only for its citation-rigor bar (primary sources, explicit
+# gaps, never a fabricated ID), which this file follows, and because two
+# of its already-documented SSDF gaps (deserialization, log/output
+# redaction) recur below for the same reason, independently re-derived.
+#
+# Primary sources, fetched and read in full (not paraphrased from
+# training-data memory), verified 2026-08-27:
+#   - NIST SP 800-218 (SSDF v1.1, Feb 2022):
+#     nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-218.pdf
+#     — fetched, converted to text with `pdftotext -layout`, and read in
+#     full: Table 1, the entire practice/task table, all four practice
+#     groups — Prepare the Organization (PO.1-PO.5), Protect the Software
+#     (PS.1-PS.3), Produce Well-Secured Software (PW.1-PW.9), Respond to
+#     Vulnerabilities (RV.1-RV.3) — including every task's Notional
+#     Implementation Examples, which is where SSDF's otherwise
+#     process-level task text gets concrete enough to cite against a
+#     specific CWE. Every task ID below (and every retired/renumbered ID
+#     deliberately NOT cited, e.g. PW.3.1/PW.3.2/PW.4.3/PW.4.5/PW.5.2,
+#     all explicitly marked "Moved to..." in the source table) was
+#     transcribed directly from this reading, not from memory.
+#   - NIST SP 800-218A (AI-augmented SSDF addendum, Jul 2024, Final):
+#     nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-218A.pdf
+#     — fetched and read in full (Scope section + Table 1, the "SSDF
+#     Community Profile for AI Model Development"). Its Scope section
+#     states verbatim: "practices for the deployment and operation of AI
+#     systems with AI models are out of scope." This Profile augments
+#     existing SSDF v1.1 task IDs with AI-model-training-specific
+#     recommendations/considerations/notes (reusing PO/PS/PW/RV IDs
+#     unchanged) plus one genuinely new practice, PW.3 "Confirm the
+#     Integrity of Training, Testing, Fine-Tuning, and Aligning Data
+#     Before Use" (training-data provenance/tampering — explicitly
+#     tagged "Not part of SSDF 1.1"). None of this is about general
+#     application source code, so 800-218A contributes ZERO additional
+#     CWE-specific task IDs to this crosswalk beyond what SP 800-218 v1.1
+#     already supplies — the same conclusion CONTROL_MAPPING.md reached
+#     for this tool's own LLM-runtime-output concern (section 8),
+#     reached independently here for the AI-model-training-pipeline case
+#     800-218A actually covers.
+#
+# SSDF's shape is fundamentally different from ASVS's: ~24 process-level
+# tasks total, not ~350 fine-grained technical requirements, most
+# individually broad enough to cover many CWEs at once. Two tasks in
+# particular are genuinely, textually the correct citation for a large
+# fraction of the CWE list below — this is real convergence, not a lazy
+# default:
+#   - PW.5.1 ("follow all secure coding practices... validate all
+#     inputs... avoid unsafe functions... detect errors and handle them
+#     gracefully... check for other vulnerabilities common to the
+#     development languages and environment") is SSDF's only task that
+#     names secure CODING practice at all, so it is the correct target
+#     for essentially every CWE that is fundamentally "the developer
+#     wrote this incorrectly" rather than a process/lifecycle gap.
+#   - PW.7.2 ("perform the code review and/or code analysis... record
+#     and triage all discovered issues," whose own Example 4 reads
+#     verbatim "Use a static analysis tool to automatically check code
+#     for vulnerabilities... with a human reviewing the issues reported
+#     by the tool and remediating them") describes exactly what this
+#     tool itself does for every finding it reports, independent of
+#     which CWE. It covers every CWE PW.5.1 covers, plus two (CWE-840,
+#     CWE-841) that PW.5.1 doesn't — business-logic errors aren't a
+#     "coding practice" defect, but code review/analysis is still how
+#     they get caught.
+# Five CWEs (see the explicit no-match list at the bottom of this
+# comment) get neither, and no other task either — not because nothing
+# "sounds close enough," but because SSDF's text, searched directly, has
+# zero mentions of the underlying concept.
+#
+# Beyond PW.5.1/PW.7.2, more specific tasks are cited where SSDF's own
+# example text names the concept directly, rather than defaulting
+# everything into the two broad tasks above:
+#   - PW.1.1's Example 2 names "protecting sensitive data" and
+#     "identification, authentication, and access control, including
+#     credential management" verbatim as the high-risk areas warranting
+#     rigorous risk assessment — cited for the whole
+#     auth/access-control/credential/sensitive-data-exposure CWE cluster
+#     in place of a generic PW.5.1-only citation.
+#   - PW.1.3 ("standardized security features and services... [e.g.,]
+#     identity management, access control... instead of creating
+#     proprietary implementations") is cited for the identity/auth and
+#     cryptography CWEs specifically — "don't roll your own auth or
+#     crypto" is close to verbatim SSDF text here.
+#   - PW.4.1's practice description names "cryptographic modules and
+#     protocols" verbatim as the paradigm case for reuse-don't-reinvent;
+#     cited for the crypto-strength/randomness/signature-verification CWE
+#     cluster instead of PW.5.1 alone.
+#   - PW.4.4's Example 4 ("still actively maintained and has not reached
+#     end of life") is a near-exact match for CWE-1104 specifically — and
+#     CWE-1104 is deliberately NOT also tagged PW.5.1/PW.7.2, since an
+#     unmaintained dependency isn't a coding-practice defect a "secure
+#     coding practice" or "code review" fixes; only replacing/updating
+#     the component does.
+#   - PW.6.1/PW.6.2's compiler/build-tool-hardening examples (warnings
+#     for "poorly secured code," and "randomize or obfuscate execution
+#     characteristics... that would otherwise be predictable and thus
+#     potentially exploitable") are cited alongside PW.5.1 for the
+#     classic memory-corruption/type-safety CWE cluster.
+#   - PW.9.1/PW.9.2 ("secure baseline"/"default settings... secure...
+#     document each setting") are cited for CWEs that are specifically
+#     about an insecure DEFAULT, not a general coding mistake.
+#   - PW.2.1 (design review confirms the design meets security
+#     requirements) is cited alongside PW.1.1 for the two business-logic
+#     CWEs (840, 841), which are design-level flaws rather than
+#     coding-practice or default-configuration defects.
+#
+# A few mappings are flagged in-line as general/imperfect fits rather
+# than exact matches (matching CONTROL_MAPPING.md's and asvs.yaml's own
+# practice of citing a real but broad task when no narrower one exists):
+# CWE-362/367 (race conditions/TOCTOU), CWE-444 (HTTP request
+# smuggling), CWE-693 (protection mechanism failure), and CWE-1333
+# (ReDoS) rely entirely on PW.5.1's closing catch-all example ("check for
+# other vulnerabilities that are common to the development languages and
+# environment") — SSDF never names any of these concepts specifically.
+# CWE-476 (NULL Pointer Dereference) is included here (PW.5.1's "detect
+# errors, and handle them gracefully" / general catch-all) even though
+# asvs.yaml deliberately excludes it — ASVS is scoped to application
+# *security* controls specifically, while SSDF's stated goal is broader
+# ("reduce the number of vulnerabilities in released software"), so a
+# reliability/DoS-adjacent memory-safety bug plausibly falls under SSDF's
+# language even where it falls outside ASVS's narrower chapters. CWE-502
+# (deserialization) and CWE-532 (sensitive data in log files) repeat,
+# rather than newly discover, two gaps CONTROL_MAPPING.md already
+# documented (sections 4 and 2 respectively): SSDF v1.1 has no task
+# naming either concept specifically; PW.5.1 ("avoid unsafe functions and
+# calls" / general secure coding) is the closest available task for both,
+# cited here as a general fit for the same reason that document gives.
+#
+# CWEs with NO genuine SSDF v1.1/800-218A match, deliberately excluded
+# rather than force-fit into PW.5.1 (a wrong or padded citation is worse
+# than none) — confirmed by direct text search of the full Table 1
+# extraction, not just recollection:
+#   - CWE-400 (Uncontrolled Resource Consumption) and CWE-770 (Allocation
+#     of Resources Without Limits or Throttling): SSDF's practice table
+#     contains zero mentions of denial-of-service, resource exhaustion,
+#     rate-limiting, throttling, or quotas anywhere in Table 1. This is a
+#     missing systemic/architectural control, not a coding-practice
+#     defect PW.5.1's language addresses.
+#   - CWE-426 (Untrusted Search Path): zero mentions of search paths,
+#     DLL/library loading, or the dynamic linker anywhere in the text —
+#     an OS/loader-level concern SSDF's SDLC-practice table never
+#     touches. (asvs.yaml independently reaches the same exclusion for
+#     the same CWE.)
+#   - CWE-732 (Incorrect Permission Assignment for Critical Resource):
+#     the only permission-related task, PS.1.1, is scoped to protecting
+#     the ORGANIZATION's own source-code repository access — the dev
+#     environment's access control, not the scanned application's own
+#     resource-permission-assignment logic at runtime. No task addresses
+#     the latter.
+#   - CWE-923 (Improper Restriction of Communication Channel to Intended
+#     Endpoints): SSDF's practices govern the SDLC (how software is
+#     built/tested/maintained), not a running application's own outbound
+#     network-egress allowlisting; zero mentions of restricting
+#     communication channels or endpoints anywhere in Table 1.
+#
+# Re-verify whenever NIST publishes a new SSDF revision — SP 800-218A's
+# own text ("NIST is also considering adding a column for Implementation
+# Examples in a future version of the Profile") signals this framework is
+# still actively evolving.
+name: "NIST SP 800-218 (SSDF) v1.1"
+guidance: |
+  Findings are being evaluated for relevance to NIST SP 800-218, the
+  Secure Software Development Framework (SSDF) v1.1. SSDF is a
+  process/practice-level framework, not a fine-grained technical
+  checklist like ASVS — most findings will map to one of a small number
+  of broad tasks: PW.5.1 (secure coding practices) as the general "this
+  is what should have prevented it" citation, and PW.7.2 (code
+  review/analysis) as the general "this is how a finding like this gets
+  caught" citation. Prioritize confirming findings whose CWE also maps to
+  a more specific task — memory-safety/buffer-overflow findings relate to
+  PW.6's compiler/build-hardening guidance, authentication/access-control/
+  credential findings relate to PW.1.1's named high-risk areas, and
+  outdated or unmaintained third-party components relate to PW.4.4 —
+  since these carry a more targeted remediation practice than the general
+  PW.5.1/PW.7.2 pair. When a finding's CWE has no SSDF match at all
+  (documented explicitly in this preset's own no-match list), still
+  report it; SSDF relevance is a prioritization signal, not a
+  completeness gate.
+scope_mode: annotate
+requirements:
+  # PW.1 Design Software to Meet Security Requirements and Mitigate
+  # Security Risks
+  - id: "PW.1.1"
+    title: "Risk/threat modeling names sensitive-data and identity/auth/access-control/credential handling as high-risk areas"
+    cwes: [
+      "CWE-200", "CWE-269", "CWE-284", "CWE-285", "CWE-287", "CWE-294",
+      "CWE-306", "CWE-311", "CWE-312", "CWE-319", "CWE-352", "CWE-384",
+      "CWE-522", "CWE-639", "CWE-640", "CWE-668", "CWE-798", "CWE-840",
+      "CWE-841", "CWE-862", "CWE-863", "CWE-915", "CWE-1390",
+    ]
+    vuln_classes: []
+  - id: "PW.1.3"
+    title: "Use standardized identity/access-control/cryptographic services instead of proprietary implementations"
+    cwes: [
+      "CWE-287", "CWE-294", "CWE-326", "CWE-327", "CWE-330", "CWE-345",
+      "CWE-347", "CWE-384", "CWE-522", "CWE-798", "CWE-1390",
+    ]
+    vuln_classes: []
+
+  # PW.2 Review the Software Design to Verify Compliance with Security
+  # Requirements and Risk Information
+  - id: "PW.2.1"
+    title: "Design review confirms the design meets security requirements and addresses identified risk"
+    cwes: ["CWE-840", "CWE-841"]
+    vuln_classes: []
+
+  # PW.4 Reuse Existing, Well-Secured Software When Feasible Instead of
+  # Duplicating Functionality
+  - id: "PW.4.1"
+    title: "Acquire/reuse well-secured third-party components, especially cryptographic modules and protocols"
+    cwes: ["CWE-326", "CWE-327", "CWE-330", "CWE-345", "CWE-347", "CWE-829"]
+    vuln_classes: []
+  - id: "PW.4.4"
+    title: "Verify acquired third-party components remain actively maintained and compliant throughout their lifecycle"
+    cwes: ["CWE-1104"]
+    vuln_classes: []
+
+  # PW.5 Create Source Code by Adhering to Secure Coding Practices
+  - id: "PW.5.1"
+    title: "Follow secure coding practices: validate/encode input-output, avoid unsafe functions, handle errors gracefully"
+    cwes: [
+      "CWE-20", "CWE-22", "CWE-73", "CWE-74", "CWE-77", "CWE-78", "CWE-79",
+      "CWE-89", "CWE-90", "CWE-94", "CWE-95", "CWE-119", "CWE-120",
+      "CWE-121", "CWE-122", "CWE-125", "CWE-134", "CWE-190", "CWE-200",
+      "CWE-209", "CWE-269", "CWE-276", "CWE-284", "CWE-285", "CWE-287",
+      "CWE-294", "CWE-295", "CWE-306", "CWE-311", "CWE-312", "CWE-319",
+      "CWE-326", "CWE-327", "CWE-330", "CWE-345", "CWE-347", "CWE-352",
+      "CWE-362", "CWE-367", "CWE-384", "CWE-416", "CWE-434", "CWE-444",
+      "CWE-476", "CWE-489", "CWE-502", "CWE-522", "CWE-532", "CWE-552",
+      "CWE-601", "CWE-611", "CWE-639", "CWE-640", "CWE-643", "CWE-668",
+      "CWE-693", "CWE-787", "CWE-798", "CWE-829", "CWE-843", "CWE-862",
+      "CWE-863", "CWE-915", "CWE-918", "CWE-1021", "CWE-1188", "CWE-1236",
+      "CWE-1333", "CWE-1390",
+    ]
+    vuln_classes: []
+
+  # PW.6 Configure the Compilation, Interpreter, and Build Processes to
+  # Improve Executable Security
+  - id: "PW.6.1"
+    title: "Use compiler/interpreter/build tools that offer executable-security features"
+    cwes: [
+      "CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125", "CWE-190",
+      "CWE-416", "CWE-787", "CWE-843",
+    ]
+    vuln_classes: []
+  - id: "PW.6.2"
+    title: "Configure and use approved compiler/build security features (warnings, exploit-mitigation obfuscation)"
+    cwes: [
+      "CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-125", "CWE-190",
+      "CWE-416", "CWE-787", "CWE-843",
+    ]
+    vuln_classes: []
+
+  # PW.7 Review and/or Analyze Human-Readable Code to Identify
+  # Vulnerabilities and Verify Compliance with Security Requirements
+  - id: "PW.7.2"
+    title: "Perform code review/code analysis; record and triage discovered vulnerabilities (e.g. via a static analysis tool)"
+    cwes: [
+      "CWE-20", "CWE-22", "CWE-73", "CWE-74", "CWE-77", "CWE-78", "CWE-79",
+      "CWE-89", "CWE-90", "CWE-94", "CWE-95", "CWE-119", "CWE-120",
+      "CWE-121", "CWE-122", "CWE-125", "CWE-134", "CWE-190", "CWE-200",
+      "CWE-209", "CWE-269", "CWE-276", "CWE-284", "CWE-285", "CWE-287",
+      "CWE-294", "CWE-295", "CWE-306", "CWE-311", "CWE-312", "CWE-319",
+      "CWE-326", "CWE-327", "CWE-330", "CWE-345", "CWE-347", "CWE-352",
+      "CWE-362", "CWE-367", "CWE-384", "CWE-416", "CWE-434", "CWE-444",
+      "CWE-476", "CWE-489", "CWE-502", "CWE-522", "CWE-532", "CWE-552",
+      "CWE-601", "CWE-611", "CWE-639", "CWE-640", "CWE-643", "CWE-668",
+      "CWE-693", "CWE-787", "CWE-798", "CWE-829", "CWE-840", "CWE-841",
+      "CWE-843", "CWE-862", "CWE-863", "CWE-915", "CWE-918", "CWE-1021",
+      "CWE-1188", "CWE-1236", "CWE-1333", "CWE-1390",
+    ]
+    vuln_classes: []
+
+  # PW.9 Configure Software to Have Secure Settings by Default
+  - id: "PW.9.1"
+    title: "Define a secure-by-default configuration baseline"
+    cwes: ["CWE-276", "CWE-489", "CWE-552", "CWE-1021", "CWE-1188"]
+    vuln_classes: []
+  - id: "PW.9.2"
+    title: "Implement the default settings and document each one for administrators"
+    cwes: ["CWE-276", "CWE-489", "CWE-552", "CWE-1021", "CWE-1188"]
+    vuln_classes: []

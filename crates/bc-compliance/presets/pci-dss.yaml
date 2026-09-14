@@ -1,0 +1,322 @@
+# PCI-DSS v4.0.1 built-in compliance preset.
+#
+# Maps this tool's own detected-vulnerability CWEs (the complete set
+# `bc-cwe` recognizes by name, crates/bc-cwe/src/lib.rs::lookup_name) to
+# PCI Data Security Standard v4.0.1 (June 2024) requirement IDs.
+#
+# IMPORTANT — scope is deliberately different from this repo's
+# docs/compliance/CONTROL_MAPPING.md, which scopes PCI-DSS to
+# "Requirement 6 only" because *that* document maps this TOOL's own
+# security posture, and the tool itself is a stateless CI scanner that
+# is never itself inside a cardholder-data environment (CDE). This file
+# maps CWEs found in a CUSTOMER's scanned source code, where the
+# customer's application may well be in a CDE and can violate PCI-DSS
+# requirements well outside Requirement 6 — e.g. hard-coded credentials
+# (CWE-798) relates to Requirement 8 (identification/authentication),
+# cleartext storage of account data (CWE-312) relates to Requirement 3,
+# cleartext transmission (CWE-319) relates to Requirement 4. Every CWE
+# below is mapped to whichever real PCI-DSS requirement its primary text
+# actually supports, without restricting to Requirement 6.
+#
+# Primary source: PCI-DSS v4.0.1 (June 2024), the official PCI Security
+# Standards Council "Requirements and Testing Procedures" document
+# (confirmed authentic via the PDF's own embedded metadata: Author
+# "PCISSC@pcisecuritystandards.org", Title "Payment Card Industry Data
+# Security Standard", CreationDate Aug 2024, matching the June 2024
+# v4.0.1 publication). pcisecuritystandards.org's own document-library
+# domain returns HTTP 403 to a direct, unauthenticated fetch of the PDF
+# (docs-prv.pcisecuritystandards.org/PCI%20DSS/Standard/PCI-DSS-v4_0_1.pdf
+# — appears to require the site's click-through-agreement session, same
+# gating CONTROL_MAPPING.md already documents for the PCI Secure
+# Software Standard); the identical official PDF was instead retrieved
+# from a third-party institutional mirror (a university's published copy
+# of the same PCI SSC document) and its full text extracted locally with
+# `pdftotext -layout` and read/grepped directly — not paraphrased from
+# training-data memory. Treat this as PRIMARY-SOURCE text reached via a
+# secondary distribution channel, not a secondary-sourced summary; every
+# requirement ID and quoted phrase below was checked against that
+# extracted text. Sections read in full: Requirement 1 (Network Security
+# Controls), Requirement 2 (Secure Configurations), Requirement 3
+# (Protect Stored Account Data), Requirement 4 (Protect Data in
+# Transit), Requirement 5 (Malicious Software — skimmed, no CWE match),
+# Requirement 6 (Develop and Maintain Secure Systems and Software),
+# Requirement 7 (Restrict Access by Business Need to Know), Requirement
+# 8 (Identify Users and Authenticate Access), Requirement 10 (Logging —
+# read for CWE-532/CWE-209 candidacy), Appendix A1 (Additional
+# Requirements for Multi-Tenant Service Providers). Requirements 9
+# (physical access), 11 (security testing), 12 (policy/governance) were
+# grepped for keywords relevant to the remaining unmapped CWEs
+# (deserialization, SSRF, XXE, file upload, redirect, race condition,
+# ReDoS, clickjacking, CSV injection, debug code, resource exhaustion,
+# file/permission exposure) and found to contain no relevant language;
+# see the no-match list below for the resulting gaps, each with its own
+# reason rather than a silent omission.
+#
+# Requirement 6.2.4 is unusually broad by design of the primary text
+# itself, not an artifact of lumping in this file: its own wording is
+# "Software engineering techniques ... to prevent or mitigate common
+# software attacks and related vulnerabilities ... including but not
+# limited to" five enumerated categories (injection; data/buffer/pointer
+# attacks; cryptography-usage attacks; business-logic/API/XSS/CSRF
+# attacks; access-control-mechanism attacks) — a single requirement ID
+# genuinely covers what ASVS spreads across a dozen granular chapters.
+# Where this file cites 6.2.4 for a CWE not verbatim-named in one of
+# those five bullets (path traversal CWE-22/CWE-73, mass assignment
+# CWE-915), it is doing what this repo's own CONTROL_MAPPING.md already
+# does for its path-jailing control ("General bucket, not
+# path-traversal-specific") — flagged here the same way, not silently.
+#
+# A few CWEs are cited under more than one requirement ID because the
+# primary text genuinely supports both a broad, code-level citation
+# (usually 6.2.4) and a narrower, more specific one elsewhere (e.g.
+# CWE-306/CWE-287 under both 6.2.4's access-control-mechanism bullet and
+# 8.3.1's literal "authenticated via at least one authentication factor"
+# language). Kept as multiple real citations rather than picking one,
+# matching asvs.yaml's own practice for CWE-918 and CWE-347.
+#
+# CWEs with NO genuine PCI-DSS v4.0.1 match, deliberately excluded
+# rather than force-fit into a nearby bucket (a wrong control ID is
+# worse than none) — see the crate-level test for the authoritative,
+# regression-guarded list:
+#   - CWE-209 (Error Message w/ Sensitive Info): no PCI-DSS requirement
+#     addresses error-message/exception/stack-trace content anywhere in
+#     the primary text.
+#   - CWE-276 (Incorrect Default Permissions), CWE-732 (Incorrect
+#     Permission Assignment for Critical Resource): OS/filesystem/cloud
+#     -resource permission-bit issues; PCI-DSS's access-control chapters
+#     (7/8) govern human and application/system *accounts*, not POSIX or
+#     cloud-resource permission bits — no textual hook found.
+#   - CWE-362 (Race Condition), CWE-367 (TOCTOU): concurrency-class bugs
+#     not enumerated in 6.2.4's attack categories and not addressed
+#     anywhere else in the standard.
+#   - CWE-384 (Session Fixation): PCI-DSS has session-idle-timeout
+#     language (8.2.8) but nothing on session-identifier regeneration at
+#     authentication time.
+#   - CWE-400 (Uncontrolled Resource Consumption), CWE-770 (Allocation
+#     of Resources Without Limits/Throttling), CWE-1333 (Inefficient
+#     Regular Expression Complexity / ReDoS): no PCI-DSS requirement
+#     addresses application-level availability/DoS resistance in
+#     bespoke code; Requirement 10.7's "critical security control
+#     failure" language is about operational security *tooling* (NSCs,
+#     IDS/IPS, anti-malware) going offline, a different concern.
+#   - CWE-426 (Untrusted Search Path): native-binary/OS dynamic-linker
+#     search-path hijacking — outside PCI-DSS's application secure
+#     -coding language entirely.
+#   - CWE-434 (Unrestricted Upload of File with Dangerous Type): no
+#     PCI-DSS text on file-upload type/content validation.
+#   - CWE-476 (NULL Pointer Dereference): a crash/reliability bug, not a
+#     security control PCI-DSS addresses.
+#   - CWE-489 (Active Debug Code): no PCI-DSS text mentions debug
+#     modes/code anywhere in the primary document.
+#   - CWE-502 (Deserialization of Untrusted Data): no deserialization
+#     -specific language anywhere in PCI-DSS v4.0.1 — the identical gap
+#     this repo's own CONTROL_MAPPING.md already documents for
+#     Requirement 6 specifically, confirmed here to hold standard-wide.
+#   - CWE-552 (Files/Directories Accessible to External Parties): no
+#     PCI-DSS text on exposed files/directories, directory listings, or
+#     misconfigured storage buckets.
+#   - CWE-601 (Open Redirect): no PCI-DSS text on redirect-target
+#     validation (the standard's only "redirection" hit is an unrelated
+#     glossary mention of e-commerce redirection *servers* as in-scope
+#     network components).
+#   - CWE-611 (XML External Entity Reference): no PCI-DSS text on XML
+#     parser configuration or external-entity handling.
+#   - CWE-693 (Protection Mechanism Failure): Requirement 10.7's
+#     "critical security control system failure" language is scoped to
+#     operational security tooling failing (a firewall going offline),
+#     not an application's own internal protection-check logic failing
+#     open — a different scope than this CWE.
+#   - CWE-843 (Type Confusion): not a literal fit for 6.2.4's
+#     "attacks on data and data structures" bullet, which is about
+#     buffer/pointer/shared-data manipulation (memory safety in
+#     unmanaged languages); type-safety violations are a distinct
+#     concern the standard doesn't enumerate.
+#   - CWE-918 (SSRF), CWE-923 (Improper Restriction of Communication
+#     Channel to Intended Endpoints): PCI-DSS's only outbound-traffic
+#     -restriction language (1.3.2) is a network-firewall/NSC control, a
+#     different control layer than application-code destination
+#     allowlisting; no Requirement 6 language addresses either
+#     SSRF-style attack.
+#   - CWE-1021 (Improper Restriction of Rendered UI Layers/Frames /
+#     clickjacking): no PCI-DSS text on frame-embedding or clickjacking
+#     protections.
+#   - CWE-1236 (CSV/Formula Injection): no PCI-DSS text on
+#     spreadsheet/formula-injection risk.
+#
+# Re-verify whenever PCI SSC publishes a new DSS revision — several
+# requirements cited below were "best practice until 31 March 2025" in
+# the source text and are fully mandatory as of this file's verification
+# date, but a future version renumbering (as ASVS v5.0.0 did) would
+# silently invalidate this crosswalk if not re-checked.
+name: "PCI-DSS v4.0.1"
+guidance: |
+  Findings are being evaluated for relevance to the PCI Data Security
+  Standard (PCI-DSS) v4.0.1. Prioritize confirming anything that could
+  expose, weaken protection of, or bypass access controls around
+  account data (primary account number and sensitive authentication
+  data): injection flaws, hard-coded credentials or cryptographic keys,
+  cleartext storage or transmission of account data, weak or broken
+  cryptography, missing or bypassable authentication/authorization
+  checks, and use of unmaintained or unpatched third-party components.
+  When a finding's CWE or vulnerability class doesn't clearly map to a
+  specific PCI-DSS requirement, still report it; PCI-DSS relevance is a
+  prioritization signal, not a completeness gate.
+scope_mode: annotate
+requirements:
+  # Requirement 2: Apply Secure Configurations to All System Components
+  - id: "2.2.2"
+    title: "Vendor default accounts changed or removed/disabled"
+    cwes: ["CWE-1188"]
+    vuln_classes: []
+
+  # Requirement 3: Protect Stored Account Data
+  - id: "3.3.1"
+    title: "Sensitive authentication data not stored after authorization (Applicability Notes for 3.3.1.1-3.3.1.3 name \"all logs\" among prohibited storage locations)"
+    cwes: ["CWE-532"]
+    vuln_classes: []
+  - id: "3.4.1"
+    title: "Full PAN masked on display; unmasked only for roles with a documented business need"
+    cwes: ["CWE-200"]
+    vuln_classes: ["info-leak"]
+  - id: "3.5.1"
+    title: "PAN rendered unreadable wherever stored (one-way hash, truncation, index token, or strong cryptography)"
+    cwes: ["CWE-311", "CWE-312"]
+    vuln_classes: []
+  - id: "3.7.1"
+    title: "Key-management policies/procedures include generation of strong cryptographic keys"
+    cwes: ["CWE-330"]
+    vuln_classes: []
+
+  # Requirement 4: Protect Cardholder Data with Strong Cryptography During Transmission
+  - id: "4.2.1"
+    title: "Strong cryptography/security protocols for PAN in transit; only trusted, unexpired keys/certs accepted; no fallback to insecure versions/algorithms/key sizes"
+    cwes: ["CWE-295", "CWE-319", "CWE-326", "CWE-327"]
+    vuln_classes: []
+
+  # Requirement 6: Develop and Maintain Secure Systems and Software
+  - id: "6.2.4"
+    title: "Software engineering techniques to prevent/mitigate common software attacks: injection; data/buffer/pointer attacks; cryptography-usage attacks; business-logic/API/XSS/CSRF attacks; access-control-mechanism attacks"
+    cwes:
+      [
+        "CWE-20",
+        "CWE-22",
+        "CWE-73",
+        "CWE-74",
+        "CWE-77",
+        "CWE-78",
+        "CWE-79",
+        "CWE-89",
+        "CWE-90",
+        "CWE-94",
+        "CWE-95",
+        "CWE-119",
+        "CWE-120",
+        "CWE-121",
+        "CWE-122",
+        "CWE-125",
+        "CWE-134",
+        "CWE-190",
+        "CWE-284",
+        "CWE-285",
+        "CWE-287",
+        "CWE-306",
+        "CWE-326",
+        "CWE-327",
+        "CWE-330",
+        "CWE-345",
+        "CWE-347",
+        "CWE-352",
+        "CWE-416",
+        "CWE-444",
+        "CWE-643",
+        "CWE-787",
+        "CWE-840",
+        "CWE-841",
+        "CWE-862",
+        "CWE-863",
+        "CWE-915",
+      ]
+    vuln_classes:
+      [
+        "injection",
+        "heap-overflow",
+        "stack-overflow",
+        "format-string",
+        "integer-overflow",
+        "use-after-free",
+        "logic-flaw",
+      ]
+  - id: "6.3.1"
+    title: "Security vulnerabilities identified and risk-ranked, covering both bespoke/custom and third-party software"
+    cwes: ["CWE-1104"]
+    vuln_classes: []
+  - id: "6.3.2"
+    title: "Inventory of bespoke/custom software and third-party components incorporated into it, maintained for vulnerability/patch management"
+    cwes: ["CWE-1104"]
+    vuln_classes: []
+  - id: "6.3.3"
+    title: "Known vulnerabilities patched (critical vulnerabilities within one month of release; others on a risk-assessed timeframe)"
+    cwes: ["CWE-1104"]
+    vuln_classes: []
+  - id: "6.4.3"
+    title: "Payment page scripts authorized, integrity-verified (e.g. SRI/CSP), and inventoried"
+    cwes: ["CWE-829"]
+    vuln_classes: []
+
+  # Requirement 7: Restrict Access to System Components and Cardholder Data by Business Need to Know
+  - id: "7.2.2"
+    title: "Access assigned to users, including privileged users, based on job classification/function and least privilege"
+    cwes: ["CWE-269"]
+    vuln_classes: []
+  - id: "7.2.5"
+    title: "Application and system accounts assigned least privilege necessary for the system/application's operability"
+    cwes: ["CWE-269"]
+    vuln_classes: []
+  - id: "7.3.1"
+    title: "Access control system(s) restrict access based on a user's need to know and cover all system components"
+    cwes: ["CWE-639"]
+    vuln_classes: []
+  - id: "7.3.2"
+    title: "Access control system(s) configured to enforce permissions per job classification/function"
+    cwes: ["CWE-863"]
+    vuln_classes: []
+  - id: "7.3.3"
+    title: "Access control system(s) set to \"deny all\" by default"
+    cwes: ["CWE-862"]
+    vuln_classes: []
+
+  # Requirement 8: Identify Users and Authenticate Access to System Components
+  - id: "8.3.1"
+    title: "All user/administrator access to system components authenticated via at least one authentication factor"
+    cwes: ["CWE-287", "CWE-306"]
+    vuln_classes: []
+  - id: "8.3.2"
+    title: "Strong cryptography renders all authentication factors unreadable during transmission and storage"
+    cwes: ["CWE-522"]
+    vuln_classes: []
+  - id: "8.3.3"
+    title: "User identity verified before modifying any authentication factor, including password resets"
+    cwes: ["CWE-640"]
+    vuln_classes: []
+  - id: "8.3.5"
+    title: "Passwords/passphrases set to a unique value for first-time use/reset, forced to change immediately after"
+    cwes: ["CWE-640"]
+    vuln_classes: []
+  - id: "8.4.2"
+    title: "Multi-factor authentication implemented for all non-console access into the CDE"
+    cwes: ["CWE-1390"]
+    vuln_classes: []
+  - id: "8.5.1"
+    title: "MFA system(s) not susceptible to replay attacks and cannot be bypassed by any user without documented, time-limited management exception"
+    cwes: ["CWE-294"]
+    vuln_classes: []
+  - id: "8.6.2"
+    title: "Passwords/passphrases for interactive-login application/system accounts are not hard coded in scripts, configuration/property files, or bespoke and custom source code"
+    cwes: ["CWE-798"]
+    vuln_classes: []
+
+  # Appendix A1: Additional PCI DSS Requirements for Multi-Tenant Service Providers
+  - id: "A1.1.2"
+    title: "Controls ensure each customer only has permission to access its own cardholder data and CDE (conditionally applicable: multi-tenant service providers only)"
+    cwes: ["CWE-668"]
+    vuln_classes: []

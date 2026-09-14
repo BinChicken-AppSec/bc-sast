@@ -1,0 +1,69 @@
+[package]
+name = "bc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "bc-sast"
+path = "src/main.rs"
+
+[dependencies]
+tempfile = { workspace = true }
+bc-pathjail = { path = "../bc-pathjail" }
+bc-target-tests = { path = "../bc-target-tests" }
+bc-llm-agentic = { path = "../bc-llm-agentic" }
+bc-model = { path = "../bc-model" }
+bc-cvss = { path = "../bc-cvss" }
+bc-pipeline-core = { path = "../bc-pipeline-core" }
+bc-llm-client = { path = "../bc-llm-client" }
+bc-llm-openai = { path = "../bc-llm-openai" }
+bc-llm-anthropic = { path = "../bc-llm-anthropic" }
+bc-gateway-http = { path = "../bc-gateway-http" }
+bc-sandbox-tools = { path = "../bc-sandbox-tools" }
+bc-orchestrator = { path = "../bc-orchestrator" }
+bc-pricing = { path = "../bc-pricing" }
+bc-stage-s0 = { path = "../bc-stage-s0" }
+bc-stage-s1 = { path = "../bc-stage-s1" }
+bc-stage-s2 = { path = "../bc-stage-s2" }
+bc-stage-s3 = { path = "../bc-stage-s3" }
+bc-stage-s4 = { path = "../bc-stage-s4" }
+bc-stage-s5 = { path = "../bc-stage-s5" }
+bc-stage-s6 = { path = "../bc-stage-s6" }
+bc-stage-s7 = { path = "../bc-stage-s7" }
+bc-stage-s8 = { path = "../bc-stage-s8" }
+bc-stage-s10 = { path = "../bc-stage-s10" }
+bc-stage-s11 = { path = "../bc-stage-s11" }
+bc-validation-scoring = { path = "../bc-validation-scoring" }
+bc-policy-gate = { path = "../bc-policy-gate" }
+bc-github = { path = "../bc-github" }
+bc-compliance = { path = "../bc-compliance" }
+bc-config = { path = "../bc-config" }
+bc-repo-analysis = { path = "../bc-repo-analysis" }
+bc-report-md = { path = "../bc-report-md" }
+bc-sarif = { path = "../bc-sarif" }
+bc-csv = { path = "../bc-csv" }
+bc-redact = { path = "../bc-redact" }
+bc-checkpoint = { path = "../bc-checkpoint" }
+bc-diffcapture = { path = "../bc-diffcapture" }
+bc-interactive = { path = "../bc-interactive" }
+bc-thirdparty-api = { path = "../bc-thirdparty-api" }
+clap = { workspace = true }
+reqwest = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha1 = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "process", "time", "io-util"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+indicatif = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+rstest = { workspace = true }
+wiremock = { workspace = true }

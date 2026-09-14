@@ -1,0 +1,26 @@
+[package]
+name = "bc-redact"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# fancy-regex: vetted 2026-07-21 against docs/supply-chain.md — crate created 2017,
+# latest version (0.18.0) published ~3 months prior, 181M+ total / 44M+ recent
+# downloads, MIT-licensed, maintained under github.com/fancy-regex/fancy-regex.
+# Needed because several redaction patterns (PAN/SSN boundaries, the SECRET
+# camelCase lookbehind + backreference) require lookaround/backreferences that the
+# base `regex` crate deliberately does not support. Referenced via `workspace
+# = true` (the pin itself lives in the root `Cargo.toml`, alongside the same
+# vetting note) rather than a second copy-pasted direct pin here, so the two
+# don't drift out of sync — see the root manifest's own comment on this entry.
+fancy-regex = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+proptest = { workspace = true }

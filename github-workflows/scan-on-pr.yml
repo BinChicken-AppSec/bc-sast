@@ -1,0 +1,177 @@
+# Scan a pull request with bc-sast.
+#
+# Copy this into the `.github/workflows/` of a repository you want
+# SCANNED, not into the scanner's own repo. It is the second half of
+# `docs/deployment.md`: it pulls an image already published by
+# `build-and-publish-image.yml` rather than building one.
+#
+# Set these first:
+#
+#   vars.SCANNER_IMAGE          the published image, pinned by sha tag or
+#                               digest, for example
+#                               registry.example.internal/security/bc-sast@sha256:...
+#                               Never `:latest`: a scan result is only
+#                               reproducible if you can say which scanner
+#                               produced it, and a moving tag silently
+#                               changes your merge gate overnight.
+#   vars.BC_GATEWAY_BASE_URL    your OpenAI- or Anthropic-compatible gateway
+#   vars.BC_MODEL               the model id used for every stage
+#   vars.BC_DIALECT             "openai" or "anthropic" (default: openai)
+#   secrets.BC_GATEWAY_API_KEY  the gateway credential
+#
+# SCOPE: this is the same-repository variant, where the automatically
+# provided GITHUB_TOKEN can both read the PR diff and write review
+# comments. Pull requests FROM FORKS get a read-only GITHUB_TOKEN, so a
+# single job cannot both scan and post; those need the two-workflow
+# `pull_request` + `workflow_run` split described in
+# `docs/github-action.md`. If this repository accepts fork PRs, read that
+# section before relying on this file.
+
+name: security scan
+
+on:
+  pull_request:
+    # The protected branch you are gating. Change to match yours.
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write    # Code Scanning SARIF upload
+  pull-requests: write      # PR review comments
+
+env:
+  SCANNER_IMAGE: ${{ vars.SCANNER_IMAGE }}
+
+jobs:
+  scan:
+    # A self-hosted runner is the preferred target: the image pull stays
+    # on your own network, and the gateway credential and the scanned
+    # source never leave it. Replace this label set with your own.
+    #
+    # Prefer EPHEMERAL runners (one job per runner, discarded afterwards:
+    # `--ephemeral` on the runner registration, or a
+    # container/VM-per-job autoscaler). This job bind-mounts the checkout
+    # into a container and chmods it wide open below; on a long-lived,
+    # shared runner that working directory would outlive the job.
+    #
+    # `runs-on: ubuntu-latest` also works unchanged, as long as the
+    # hosted runner can reach and authenticate to your registry. If it
+    # cannot, use the container action instead (`action.yml`), which
+    # builds the image from source on the runner. See
+    # `docs/github-action.md`.
+    runs-on: [self-hosted, linux, x64]
+
+    steps:
+      # `ref:` is NOT optional. A bare checkout on a `pull_request`
+      # trigger gives you GitHub's synthetic merge commit, not the PR's
+      # real head, and this checkout is what the container scans, so the
+      # wrong ref means the wrong file content, not just a wrong recorded
+      # sha. It is also the sha `--git-sha` must be given, because
+      # comments anchored to a commit that is not part of the PR are
+      # rejected by GitHub's API.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # The image is distroless and runs as a non-root uid with no shell,
+      # so it cannot fix ownership from the inside. The bind-mounted
+      # checkout has to be writable by it or the scan fails at the very
+      # end, after every LLM call has already been paid for. `chmod -R`
+      # over the WHOLE checkout, not just `security-scan/`: with
+      # `--remediate` on, the fix stage edits repo files in place and
+      # then diffs them, and a read-only checkout makes every fix report
+      # a null diff instead of an error.
+      - name: Make the checkout writable by the container
+        run: mkdir -p security-scan && chmod -R 777 .
+
+      - name: Pull the scanner image
+        run: docker pull "$SCANNER_IMAGE"
+
+      # Both credentials go in as environment variables, never as CLI
+      # arguments, so neither appears in a process listing or a shell
+      # trace: `--gateway-api-key` and `--github-token` are both wired to
+      # BC_GATEWAY_API_KEY / GITHUB_TOKEN.
+      #
+      # Passing --github-token/--github-repo/--pr-number at SCAN time
+      # does two things at once: it lets --diff-scope fetch the PR diff,
+      # and it makes the scan itself post and reconcile the per-finding
+      # review comments (one comment per finding, keyed by a stable id,
+      # updated rather than duplicated on re-scan).
+      - name: Run the scan
+        env:
+          BC_GATEWAY_API_KEY: ${{ secrets.BC_GATEWAY_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -e BC_GATEWAY_API_KEY \
+            -e GITHUB_TOKEN \
+            "$SCANNER_IMAGE" \
+            --repo /workspace \
+            --gateway-base-url "${{ vars.BC_GATEWAY_BASE_URL }}" \
+            --dialect "${{ vars.BC_DIALECT || 'openai' }}" \
+            --model "${{ vars.BC_MODEL }}" \
+            --git-sha "${{ github.event.pull_request.head.sha }}" \
+            --diff-scope \
+            --github-repo "${{ github.repository }}" \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --out-sarif /workspace/security-scan/report.sarif \
+            --out-findings-json /workspace/security-scan/findings.json \
+            --max-tokens 4000000 \
+            --max-scan-seconds 3600 \
+            --no-progress
+
+      # ---------------------------------------------------------------
+      # OPTIONAL: automated remediation.
+      #
+      # Delete this whole block if you only want findings. Enabled, it
+      # asks the model to produce a fix for each verified finding and
+      # posts them as GitHub suggested-change comments the author can
+      # accept in one click. It costs a second pass of model calls, and
+      # the fixes are proposals; nothing is committed or merged here.
+      #
+      # Two steps, because fix-suggestion comments are NOT posted by the
+      # scan itself: `--remediate-from` reads the findings the scan just
+      # wrote and produces remediation.json (augmenting report.sarif in
+      # place, which is why this sits BEFORE the upload below), and a
+      # separate `--post-fixes-from` invocation posts the suggestions.
+      # ---------------------------------------------------------------
+      # - name: Remediate the verified findings
+      #   env:
+      #     BC_GATEWAY_API_KEY: ${{ secrets.BC_GATEWAY_API_KEY }}
+      #   run: |
+      #     docker run --rm \
+      #       -v "$PWD:/workspace" \
+      #       -e BC_GATEWAY_API_KEY \
+      #       "$SCANNER_IMAGE" \
+      #       --repo /workspace \
+      #       --gateway-base-url "${{ vars.BC_GATEWAY_BASE_URL }}" \
+      #       --model "${{ vars.BC_MODEL }}" \
+      #       --remediate-from /workspace/security-scan/findings.json \
+      #       --out-sarif /workspace/security-scan/report.sarif \
+      #       --out-remediation-json /workspace/security-scan/remediation.json \
+      #       --no-progress
+      #
+      # - name: Post the fix suggestions
+      #   if: hashFiles('security-scan/remediation.json') != ''
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #   run: |
+      #     docker run --rm \
+      #       -v "$PWD:/workspace" \
+      #       -e GITHUB_TOKEN \
+      #       "$SCANNER_IMAGE" \
+      #       --repo /workspace \
+      #       --gateway-base-url unused \
+      #       --post-fixes-from /workspace/security-scan/remediation.json \
+      #       --github-repo "${{ github.repository }}" \
+      #       --pr-number "${{ github.event.pull_request.number }}"
+
+      # Last, so that an enabled remediation block above has already
+      # augmented the SARIF in place. `always()`, because a budget stop
+      # still produces a report and partial results are worth surfacing.
+      - name: Upload to Code Scanning
+        if: always() && hashFiles('security-scan/report.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: security-scan/report.sarif

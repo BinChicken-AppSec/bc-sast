@@ -1,0 +1,200 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# Every direct dependency is pinned to an exact version that was checked
+# against docs/supply-chain.md at the time it was added (published >=30
+# days prior, real adoption/history, no typosquat risk) rather than left on
+# a loose range that `cargo update` could silently bump to a same-day
+# release. Bump deliberately, re-vetting the new version each time.
+[workspace.dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+regex = "=1.12.4"
+thiserror = "=2.0.18"
+tempfile = "=3.27.0"
+rstest = "=0.23.0"
+proptest = "=1.11.0"
+time = "=0.3.49"
+# Pinned to 0.1.89 (published 2025-08-14), not the latest 0.1.91 (published
+# 2026-07-18, three days before this was vetted), so it stays >=30 days old per
+# the project's supply-chain policy. dtolnay/async-trait, 560M+ downloads.
+async-trait = "=0.1.89"
+# `rustls` (reqwest 0.13's feature, backed by rustls-platform-verifier): TLS
+# via rustls, certificate verification via the OS/container's own trust
+# store, not a separate compiled-in Mozilla root list, so a private-CA
+# gateway only needs its cert added to the image's trust store, matching the
+# container design (see docs/supply-chain.md). default-features off to skip
+# charset/http2/system-proxy, unneeded for a JSON-over-HTTPS gateway client.
+# 0.13.4 published 2026-05-25, >=30 days old at time of vetting.
+reqwest = { version = "=0.13.4", default-features = false, features = [
+    "rustls",
+] }
+# Already pulled in transitively by reqwest's `rustls` feature; depended on
+# directly only to eagerly validate a `ca_cert_path` file's PEM syntax
+# before handing it to reqwest (which, on the rustls backend, defers PEM
+# parsing until first real TLS connection instead of at client-build time,
+# which is too late for a fail-closed startup check on a security-relevant config
+# input). rustls org, 401M+ downloads. 1.14.1 published 2026-04-24, >=30
+# days old at time of vetting (the newer 1.15.0 was not: 21 days old).
+rustls-pki-types = "=1.14.1"
+# Async runtime, needed once any crate makes real async HTTP calls (reqwest)
+# or spins up a wiremock server in tests. 1.52.3 published 2026-05-08, >=30
+# days old at time of vetting (1.52.4/1.53.0/1.53.1 were all <30 days old).
+tokio = "=1.52.3"
+# The de facto standard Rust CLI argument parser, needed by `bc-cli`.
+# clap-rs org, created 2015, 459 published versions, ~981M all-time /
+# ~203M recent downloads, MIT OR Apache-2.0 (both already allowlisted).
+# Pinned to 4.5.51 (published 2025-10-29, >=30 days old at time of
+# vetting), not the newest 4.6.4 (published 1 day before this check).
+clap = { version = "=4.5.51", features = ["derive", "env"] }
+# HTTP mocking for I/O-boundary crate tests (dev-dependency only), per the
+# testing strategy in the architecture plan. tokio-rs org, 62M+ downloads.
+# 0.6.5 published 2025-08-24, >=30 days old at time of vetting.
+wiremock = "=0.6.5"
+# rust-lang/glob, 518M+ downloads, used by cargo itself. Only third-party
+# dep bc-sandbox-tools needs (Glob-tool pattern matching). Jailing/
+# recursive-walk/redaction all reuse existing in-workspace crates.
+# 0.3.3 published 2025-08-11, >=30 days old at time of vetting.
+glob = "=0.3.3"
+# fancy-regex: vetted 2026-07-21 against docs/supply-chain.md
+# (github.com/fancy-regex/fancy-regex, MIT, 181M+ downloads). The single
+# source of truth for this pin: both `bc-redact` and `bc-repo-analysis`
+# reference it via `workspace = true` rather than each keeping their own
+# copy-pasted direct pin. Needed for lookaround/backreferences the base
+# `regex` crate deliberately doesn't support: `bc-redact`'s PAN/SSN
+# boundary and SECRET camelCase lookbehind+backreference patterns, and
+# `bc-repo-analysis`'s config-dedup negative-lookahead secret-detection
+# regex.
+fancy-regex = "=0.18.0"
+# RustCrypto org (github.com/RustCrypto/hashes), 416M+ downloads. Used only
+# for config-dedup's shape-hash clustering key (SHA-1 is fine here, since it's
+# an identity-grouping hash, not a security control). 0.11.0 published
+# 2026-03-27, >=30 days old at time of vetting.
+sha1 = "=0.11.0"
+# The de facto standard Rust SQLite binding (rusqlite org, created 2014,
+# 83M+ downloads, MIT). Needed for `bc-checkpoint`'s Phase-2 persistent
+# `CheckpointStore` (`--resume` support for S10 remediation runs), matching
+# the Python original's own SQLite-backed state store. `bundled` compiles
+# SQLite from source rather than linking a system library, consistent with
+# this project's container build already needing a C toolchain (cmake/
+# clang) for `aws-lc-sys`, and it avoids a version/availability mismatch
+# with whatever SQLite (if any) is installed on a given build host. 0.40.1
+# published 2026-06-06, >=30 days old at time of vetting (the latest stable
+# release, no newer version exists to prefer instead).
+rusqlite = { version = "=0.40.1", features = ["bundled"] }
+# The de facto standard cross-platform terminal manipulation crate
+# (crossterm-rs org, created 2018, 162M+ all-time / 39M+ recent downloads,
+# MIT), used by `bc-interactive`'s `-i`/`--interactive` finding picker for
+# raw-mode terminal control, cross-platform key-event reading (POSIX +
+# Windows console API), and cursor/screen manipulation, matching the
+# Python original's own hand-rolled `termios`/`tty`/`msvcrt` + literal ANSI
+# escape codes, but through a mature, widely-used library instead of
+# hand-rolled unsafe FFI (getting raw-mode restoration wrong risks leaving
+# a user's real terminal broken, exactly the kind of low-level platform
+# code this vetting policy exists to be conservative about). Default
+# features (needed: `events` for `event::read()`, `windows` for Windows
+# console support, and both are default-on, not extras). 0.29.0 published
+# 2025-04-05, >=30 days old at time of vetting (the latest stable release,
+# no newer version exists to prefer instead).
+crossterm = "=0.29.0"
+# tree-sitter org (github.com/tree-sitter), created 2018, 34.7M+ downloads,
+# MIT. Needed for `bc-callgraph`'s S0 static seed engine (AST-native
+# source/sink call-site extraction), matching the Python original's own
+# `tree-sitter`+`tree-sitter-language-pack` dependency. 0.26.11 published
+# 2026-07-12, >=30 days old at time of vetting (0.26.12/0.26.13 were both
+# <30 days old).
+tree-sitter = "=0.26.11"
+# tree-sitter org, 13.9M+ downloads, MIT. 0.25.0 published 2025-09-11.
+# Used by both `bc-callgraph` (S0's manual Node-walking extractors) and
+# `bc-repo-analysis` (S1's `ts_graph` Query-based call-graph backend).
+tree-sitter-python = "=0.25.0"
+# tree-sitter org, 10.4M+ downloads, MIT. 0.23.5 published 2024-12-21.
+# Used by `bc-callgraph` and `bc-repo-analysis`. See `tree-sitter-python`'s
+# comment.
+tree-sitter-java = "=0.23.5"
+# tree-sitter org, 11.8M+ downloads, MIT. 0.25.0 published 2025-09-01.
+# Used by `bc-callgraph` and `bc-repo-analysis`. See `tree-sitter-python`'s
+# comment.
+tree-sitter-javascript = "=0.25.0"
+# tree-sitter org, 12.9M+ downloads, MIT. 0.23.2 published 2024-11-11.
+# Used by `bc-callgraph` and `bc-repo-analysis`. See `tree-sitter-python`'s
+# comment.
+tree-sitter-typescript = "=0.23.2"
+# tree-sitter org, 11.5M+ downloads, MIT. 0.25.0 published 2025-08-29.
+# Used by `bc-callgraph` and `bc-repo-analysis`. See `tree-sitter-python`'s
+# comment.
+tree-sitter-go = "=0.25.0"
+# tree-sitter org, 5.4M+ downloads, MIT. 0.23.5 published 2026-04-14.
+# Used by `bc-callgraph` and `bc-repo-analysis`. See `tree-sitter-python`'s
+# comment.
+tree-sitter-c-sharp = "=0.23.5"
+# tree-sitter-grammars org (github.com/tree-sitter-grammars), the modern
+# community-maintained successor project, created 2024-08-30, 2.08M+
+# downloads (vs. the older, less-maintained `tree-sitter-kotlin` (fwcd)'s
+# 398K), MIT. 1.1.0 published 2025-01-09, >=30 days old at time of vetting.
+# `bc-repo-analysis`'s `ts_graph` Kotlin query is written against this
+# grammar's actual node shape (`identifier`, no `simple_identifier`/
+# `navigation_suffix` wrapper, confirmed via a live parse-tree probe),
+# which differs from the older fwcd grammar the Python original's
+# `tree-sitter-language-pack` dependency wraps; see `ts_graph.rs`'s own
+# comment on the Kotlin query entry.
+tree-sitter-kotlin-ng = "=1.1.0"
+# tree-sitter org, 10.1M+ downloads, MIT. 0.24.2 published 2026-04-22.
+tree-sitter-c = "=0.24.2"
+# tree-sitter org, 10.4M+ downloads, MIT. 0.23.4 published 2024-11-11.
+tree-sitter-cpp = "=0.23.4"
+# tree-sitter org, 6.0M+ downloads, MIT. 0.23.1 published 2024-11-11.
+tree-sitter-ruby = "=0.23.1"
+# tree-sitter org, 4.5M+ downloads, MIT. 0.24.2 published 2025-08-18.
+# Exports two grammar variants (`LANGUAGE_PHP`/`LANGUAGE_PHP_ONLY`). This
+# port uses `LANGUAGE_PHP` (embeddable-HTML-aware), matching the Python
+# original's plain `"php"` grammar-pack alias.
+tree-sitter-php = "=0.24.2"
+# tree-sitter org, 17.6M+ downloads, MIT. 0.24.2 published 2026-03-27.
+tree-sitter-rust = "=0.24.2"
+# alex-pinkus/tree-sitter-swift (not under the tree-sitter org, since no
+# official org-maintained Swift grammar exists), 4.7M+ downloads, MIT.
+# This is the de facto standard Swift grammar (widely depended on,
+# actively maintained) and what Python's own `tree-sitter-language-pack`
+# dependency wraps too. 0.7.3 published 2026-06-01.
+tree-sitter-swift = "=0.7.3"
+# tree-sitter org, 4.1M+ downloads, MIT. 0.26.0 published 2026-04-18
+# (0.26.2, the newest release, was <30 days old at time of vetting).
+tree-sitter-scala = "=0.26.0"
+# tokio-rs org (github.com/tokio-rs/tracing), created 2017, 814M+ all-time /
+# 260M+ recent downloads, MIT. The de facto standard Rust structured-logging
+# facade. Genuinely new capability (task #74), not a port: the Python
+# original's own "observability" was ad-hoc `print(..., file=sys.stderr)`
+# diagnostics with no real level scheme. 0.1.44 published 2025-12-18, >=30
+# days old at time of vetting.
+tracing = "=0.1.44"
+# tokio-rs org, 130M+ recent downloads, MIT. The `env-filter` feature is the
+# only one this project needs: `RUST_LOG`-style level filtering plus a
+# plain file-writer subscriber; no JSON/OpenTelemetry export. 0.3.23
+# published 2026-03-13, >=30 days old at time of vetting.
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = [
+    "env-filter",
+    "fmt",
+    "ansi",
+] }
+# console-rs org (github.com/console-rs/indicatif), created 2017, 209M+
+# all-time downloads, MIT. The de facto standard Rust terminal progress-bar
+# crate, used for task #75's progress bar (stage name, S4 chunk progress, live
+# findings counter, elapsed time/token spend), consumed via bc-cli's
+# ScanEvent channel. Not a port, as the Python original has no equivalent UI.
+# 0.18.6 published 2026-07-01, >=30 days old at time of vetting.
+indicatif = "=0.18.6"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = true
+strip = true

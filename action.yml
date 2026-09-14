@@ -1,0 +1,185 @@
+name: "BC Agentic SAST"
+description: "Agentic, LLM-driven SAST scan producing a SARIF 2.1.0 report"
+author: "BC Agentic SAST Harness"
+branding:
+  icon: "shield"
+  color: "blue"
+
+# This action is a pure *producer*: it writes SARIF (report.sarif) and a
+# findings snapshot (findings.json) into the checked-out workspace; it
+# never uploads anything or posts PR comments itself. Consumers wire up
+# the maintained `github/codeql-action/upload-sarif` action for SARIF, and
+# `bc-sast`'s own `--post-comments-from` mode (a second, separate step run in
+# a privileged job) for PR comments. See docs/github-action.md's
+# two-workflow example, which covers both. Keeping this action a pure
+# producer matches how `bc-sarif`/`bc-github` are designed: this action
+# never itself needs `pull-requests: write` or `security-events: write`.
+#
+# `findings.json` (via `--out-findings-json`, always written alongside
+# SARIF. No toggle, since it's small and PR comments needs the base repo's
+# job to have already run *before* posting can happen) carries exactly
+# what a later `--post-comments-from` invocation needs to post PR comments
+# without re-running the scan.
+#
+# Every input here has either a fixed value (`repo`, always
+# `github.workspace`) or a shipped default, specifically so no input is
+# ever passed as a literal empty string to the container's `args:`.
+# GitHub Actions has no way to conditionally omit one array element based
+# on whether an input was supplied, and the image's entrypoint is the
+# scanner binary itself, not a wrapper script that could work around it.
+inputs:
+  gateway-base-url:
+    description: "AI gateway base URL (OpenAI-compatible or Anthropic-compatible)."
+    required: true
+  gateway-api-key:
+    description: "AI gateway API key. Passed as an environment variable, not a CLI argument."
+    required: false
+    default: ""
+  model:
+    description: "Model identifier used for every pipeline stage."
+    required: false
+    default: "gpt-4o"
+  dialect:
+    description: "Gateway wire dialect: openai or anthropic."
+    required: false
+    default: "openai"
+  remediate:
+    description: >-
+      Attempt an automated fix for each verified finding after the scan
+      completes ("true"/"false"). Writes remediation.json alongside the
+      SARIF/findings output when enabled; no remediation file otherwise. Posting
+      the resulting fix-suggestion PR comments is a separate step. See
+      docs/github-action.md's consumer workflow 2 example.
+    required: false
+    default: "false"
+  remediation-delivery:
+    description: >-
+      Delivery for full-scan remediation: patch (default) or zip. ZIP writes
+      security-scan/remediated-source.zip for a following artifact-upload
+      step. Branch delivery requires the CLI's explicit remote/branch flags.
+    required: false
+    default: "patch"
+  app-id:
+    description: >-
+      CMDB application id, for environmental-CVSS/OffensivePriority
+      enrichment. Leave unset to disable enrichment.
+    required: false
+    default: ""
+  cmdb-csv:
+    description: >-
+      Path (inside the checked-out workspace) to a CMDB CSV export, used
+      alongside `app-id` for enrichment. Leave unset to disable enrichment.
+    required: false
+    default: ""
+  git-sha:
+    description: >-
+      The commit sha to record as this scan's `report.git_sha` (used
+      verbatim, never re-derived). STRONGLY RECOMMENDED for
+      `findings.json`/PR-comment posting. The image ships `git` now, so
+      leaving this unset falls back to `git rev-parse HEAD` inside the
+      container rather than giving up (the previous distroless runtime had
+      no `git` binary and no shell, which made this input mandatory). Pass
+      it anyway: the workflow authoritatively knows which commit it
+      checked out, and a shallow or detached checkout can leave
+      `git rev-parse` reporting something the PR-comment API will reject.
+      With no usable sha, `report.git_sha` stays `None` and
+      `findings.json`'s `commit_sha` is silently absent, which
+      `--post-comments-from` needs to post anything at all. Pass
+      the `github.event.pull_request.head.sha` context value on a
+      `pull_request` trigger (matching whatever `ref:` the calling
+      workflow's own `actions/checkout` step used to check out the code
+      this scans. See docs/github-action.md's consumer workflow 1
+      example) or `github.sha` otherwise. Write those as expressions in
+      the CALLING WORKFLOW: an action manifest cannot, see the `runs:`
+      comment below.
+    required: false
+    default: ""
+
+runs:
+  using: "docker"
+  # Built from source on the consumer's own runner, not pulled from a
+  # registry. The public mirror publishes no image of its own. Our own
+  # A private authenticated registry cannot serve as a default image
+  # reference for arbitrary consumers either. Publish your own image and
+  # pin it by digest if you would rather not build on the runner.
+  image: "Dockerfile"
+  env:
+    BC_GATEWAY_API_KEY: ${{ inputs.gateway-api-key }}
+    # Git ownership, and why it is set here rather than anywhere else.
+    #
+    # The image runs as uid 65532, and the runner bind-mounts its
+    # checkout keeping the runner's own ownership. Git 2.35 and later
+    # refuse a repository owned by a different user
+    # (`fatal: detected dubious ownership`), so without this every
+    # git-backed feature the Wolfi runtime unlocked degrades right back
+    # to its pre-`git` behavior, silently: `report.git_sha` stays unset
+    # unless `git-sha` was passed, `--remediate` edits the checkout in
+    # place instead of an isolated worktree, and S10's git revert
+    # backstop is a no-op. Each of those probes rather than assumes, so
+    # nothing fails; it just quietly does less.
+    #
+    # A docker action has nowhere to run a shell before the entrypoint
+    # (the entrypoint IS the scanner binary), and a nonroot container
+    # cannot `chown` the mount for itself, so the two remedies
+    # `docs/deployment.md` gives a `docker run` operator are both out of
+    # reach. Git's environment-variable config scope is what is left, and
+    # it is enough: `GIT_CONFIG_KEY_n`/`VALUE_n` land in git's `command`
+    # scope, which git counts as *protected* configuration and therefore
+    # honors for `safe.directory`. A repository's own `.git/config` is
+    # not protected, so a scanned repo still cannot grant itself this.
+    #
+    # The value is the literal mount point, not an expression. An action
+    # manifest can only use the `inputs` context; `github` is not
+    # available here at all, and a `${{ github.workspace }}` anywhere in
+    # this file (including inside a `description`) fails the manifest to
+    # load with "Unrecognized named-value: 'github'". The runner mounts
+    # the workspace at `/github/workspace` and sets `--workdir` to it,
+    # measured on a real runner:
+    #   -v "/home/runner/work/<repo>/<repo>":"/github/workspace"
+    #
+    # One directory, named once. Not `safe.directory=*`, which the image
+    # rejects for the reason its runtime stage spells out: a security
+    # tool does not get to turn an ownership check off for every
+    # repository on an operator's behalf. No other repository on the
+    # runner is affected, and the `GIT_CONFIG_*` variables reach only
+    # this container's own process tree.
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: "safe.directory"
+    GIT_CONFIG_VALUE_0: "/github/workspace"
+  # Paths below are the container's, written literally, because
+  # `runs.args` is NOT path-translated. Measured on a real runner: an
+  # argument carrying the host workspace path arrives verbatim and the
+  # directory does not exist inside the container, while environment
+  # values ARE rewritten. The asymmetry is in
+  # `ContainerActionHandler.cs`, which calls `TranslateToContainerPath`
+  # on every environment value but assembles `ContainerEntryPointArgs`
+  # verbatim from `EvaluateContainerArguments`.
+  #
+  # This file used to pass `${{ github.workspace }}` here. That was
+  # broken twice over: the `github` context does not exist in an action
+  # manifest, so the manifest failed to load before any of this mattered,
+  # and had it loaded, the host path would not have resolved inside the
+  # container. Both are fixed by naming the mount point directly.
+  args:
+    - "--repo"
+    - "/github/workspace"
+    - "--gateway-base-url"
+    - ${{ inputs.gateway-base-url }}
+    - "--model"
+    - ${{ inputs.model }}
+    - "--dialect"
+    - ${{ inputs.dialect }}
+    - "--out-findings-json"
+    - "/github/workspace/security-scan/findings.json"
+    - "--remediate"
+    - ${{ inputs.remediate }}
+    - "--remediation-delivery"
+    - ${{ inputs.remediation-delivery }}
+    - "--out-remediation-json"
+    - "/github/workspace/security-scan/remediation.json"
+    - "--app-id"
+    - ${{ inputs.app-id }}
+    - "--cmdb-csv"
+    - ${{ inputs.cmdb-csv }}
+    - "--git-sha"
+    - ${{ inputs.git-sha }}

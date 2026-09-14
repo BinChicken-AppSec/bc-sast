@@ -1,0 +1,164 @@
+{
+  "generate": true,
+  "level": "comprehensive",
+  "allowed_support_paths": [],
+  "discovered_execution": [
+    {
+      "language": "Rust",
+      "image": "rust@sha256:9a73a5088750b4c95158ab26629c854c3d6fc4b173cb7bc8079ad252d8ed7bfa",
+      "allowed_argv": [
+        [
+          "cargo",
+          "test",
+          "--locked",
+          "--offline"
+        ]
+      ],
+      "provisioning": {
+        "pins": [
+          "Cargo.lock"
+        ],
+        "argv": [
+          "cargo",
+          "fetch",
+          "--locked"
+        ],
+        "scripts_disabled": false
+      }
+    },
+    {
+      "language": "JavaScript/TypeScript",
+      "image": "node@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5",
+      "allowed_argv": [
+        [
+          "npm",
+          "run",
+          "test"
+        ],
+        [
+          "npm",
+          "run",
+          "test:unit"
+        ],
+        [
+          "npm",
+          "run",
+          "test:integration"
+        ],
+        [
+          "npm",
+          "run",
+          "test:e2e"
+        ]
+      ],
+      "provisioning": {
+        "pins": [
+          "package-lock.json",
+          "npm-shrinkwrap.json"
+        ],
+        "argv": [
+          "npm",
+          "ci",
+          "--ignore-scripts",
+          "--no-audit",
+          "--no-fund"
+        ],
+        "scripts_disabled": true
+      }
+    },
+    {
+      "language": "Python",
+      "image": "python@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254",
+      "allowed_argv": [
+        [
+          "python",
+          "-m",
+          "pytest"
+        ]
+      ],
+      "provisioning": {
+        "pins": [
+          "requirements.txt"
+        ],
+        "argv": [
+          "pip",
+          "install",
+          "--user",
+          "--no-input",
+          "--no-cache-dir",
+          "--only-binary",
+          ":all:",
+          "-r",
+          "requirements.txt"
+        ],
+        "scripts_disabled": true
+      }
+    },
+    {
+      "language": "Go",
+      "image": "golang@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b",
+      "allowed_argv": [
+        [
+          "go",
+          "test",
+          "./..."
+        ]
+      ],
+      "provisioning": {
+        "pins": [
+          "go.mod"
+        ],
+        "argv": [
+          "go",
+          "mod",
+          "download"
+        ],
+        "scripts_disabled": true
+      }
+    },
+    {
+      "language": "Java/Kotlin",
+      "image": "maven@sha256:a972570be789ee5c9fa23446a8914ac7327560b5c022f662cfa9452aef829f18",
+      "allowed_argv": [
+        [
+          "mvn",
+          "--offline",
+          "test"
+        ]
+      ],
+      "provisioning": {
+        "pins": [
+          "pom.xml"
+        ],
+        "argv": [
+          "mvn",
+          "-B",
+          "dependency:go-offline"
+        ],
+        "scripts_disabled": false
+      }
+    },
+    {
+      "language": ".NET",
+      "image": "mcr.microsoft.com/dotnet/sdk@sha256:5ef85cc12cb25be6ec319a7392d1e9efd53c3bc8abb971c53d8058a473f09053",
+      "allowed_argv": [
+        [
+          "dotnet",
+          "test",
+          "--no-restore"
+        ]
+      ],
+      "provisioning": {
+        "pins": [
+          "packages.lock.json"
+        ],
+        "argv": [
+          "dotnet",
+          "restore",
+          "--locked-mode"
+        ],
+        "scripts_disabled": false
+      }
+    }
+  ]
+}

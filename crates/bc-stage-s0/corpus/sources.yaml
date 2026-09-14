@@ -1,0 +1,421 @@
+# S0 starter source corpus, the bundled default for `step0.enabled: true`
+# when no custom `sources_yaml` is configured. See `sinks.yaml` in this
+# same directory for the full scope/rigor note this file shares; not
+# repeated here.
+#
+# `ep_kind` is read by two consumers and has to satisfy both. The seed
+# stage resolves it through `bc_model::EntryPointKind::parse`, whose
+# canonical kinds are `network`, `ipc`, `file`, `cli`, `deserialization`
+# and `framework`; the aliases that table knows (`http`, `stdin`, `env`
+# among them) resolve too, and anything else is `other`, which the
+# downstream stages treat as unclassified. The taint pair filter
+# (`bc_callgraph::graph::source_kind_compat`) reads the same string and
+# keys its allowed-sink rows on `network`, `ipc`, `cli`, `filesystem`
+# (also spelled `file`) and `env`; a spelling with no row admits every
+# sink, which is how 18 of these 21 rules bypassed the filter until
+# 2026-09-09, when they said `http` and `stdin`. Spell the canonical
+# kind. The two `env` rules are the deliberate exception: `env` is a
+# row of its own in the filter, with a broader sink list than `file`
+# (an environment variable can name an open-redirect target; a file's
+# bytes are not treated that way), so writing `file` there would narrow
+# what those rules can pair with.
+#
+# Every rule below is a real framework/stdlib API for reading
+# attacker-influenced input, using the "module_attr" call shape
+# (`<receiver>.<method>(...)`). Several of these rely on a real,
+# strong language-community convention for the receiver's variable name
+# (Flask/Django's `request`, Java Servlet's `request` parameter, Go's
+# `r *http.Request` and gin/echo's `c`, Express's `req`), which this
+# simplified extractor can't verify is actually that type; flagged here
+# explicitly rather than silently assumed.
+#
+# UPDATED 2026-09-07: C# and the JavaScript/TypeScript property sources
+# below are new, and rest on the extractor change committed alongside
+# them. The header used to say C# was "deliberately omitted: ASP.NET's
+# real request-parameter APIs (`Request.Query[...]`,
+# `Request.QueryString[...]`) are indexers, not method calls", and the
+# Express note below said the same of `req.query`/`req.body`/
+# `req.params`. Both were true of the extractor as it stood and left
+# those two languages with, between them, a single source rule. A
+# property read that is not a callee and not an assignment target is now
+# recorded as a call site in its own right (see `RawCall::property_read`
+# in `bc_callgraph::scan`), so `Request.Query` and `req.query` are
+# expressible in exactly the module_attr shape everything else uses. A
+# property read can match a SOURCE rule only, never a sink.
+#
+# Still not expressible, and deliberately absent: ASP.NET's
+# `[FromQuery]`/`[FromBody]`/`[FromRoute]` parameter attributes and
+# NestJS's `@Query()`/`@Body()`/`@Param()` decorators. Neither is a call
+# shape at all; both are handled on the framework-marker plane
+# (`bc_callgraph::framework`), which is where Java's `@RequestParam` and
+# C#'s own `[FromQuery]` already live. Go's `r.Body` is likewise absent:
+# Go selector reads are not recorded as call sites (unlike JavaScript's
+# and C#'s, they are rarely the request-input API and are ubiquitous
+# elsewhere), so only Go's call-shaped request accessors are covered.
+rules:
+  # ── Python: Flask ───────────────────────────────────────────────────
+  - id: py.flask.request-args
+    languages: [python]
+    pattern-either:
+      - pattern: request.args.get(...)
+      - pattern: request.form.get(...)
+      - pattern: request.get_json(...)
+      - pattern: request.cookies.get(...)
+      - pattern: request.headers.get(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+
+  # ── Python: Django ───────────────────────────────────────────────────
+  - id: py.django.request-get-post
+    languages: [python]
+    pattern-either:
+      - pattern: request.GET.get(...)
+      - pattern: request.POST.get(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+
+  # ── Python: environment / stdin ─────────────────────────────────────
+  - id: py.os-getenv
+    languages: [python]
+    # `env`, not `file`: see the header.
+    pattern-either:
+      - pattern: os.getenv(...)
+      - pattern: os.environ.get(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: env
+      semantic_family: other
+  - id: py.input
+    languages: [python]
+    pattern: input(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: cli
+      semantic_family: other
+
+  # ── JavaScript/TypeScript: Express ───────────────────────────────────
+  - id: js.express.req-param
+    languages: [javascript, typescript]
+    # `req.param(name)`: Express's older, still-supported per-field
+    # accessor, and the one Express request-input API that is a call.
+    # The property accessors are the rule below.
+    pattern: req.param(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+  - id: js.express.req-properties
+    languages: [javascript, typescript]
+    # Express and Next.js API routes both hang request input off `req`.
+    # `req.get(...)` is Express's header accessor; it is spelled here as
+    # a property of `req` like the rest because the receiver has to be
+    # literally `req` either way, which is what keeps a rule this
+    # generic honest.
+    pattern-either:
+      - pattern: req.query(...)
+      - pattern: req.params(...)
+      - pattern: req.body(...)
+      - pattern: req.headers(...)
+      - pattern: req.cookies(...)
+      - pattern: req.get(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+  - id: js.fastify-hapi.request-properties
+    languages: [javascript, typescript]
+    # Fastify (`request.query`/`.body`/`.params`/`.headers`) and hapi
+    # (`request.payload`/`.query`/`.params`) both name the handler's
+    # first argument `request`.
+    pattern-either:
+      - pattern: request.query(...)
+      - pattern: request.params(...)
+      - pattern: request.body(...)
+      - pattern: request.headers(...)
+      - pattern: request.payload(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+  - id: js.koa.ctx-properties
+    languages: [javascript, typescript]
+    # Koa's context. `ctx.request.body` reads as a `body` property of
+    # `ctx` here because the extractor names a property read after its
+    # leftmost receiver, exactly as it names a chained call.
+    pattern-either:
+      - pattern: ctx.query(...)
+      - pattern: ctx.params(...)
+      - pattern: ctx.body(...)
+      - pattern: ctx.headers(...)
+      - pattern: ctx.request(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+
+  # ── Go: net/http, gin, echo, chi, gorilla ────────────────────────────
+  - id: go.os-getenv
+    languages: [go]
+    # `env`, not `file`: see the header.
+    pattern: os.Getenv(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: env
+      semantic_family: other
+  - id: go.nethttp.request-accessors
+    languages: [go]
+    # `r *http.Request` is the near-universal Go handler convention.
+    # `r.URL.Query()` reduces to a `Query` call on `r`; `r.Header.Get`
+    # is deliberately NOT listed, because it would reduce to `r.Get`,
+    # which is chi's own route-registration call (`r.Get("/p", h)`) and
+    # would turn every chi route into a source.
+    pattern-either:
+      - pattern: r.URL.Query(...)
+      - pattern: r.FormValue(...)
+      - pattern: r.PostFormValue(...)
+      - pattern: r.ParseMultipartForm(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+  - id: go.gin-echo.context-accessors
+    languages: [go]
+    # gin and echo both name the handler context `c`; the two sets
+    # overlap (`Param`) and are listed together for that reason.
+    pattern-either:
+      - pattern: c.Query(...)
+      - pattern: c.DefaultQuery(...)
+      - pattern: c.QueryParam(...)
+      - pattern: c.Param(...)
+      - pattern: c.PostForm(...)
+      - pattern: c.FormValue(...)
+      - pattern: c.GetHeader(...)
+      - pattern: c.Bind(...)
+      - pattern: c.BindJSON(...)
+      - pattern: c.ShouldBind(...)
+      - pattern: c.ShouldBindJSON(...)
+      - pattern: c.ShouldBindQuery(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+  - id: go.chi-gorilla.url-params
+    languages: [go]
+    pattern-either:
+      - pattern: chi.URLParam(...)
+      - pattern: chi.URLParamFromCtx(...)
+      - pattern: mux.Vars(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+
+  # ── C#: ASP.NET request ──────────────────────────────────────────────
+  - id: cs.aspnet.request-properties
+    languages: [csharp]
+    # `Request.Query["id"]`, `Request.Form["n"]`, `Request.Headers`,
+    # `Request.Body` and `Request.QueryString` are properties (the first
+    # two indexed), which the property-read call sites described in this
+    # file's header make expressible.
+    pattern-either:
+      - pattern: Request.Query(...)
+      - pattern: Request.Form(...)
+      - pattern: Request.Headers(...)
+      - pattern: Request.Body(...)
+      - pattern: Request.QueryString(...)
+      - pattern: Request.Cookies(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+
+  # ── PHP: superglobals, Laravel, Symfony ──────────────────────────────
+  #
+  # `$_GET['q']` is an indexed read, not a call; `scan::lite` records
+  # the superglobal it names as a receiver-less call site so it can be
+  # spelled here (see `Shape::read_name`). A `$` sigil is part of PHP's
+  # variable token rather than of the name a rule spells, so
+  # `$request->query(...)` is written `request.query(...)`.
+  - id: php.superglobals
+    languages: [php]
+    pattern-either:
+      - pattern: _GET(...)
+      - pattern: _POST(...)
+      - pattern: _REQUEST(...)
+      - pattern: _COOKIE(...)
+      - pattern: _FILES(...)
+      - pattern: _SERVER(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+  - id: php.laravel-symfony.request
+    languages: [php]
+    # Laravel's `$request->input()/query()/all()` and Symfony's
+    # `$request->query->get()`, which reduces to a `get` on `request`.
+    pattern-either:
+      - pattern: request.input(...)
+      - pattern: request.query(...)
+      - pattern: request.all(...)
+      - pattern: request.get(...)
+      - pattern: request.post(...)
+      - pattern: request.header(...)
+      - pattern: request.cookie(...)
+      - pattern: request.file(...)
+      - pattern: Request.get(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+
+  # ── Ruby: Rails ──────────────────────────────────────────────────────
+  #
+  # `params[:owner]` is an indexed read, recorded receiver-less by
+  # `scan::lite` for the same reason PHP's superglobals are.
+  - id: ruby.rails.request
+    languages: [ruby]
+    pattern-either:
+      - pattern: params(...)
+      - pattern: cookies(...)
+      - pattern: session(...)
+      - pattern: params.fetch(...)
+      - pattern: params.require(...)
+      - pattern: params.permit(...)
+      - pattern: params.dig(...)
+      - pattern: params.to_s(...)
+      - pattern: request.headers(...)
+      - pattern: request.body(...)
+      - pattern: request.params(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+
+  # ── Kotlin: Ktor ─────────────────────────────────────────────────────
+  #
+  # Kotlin's SINKS are the Java block's (same JVM APIs, same names, and
+  # `MatchSpec.languages` is a set), but its request surface is Ktor's,
+  # which Java shares nothing with. `call.parameters["id"]` and
+  # `call.request.queryParameters["owner"]` are indexed reads, recorded
+  # by `scan::lite` as a call on `call` named after the chain's last
+  # segment (see `Shape::read_name`). Spring-Kotlin's `@RequestParam`
+  # and friends need no rule: they are parameter annotations, handled on
+  # the framework-marker plane for every language at once.
+  - id: kotlin.ktor.request
+    languages: [kotlin]
+    pattern-either:
+      - pattern: call.parameters(...)
+      - pattern: call.queryParameters(...)
+      - pattern: call.headers(...)
+      - pattern: call.cookies(...)
+      - pattern: call.receive(...)
+      - pattern: call.receiveText(...)
+      - pattern: call.receiveParameters(...)
+      - pattern: call.receiveStream(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+
+  # ── C / C++ ──────────────────────────────────────────────────────────
+  #
+  # A command-line tool's request surface is its argv, its environment
+  # and whatever it reads off a descriptor. `argv[1]` is an indexed read
+  # rather than a call, recorded receiver-less by `scan::lite` exactly
+  # as PHP's superglobals are.
+  #
+  # C and C++ share ONE language key: `ext_to_lang` maps `.c`, `.h`,
+  # `.cpp`, `.cc`, `.cxx` and `.hpp` all onto `c-cpp`, and C++'s grammar
+  # parses both. `std::cin >> x` is an operator, not a call, so it has
+  # no shape here.
+  - id: c.argv-and-environment
+    languages: [c, cpp]
+    pattern-either:
+      - pattern: argv(...)
+      - pattern: envp(...)
+      - pattern: getenv(...)
+      - pattern: secure_getenv(...)
+      - pattern: std.getenv(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: cli
+      semantic_family: other
+  - id: c.stream-reads
+    languages: [c, cpp]
+    pattern-either:
+      - pattern: fgets(...)
+      - pattern: gets(...)
+      - pattern: getline(...)
+      - pattern: fread(...)
+      - pattern: read(...)
+      - pattern: recv(...)
+      - pattern: recvfrom(...)
+      - pattern: scanf(...)
+      - pattern: fscanf(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: cli
+      semantic_family: other
+
+  # ── Rust: actix / rocket request accessors ───────────────────────────
+  #
+  # Rust's PRIMARY source shape is not a rule at all: axum binds request
+  # input by destructuring an extractor in the handler's own signature
+  # (`Query(params): Query<SearchParams>`), which
+  # `bc_callgraph::scan::extractor_binding_sources` reads straight off
+  # `FuncDef::params`. What is left for a rule here is actix's
+  # `HttpRequest`, whose accessors are ordinary calls. actix's own
+  # `web::Query<T>`/`web::Path<T>` and rocket's route parameters are
+  # types rather than patterns, and `scan::lite` records a parameter's
+  # pattern only: a documented gap, not an oversight.
+  - id: rust.actix.request-accessors
+    languages: [rust]
+    pattern-either:
+      - pattern: req.query_string(...)
+      - pattern: req.match_info(...)
+      - pattern: req.headers(...)
+      - pattern: req.cookie(...)
+      - pattern: request.query_string(...)
+      - pattern: request.match_info(...)
+      - pattern: request.headers(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other
+
+  # ── Java / Kotlin: Servlet API ───────────────────────────────────────
+  #
+  # Both rules claim `kotlin` too: Kotlin calls the same Servlet API by
+  # the same names, and `MatchSpec.languages` is a set the matcher tests
+  # with `contains(language)`, so one rule covers both the moment a
+  # Kotlin extractor is wired. See the Java block in `sinks.yaml` for
+  # the full note.
+  - id: java.servlet.request-getparameter
+    languages: [java, kotlin]
+    # Relies on the (extremely strong, but unverified by this extractor)
+    # Java Servlet convention of naming the `HttpServletRequest`
+    # parameter `request`. `req` is spelled out alongside it because
+    # that abbreviation is just as conventional.
+    pattern-either:
+      - pattern: request.getParameter(...)
+      - pattern: request.getParameterValues(...)
+      - pattern: request.getParameterMap(...)
+      - pattern: request.getHeader(...)
+      - pattern: request.getHeaders(...)
+      - pattern: request.getQueryString(...)
+      - pattern: request.getInputStream(...)
+      - pattern: request.getReader(...)
+      - pattern: request.getCookies(...)
+      - pattern: request.getPathInfo(...)
+      - pattern: request.getRequestURI(...)
+      - pattern: req.getParameter(...)
+      - pattern: req.getHeader(...)
+      - pattern: req.getInputStream(...)
+    metadata:
+      cwe: CWE-20
+      ep_kind: network
+      semantic_family: other

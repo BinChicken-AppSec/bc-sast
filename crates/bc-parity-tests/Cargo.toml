@@ -1,0 +1,16 @@
+[package]
+name = "bc-parity-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-cvss = { path = "../bc-cvss" }
+bc-redact = { path = "../bc-redact" }
+bc-config = { path = "../bc-config" }
+bc-validation-scoring = { path = "../bc-validation-scoring" }
+serde_json = { workspace = true }

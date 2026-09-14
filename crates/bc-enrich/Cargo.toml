@@ -1,0 +1,19 @@
+[package]
+name = "bc-enrich"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-model = { path = "../bc-model" }
+bc-cvss = { path = "../bc-cvss" }
+bc-pathjail = { path = "../bc-pathjail" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }

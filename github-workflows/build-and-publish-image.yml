@@ -1,0 +1,101 @@
+# Build the bc-sast container image and publish it to a registry you
+# control. Copy this into THIS repository's own `.github/workflows/` (or
+# your fork's). It is the first half of `docs/deployment.md`.
+#
+# Registry-agnostic on purpose. Everything registry-specific is either a
+# repository variable (`vars.*`), a secret (`secrets.*`), or a commented
+# example; there is no cloud provider baked in anywhere. Set:
+#
+#   vars.REGISTRY   e.g. ghcr.io, registry.example.internal,
+#                   <account>.dkr.ecr.<region>.amazonaws.com, myorg.azurecr.io
+#   vars.IMAGE      the repository path inside it, e.g. security/bc-sast
+#   secrets.REGISTRY_USERNAME / secrets.REGISTRY_PASSWORD
+#                   whatever your registry's `docker login` wants
+#
+# Nothing here needs the scanner's gateway credential: this workflow only
+# builds and pushes an image, it never runs a scan.
+
+name: build and publish scanner image
+
+on:
+  push:
+    branches: [main]
+    # A tag push republishes the same content under a release tag.
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Only needed if your registry authenticates via OIDC/workload identity
+  # rather than a username/password. Delete this line for a token login.
+  id-token: write
+
+env:
+  REGISTRY: ${{ vars.REGISTRY }}
+  IMAGE: ${{ vars.IMAGE }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # Log in to your registry.
+      #
+      # The generic form below works for any registry that accepts a
+      # username/password or a token on stdin (GHCR, Docker Hub, Harbor,
+      # Nexus, GitLab, Artifactory, a plain distribution registry).
+      #
+      # If your registry instead issues a short-lived token from a cloud
+      # identity, replace this whole step with that provider's own login
+      # action or CLI call. For example (commented, not enabled):
+      #
+      #   - uses: <cloud>/configure-credentials@vN
+      #     with:
+      #       role-to-assume: <the CI role in your account>
+      #       <region-or-tenant>: <value>
+      #   - run: <cloud-cli> registry login --stdin
+      #
+      # Read the credential from your CI secret store; never inline one.
+      # ---------------------------------------------------------------
+      - name: Log in to the registry
+        run: |
+          echo "${{ secrets.REGISTRY_PASSWORD }}" \
+            | docker login "$REGISTRY" \
+                -u "${{ secrets.REGISTRY_USERNAME }}" \
+                --password-stdin
+
+      # Tag by git sha, and only additionally by a moving tag. A scan
+      # result is reproducible only if you can say which scanner produced
+      # it, so consuming repositories should pin the sha tag (or a
+      # digest); `latest` exists for convenience and should never back a
+      # merge gate.
+      - name: Build the image
+        run: |
+          docker build \
+            -t "$REGISTRY/$IMAGE:${{ github.sha }}" \
+            -t "$REGISTRY/$IMAGE:latest" \
+            .
+
+      # Optional but recommended: prove the built image actually starts
+      # before publishing it. `--help` needs no gateway credential, no
+      # network, and no repository: it just exercises the entrypoint.
+      # (`--setup` is the fuller offline readiness check, but it still
+      # requires `--gateway-base-url`, and it warns about the missing
+      # `git` binary the distroless runtime deliberately lacks, so it is
+      # a poor fit for a credential-free build job.)
+      - name: Smoke-test the image
+        run: docker run --rm "$REGISTRY/$IMAGE:${{ github.sha }}" --help > /dev/null
+
+      - name: Push
+        run: |
+          docker push "$REGISTRY/$IMAGE:${{ github.sha }}"
+          docker push "$REGISTRY/$IMAGE:latest"
+
+      - name: Report the digest to pin
+        run: |
+          docker image inspect \
+            --format '{{ index .RepoDigests 0 }}' \
+            "$REGISTRY/$IMAGE:${{ github.sha }}" \
+            >> "$GITHUB_STEP_SUMMARY"

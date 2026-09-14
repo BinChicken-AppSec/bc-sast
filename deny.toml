@@ -1,0 +1,49 @@
+# cargo-deny configuration. Run via `cargo deny check advisories bans licenses sources`.
+# Enforced in CI on every PR and on a schedule (see .github/workflows/ci.yml), so a
+# newly-disclosed advisory against an unchanged dependency still trips the build.
+#
+# This catches KNOWN, already-disclosed issues (RustSec advisory DB) and enforces the
+# license/source allowlist below. It does NOT catch a freshly-published or typosquatted
+# malicious crate before the security community has reported it. Advisories lag actual
+# publication. See docs/supply-chain.md for the complementary manual-vetting policy that
+# covers that gap for every new direct dependency.
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # Covers `webpki-root-certs` (rustls org), transitively pulled in by
+    # reqwest's `rustls` feature (via rustls-platform-verifier) to bundle
+    # Mozilla's CA root data. CDLA-Permissive-2.0 is a permissive,
+    # non-copyleft data license (Community Data License Agreement), not a
+    # code license, required for redistributing that specific dataset.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Intra-workspace crates (bc-yaml, bc-pathjail, ...) are depended on via
+# `{ path = "../..." }` with no separate version requirement. That's the
+# normal pattern for a workspace's own member crates, not an unpinned
+# external dependency, so it shouldn't trip the same "wildcard" lint aimed
+# at catching e.g. `foo = "*"` on a crates.io dependency.
+allow-wildcard-paths = true
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

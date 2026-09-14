@@ -1,0 +1,17 @@
+[package]
+name = "bc-csv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-model = { path = "../bc-model" }
+bc-cwe = { path = "../bc-cwe" }
+bc-sarif = { path = "../bc-sarif" }
+
+[dev-dependencies]
+rstest = { workspace = true }

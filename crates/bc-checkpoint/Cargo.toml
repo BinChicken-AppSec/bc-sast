@@ -1,0 +1,16 @@
+[package]
+name = "bc-checkpoint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
+sha1 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "bc-llm-anthropic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-llm-client = { path = "../bc-llm-client" }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+regex = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = { workspace = true }

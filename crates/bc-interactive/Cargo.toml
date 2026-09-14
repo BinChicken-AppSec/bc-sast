@@ -1,0 +1,25 @@
+[package]
+name = "bc-interactive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-model = { path = "../bc-model" }
+bc-llm-client = { path = "../bc-llm-client" }
+bc-stage-s10 = { path = "../bc-stage-s10" }
+bc-stage-s11 = { path = "../bc-stage-s11" }
+bc-validation-scoring = { path = "../bc-validation-scoring" }
+bc-checkpoint = { path = "../bc-checkpoint" }
+crossterm = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+bc-sandbox-tools = { path = "../bc-sandbox-tools" }

@@ -1,0 +1,19 @@
+[package]
+name = "bc-llm-agentic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-llm-client = { path = "../bc-llm-client" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+async-trait = { workspace = true }
