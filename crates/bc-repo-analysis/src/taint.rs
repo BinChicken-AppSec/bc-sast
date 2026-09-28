@@ -246,6 +246,7 @@ pub fn add_taint_chunks(
                     String::new()
                 },
                 sink_cwe: cwes,
+                shard_id: String::new(),
             });
         }
 
@@ -375,6 +376,7 @@ pub fn add_taint_chunks(
                 source_ref: q_join(&ep.file, &ep.function),
                 sink_ref,
                 sink_cwe,
+                shard_id: String::new(),
             });
         }
     }

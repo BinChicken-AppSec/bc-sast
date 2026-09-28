@@ -27,17 +27,39 @@ use crate::families;
 use crate::rules::MatchSpec;
 use crate::scan::FileIndex;
 
-/// System prompt for the LLM classification call `bc-stage-s0` will
-/// eventually make with [`build_prompt_batch`]'s output.
-pub const SYSTEM_PROMPT: &str = "You classify API call fingerprints for taint seeding. \
-Return JSON only with key 'results': a list of objects with fields \
-id, role, confidence, cwe, kind. \
-role must be one of source, sink, none. \
-confidence must be a number between 0 and 1. \
-cwe should be like CWE-89. \
-kind for source should be one of network, ipc, file, cli, \
-deserialization, other. \
-kind for sink can be a short snake_case label.";
+/// System prompt for `bc-stage-s0`'s LLM classification call over
+/// [`build_prompt_batch`]'s output. Upstream v1.3's expanded form, with
+/// definitions, common false positives, a confidence calibration scale and
+/// per-language hints; the output contract (the last paragraph) is
+/// unchanged, so [`parse_results`] needs nothing new.
+pub const SYSTEM_PROMPT: &str = r#"You are a taint-analysis classifier. Given API call fingerprints extracted from source code, classify each as source, sink, or none for static taint seeding.
+
+DEFINITIONS:
+- source: An API that reads UNTRUSTED data into the application from outside its trust boundary. Examples: HTTP request parameters, file reads, environment variables, CLI arguments, deserialized objects, database query results from user-controlled queries, IPC/socket receives.
+- sink: An API that performs a SECURITY-SENSITIVE operation where untrusted data could cause harm. Examples: OS command execution, SQL query execution, file writes to user-controlled paths, template rendering, deserialization of untrusted formats, dynamic code evaluation, LDAP queries, XML parsing.
+- none: Utility functions, logging, type conversions, pure computation, string formatting without injection risk, internal-only helpers. When uncertain, prefer none.
+
+COMMON FALSE POSITIVES TO AVOID:
+- Logging/printing functions (print, log, logger.*) are NOT sinks.
+- Collection operations (append, push, add, len, size) are NOT sinks.
+- Type conversions (str, int, float, toString) are NOT sinks.
+- Internal getters/setters with no external I/O are NOT sources.
+
+CONFIDENCE CALIBRATION:
+- 0.9-1.0: API name AND module unambiguously indicate taint relevance (e.g., subprocess.Popen, flask.request.args, os.system).
+- 0.7-0.9: Strong signal from either name or module, context confirms (e.g., cursor.execute with SQL module, yaml.load).
+- 0.5-0.7: Ambiguous name, module/context unclear (e.g., generic .get(), .read() without clear taint-relevant module).
+- Below 0.5: Lean toward role=none instead.
+
+LANGUAGE-SPECIFIC HINTS:
+- Python: flask/django/fastapi request.* = source; os/subprocess.* = sink; pickle/yaml.load = sink (CWE-502); sqlite3/psycopg2 .execute = sink (CWE-89).
+- Java: HttpServletRequest.get* = source; Runtime.exec = sink (CWE-78); Statement.execute* = sink (CWE-89); ObjectInputStream.readObject = sink (CWE-502).
+- JavaScript/TypeScript: req.query/req.body/req.params = source; eval/Function = sink; child_process.exec = sink (CWE-78); pg/mysql .query = sink (CWE-89).
+- Go: r.URL.Query/r.FormValue/r.Body = source; exec.Command = sink (CWE-78); db.Query with string concat = sink (CWE-89).
+- C/C++: recv/fgets/getenv/argv = source; system/popen/exec* = sink (CWE-78); strcpy/sprintf/strcat = sink (CWE-120); free after use = sink (CWE-416).
+- PHP: $_GET/$_POST/$_COOKIE/$_REQUEST/$_FILES/$_SERVER = source; exec/system/shell_exec/passthru/popen = sink (CWE-78); mysqli_query/pg_query with concat = sink (CWE-89); include/require with user input = sink (CWE-98); move_uploaded_file = sink (CWE-434); unserialize = sink (CWE-502).
+
+Return JSON only with key 'results': a list of objects with fields id, role, confidence, cwe, kind. role must be one of source, sink, none. confidence must be a number between 0 and 1. cwe should be like CWE-89. kind for source should be one of network, ipc, file, cli, deserialization, other. kind for sink can be a short snake_case label."#;
 
 fn source_method_hints() -> &'static [&'static str] {
     &[
@@ -1093,5 +1115,19 @@ mod tests {
             1,
         );
         assert_eq!(sources.len(), 1);
+    }
+
+    #[test]
+    fn the_system_prompt_keeps_the_output_contract_and_gains_the_v1_3_guidance() {
+        assert!(SYSTEM_PROMPT.starts_with("You are a taint-analysis classifier."));
+        for needle in [
+            "COMMON FALSE POSITIVES TO AVOID:",
+            "CONFIDENCE CALIBRATION:",
+            "- PHP: $_GET/$_POST",
+            "Return JSON only with key 'results'",
+            "kind for sink can be a short snake_case label.",
+        ] {
+            assert!(SYSTEM_PROMPT.contains(needle), "{needle}");
+        }
     }
 }

@@ -364,17 +364,17 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_zip_output_directory_that_cannot_be_created_fails_the_delivery() {
-        use std::os::unix::fs::PermissionsExt;
+        // A path component is a regular file, so the directory cannot be
+        // created (ENOTDIR) by any user. A read-only parent directory
+        // would not stop root, which bypasses permission bits.
         let root = tempfile::tempdir().unwrap();
         let locked = root.path().join("locked");
-        std::fs::create_dir(&locked).unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::write(&locked, "not a directory").unwrap();
         let outcome = deliver(
             &state(DeliveryMode::Zip, locked.join("security-scan/source.zip")),
             root.path(),
         )
         .await;
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(outcome
             .unwrap_err()
             .contains("Cannot create ZIP output directory"));

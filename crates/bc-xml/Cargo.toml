@@ -1,0 +1,18 @@
+[package]
+name = "bc-xml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Deliberately no dependencies: this crate reads untrusted SOAP/WSDL, XSD
+# and OData CSDL files, and the supply-chain policy prefers a small reader
+# that can be audited end to end over a third-party XML engine. See the
+# crate documentation in src/lib.rs.
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }

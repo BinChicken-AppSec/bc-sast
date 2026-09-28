@@ -93,6 +93,21 @@ pub fn step_defaults() -> Value {
             "max_config_reps": 80,
             "max_api_artefacts": 100,
             "max_function_sites": 80,
+            // Ported from v1.4.0 `_STEP_DEFAULTS["step2"]`: redacted
+            // config-rep bodies, the bounded manifest walk, the asset and
+            // boundary caps, and the (off by default) read-only agentic
+            // threat model.
+            "max_config_rep_chars": 2000,
+            "max_config_rep_bodies": 12,
+            "max_manifest_depth": 3,
+            "max_manifests": 12,
+            "max_manifests_per_kind": 2,
+            "max_manifest_total_chars": 24000,
+            "max_assets": 40,
+            "max_trust_boundaries": 60,
+            "agentic": false,
+            "allowed_tools": ["Read", "Glob", "Grep"],
+            "max_turns": 12,
         },
         "step3": {
             "max_tokens": 64000,
@@ -120,6 +135,20 @@ pub fn step_defaults() -> Value {
             "catchall_max_files": 100,
             "max_files_per_chunk": 80,
             "specialist_chunk_loc": 10000,
+            // ── C2 coverage/decomposition keys (upstream v1.3/v1.4) ──
+            // `catchall_mode` above stays "all": upstream's default.yaml
+            // ships "reachable_only" with a 0.5 ratio, but `_STEP_DEFAULTS`
+            // registers "all" and this port deliberately keeps the wider
+            // sweep (see `bc_stage_s3::Step3Config::catchall_mode`).
+            "catchall_deduct_lens_coverage": false,
+            "max_cohesion_groups": 64,
+            "max_threat_fallback_chunks": 50,
+            "threat_surface_fallbacks": true,
+            "threat_fallback_max_files": 12,
+            "max_prompt_threats": 50,
+            "max_prompt_assets": 20,
+            "max_prompt_boundaries": 30,
+            "max_prompt_threat_context_chars": 2500,
             // The shipped home of S4's chunk-slicing mode: declared in
             // `step3` (only `profiles/taint.yaml` raises it to
             // "function"), read by S4's `_slice_mode`
@@ -144,6 +173,11 @@ pub fn step_defaults() -> Value {
             // shipped Python profile sets this half.
             "taint_chunk_slice": null,
             "frontier_max_funcs_per_file": 24,
+            // Upstream v1.4.0 gates shard siblings unconditionally on a
+            // route with a prefix cache; this port cannot see the route
+            // from S4, so it is an operator switch (see
+            // `bc_stage_s4::Step4Config::shard_cache_gating`).
+            "shard_cache_gating": true,
         },
         "step5_prefilter": {
             "min_pre_confidence": 0.6,
@@ -154,6 +188,9 @@ pub fn step_defaults() -> Value {
             "parallel": 5,
             "min_confidence": 7,
             "max_turns": 30,
+            // Python's shipped profiles set it `false` explicitly; must
+            // agree with `bc_stage_s6::Step6Config::new()`.
+            "progress_file": false,
         },
         "step7_dedup": {
             "line_tolerance": 3,
@@ -202,11 +239,42 @@ pub fn step_defaults() -> Value {
         "output": {
             "emit_unreachable_appendix": false,
         },
+        // Not a step: the text progress lines `bc-cli` prints to stderr
+        // (`progress_lines.rs`), read by
+        // `config_overrides::scan_progress_override`. Python's
+        // `scan_progress` section, whose built-in scalar default is off
+        // with `compact` lines when on.
+        "scan_progress": {
+            "enabled": false,
+            "style": "compact",
+        },
+        // Not a step: transport settings every stage shares, read by
+        // `bc-cli`'s `llm_settings` (and `config_overrides::
+        // llm_stream_large_responses_override`). Net-new versus Python,
+        // which spells the two cache keys at the top level
+        // (`cache_markers: "on"`, `cache_min_block_tokens`) and has no
+        // transport or lifetime key at all.
+        "llm": {
+            "stream_large_responses": false,
+            // `auto`: the Responses API for known reasoning models, Chat
+            // Completions for everything else (docs/llm-transport.md).
+            "openai_api": "auto",
+            "cache_markers": true,
+            "cache_min_block_tokens": null,
+            "cache_ttl": "5m",
+        },
         "step_validate": {
             "enabled": false,
+            // S11's reasoning effort, Python's `DEFAULT_EFFORT`. Read by
+            // `bc-cli`'s `config_overrides::apply_step11_overrides`;
+            // `--reasoning-effort` and `models.validate.orchestrator.effort`
+            // both override it.
             "effort": "high",
             "max_turns": 50,
             "max_findings": 20,
+            // Net-new (Python flags every tie): score a one-step persona
+            // tie as SPLIT rather than failing the fix closed.
+            "split_ties_score": true,
         },
     })
 }
@@ -231,6 +299,8 @@ mod tests {
             "step_remediate",
             "step_validate",
             "output",
+            "scan_progress",
+            "llm",
         ] {
             assert!(d.get(key).is_some(), "missing step defaults for {key}");
         }
@@ -253,6 +323,26 @@ mod tests {
         assert_eq!(d["step2"]["max_prompt_entry_points"], 400);
     }
 
+    /// The v1.4.0 `step2` keys, matching `Step2Config::new()`.
+    #[test]
+    fn step2_carries_the_v1_4_evidence_and_cap_keys() {
+        let d = step_defaults();
+        assert_eq!(d["step2"]["max_config_rep_chars"], 2000);
+        assert_eq!(d["step2"]["max_config_rep_bodies"], 12);
+        assert_eq!(d["step2"]["max_manifest_depth"], 3);
+        assert_eq!(d["step2"]["max_manifests"], 12);
+        assert_eq!(d["step2"]["max_manifests_per_kind"], 2);
+        assert_eq!(d["step2"]["max_manifest_total_chars"], 24000);
+        assert_eq!(d["step2"]["max_assets"], 40);
+        assert_eq!(d["step2"]["max_trust_boundaries"], 60);
+        assert_eq!(d["step2"]["agentic"], false);
+        assert_eq!(
+            d["step2"]["allowed_tools"],
+            serde_json::json!(["Read", "Glob", "Grep"])
+        );
+        assert_eq!(d["step2"]["max_turns"], 12);
+    }
+
     #[test]
     fn step0_and_step1_carry_pythons_string_mode_keys() {
         let d = step_defaults();
@@ -266,6 +356,8 @@ mod tests {
         assert_eq!(d["step5_prefilter"]["ast_backfill_evidence"], true);
         assert_eq!(d["step3"]["catchall_mode"], "all");
         assert_eq!(d["output"]["emit_unreachable_appendix"], false);
+        assert_eq!(d["scan_progress"]["enabled"], false);
+        assert_eq!(d["scan_progress"]["style"], "compact");
     }
 
     #[test]
@@ -277,7 +369,22 @@ mod tests {
         assert_eq!(d["step7_dedup"]["line_tolerance"], 3);
         assert_eq!(d["step7_dedup"]["merge_same_range_cwes"], true);
         assert_eq!(d["step_validate"]["enabled"], false);
+        assert_eq!(d["step_validate"]["split_ties_score"], true);
         assert_eq!(d["step_remediate"]["top_n_findings"], 20);
+        assert_eq!(d["step_validate"]["effort"], "high");
+    }
+
+    /// The `llm` transport defaults: the library defaults
+    /// (`bc_llm_client::CachePolicy::default()`) plus `auto` transport,
+    /// so loading a config changes nothing a flag-only run would not do.
+    #[test]
+    fn llm_carries_the_transport_and_cache_defaults() {
+        let d = step_defaults();
+        assert_eq!(d["llm"]["stream_large_responses"], false);
+        assert_eq!(d["llm"]["openai_api"], "auto");
+        assert_eq!(d["llm"]["cache_markers"], true);
+        assert_eq!(d["llm"]["cache_min_block_tokens"], Value::Null);
+        assert_eq!(d["llm"]["cache_ttl"], "5m");
     }
 
     /// S4's chunk-slicing mode lives in TWO sections, exactly as Python
@@ -293,6 +400,13 @@ mod tests {
         assert_eq!(d["step3"]["taint_chunk_slice"], "file");
         assert_eq!(d["step4"]["taint_chunk_slice"], Value::Null);
         assert_eq!(d["step4"]["frontier_max_funcs_per_file"], 24);
+    }
+
+    /// Must match `bc_stage_s4::Step4Config::new()`'s own `true`, so a
+    /// config that sets nothing gates the same with or without `load()`.
+    #[test]
+    fn step4_gates_shard_siblings_by_default() {
+        assert_eq!(step_defaults()["step4"]["shard_cache_gating"], true);
     }
 
     /// `stepN.timeout` is the per-call wall-clock deadline each stage

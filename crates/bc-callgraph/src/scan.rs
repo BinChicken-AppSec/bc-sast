@@ -385,7 +385,7 @@ struct RawCall {
     /// reads as dynamic. See [`literal_only_symbols`].
     first_arg_symbol: Option<String>,
     /// This "call" is really a property read (`req.query`,
-    /// `Request.Headers`) that the extractor synthesised so a rule can
+    /// `Request.Headers`) that the extractor synthesized so a rule can
     /// name it — see [`RawCall::property_read`]'s own users in
     /// [`scan_file`]. Property reads match **source** specs only, and
     /// stay out of `call_edges`/`observed_calls`: a bare read is a read
@@ -556,7 +556,7 @@ pub(crate) fn scope_for(offset: usize, ranges: &[(usize, usize, String)]) -> Str
         .unwrap_or_default()
 }
 
-/// All named children of `node`, materialised. tree-sitter's own
+/// All named children of `node`, materialized. tree-sitter's own
 /// `named_children` iterator borrows a `TreeCursor`, which makes it
 /// unusable in tail position or as a function's return value; every
 /// fact extractor in this crate wants the plain list.
@@ -627,7 +627,7 @@ fn push_symbol(out: &mut Vec<String>, sym: String) {
 /// passed in two arguments is two entries, because both parameters
 /// receive it. Slots count `named_kids` of the argument list, so a Python
 /// keyword argument is numbered positionally — parameter binding by name
-/// is not modelled, upstream or here.
+/// is not modeled, upstream or here.
 fn slotted_arg_symbols(
     args_node: Option<Node>,
     src: &[u8],
@@ -3772,7 +3772,7 @@ pub fn scan_file(
         let snk_specs_lang = specs_for(sink_index, &sink_fallback, language, &method);
 
         // Record the edge for BFS regardless of match status — but never
-        // for a synthesised property read, which is not a call and whose
+        // for a synthesized property read, which is not a call and whose
         // property name colliding with some function's would fabricate a
         // call-graph edge. See [`RawCall::property_read`].
         if !property_read {

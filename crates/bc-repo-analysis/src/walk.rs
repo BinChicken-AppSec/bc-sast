@@ -438,25 +438,43 @@ mod tests {
         assert_eq!(file_size(Path::new("/does/not/exist_xyz_bc")), None);
     }
 
-    #[cfg(unix)]
+    /// Moves the directory `staged` (built at a short path) to a new
+    /// location whose own path is 100 bytes short of Linux's `PATH_MAX`,
+    /// and returns it. An entry inside it with a name of 100 bytes or more
+    /// is then listed by `read_dir`, but its full path is refused with
+    /// ENAMETOOLONG before any permission check, so no user, root
+    /// included, can stat, open or list it through that path.
+    #[cfg(target_os = "linux")]
+    fn bury_near_path_max(staged: &Path) -> PathBuf {
+        const TARGET: usize = 4096 - 100;
+        let mut deep = staged.parent().unwrap().canonicalize().unwrap();
+        while TARGET.saturating_sub(deep.as_os_str().len() + 1) > 255 {
+            deep.push("d".repeat(200));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let buried = deep.join("r".repeat(TARGET - deep.as_os_str().len() - 1));
+        std::fs::rename(staged, &buried).unwrap();
+        buried
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn a_file_whose_directory_loses_search_permission_is_silently_skipped() {
+    fn a_listed_file_that_can_no_longer_be_stat_ed_is_silently_skipped() {
         // `DirEntry::file_type()` (used by `collect_files` to identify a
-        // regular file) is a cheap dirent-type read that needs only
-        // *read* permission on the containing directory, but a full
-        // `metadata()` call needs *execute* (search) permission to
-        // resolve the path — so a directory with read-but-not-execute
-        // permissions lets a file be discovered as a candidate and then
-        // genuinely fail to stat, a real (if unusual) misconfiguration
-        // rather than a contrived race.
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        std::fs::write(sub.join("file.txt"), "hello").unwrap();
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let (files, _) = walk_repo(dir.path(), &WalkConfig::new());
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(files.is_empty(), "unexpected files: {files:?}");
+        // regular file) is a cheap dirent-type read, but `file_size` needs
+        // a full `metadata()` call on the path, which can fail for a file
+        // that was just listed. In the field that is a directory with
+        // read-but-not-search permission; a permission bit cannot stop
+        // root, so the stat failure is produced by a path longer than
+        // `PATH_MAX`, which fails for every user.
+        let base = tempfile::tempdir().unwrap();
+        let staged = base.path().join("staged");
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("ok.txt"), "hello").unwrap();
+        std::fs::write(staged.join("f".repeat(200)), "hello").unwrap();
+        let root = bury_near_path_max(&staged);
+        let (files, report) = walk_repo(&root, &WalkConfig::new());
+        assert_eq!(files, vec!["ok.txt".to_string()]);
+        assert_eq!(report, ExclusionReport::default());
     }
 }

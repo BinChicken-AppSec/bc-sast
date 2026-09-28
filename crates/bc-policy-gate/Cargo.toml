@@ -13,6 +13,7 @@ bc-yaml = { path = "../bc-yaml" }
 bc-repo-analysis = { path = "../bc-repo-analysis" }
 bc-pathjail = { path = "../bc-pathjail" }
 serde_json = { workspace = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

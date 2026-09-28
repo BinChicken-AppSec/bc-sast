@@ -61,7 +61,7 @@ pub fn load_files_full(files: &[String], repo_root: &Path) -> String {
         match read_confined(repo_root, rel) {
             Err(placeholder) => parts.push(placeholder),
             Ok(text) => {
-                let redacted = redact_source(&text);
+                let redacted = redact_source(&text, rel);
                 let numbered: Vec<String> = redacted
                     .lines()
                     .enumerate()
@@ -267,7 +267,7 @@ pub fn load_sliding_window(chunk: &Chunk, ctx: &ContextPackage, repo_root: &Path
         match read_confined(repo_root, rel) {
             Err(placeholder) => parts.push(placeholder),
             Ok(text) => {
-                let redacted = redact_source(&text);
+                let redacted = redact_source(&text, rel);
                 let lines: Vec<String> = redacted
                     .lines()
                     .map(|ln| truncate_chars(ln, MAX_LINE_CHARS))
@@ -371,6 +371,7 @@ mod tests {
             source_ref: String::new(),
             sink_ref: String::new(),
             sink_cwe: Vec::new(),
+            shard_id: String::new(),
         }
     }
 
@@ -532,7 +533,7 @@ mod tests {
         let c = chunk(ChunkSize::Large, vec!["app.py"], vec!["run"]);
         let out = load_sliding_window(&c, &ctx, dir.path());
         assert!(out.contains("danger()"), "{out}");
-        // One window, centred on the definition — not the whole file and
+        // One window, centered on the definition — not the whole file and
         // not the call-site window the text scan would have produced.
         assert_eq!(out.matches("=== app.py [lines").count(), 1, "{out}");
         assert!(!out.contains("import x"), "{out}");
@@ -547,18 +548,18 @@ mod tests {
         assert!(out.contains("danger()"), "{out}");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn load_files_full_unreadable_file_is_a_read_error_placeholder() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("locked.py");
-        std::fs::write(&path, "secret\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let out = load_files_full(&["locked.py".to_string()], dir.path());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // `drop_caches` is a regular file nobody can open for reading. The
+        // kernel checks a sysctl's mode bits itself, without the
+        // CAP_DAC_OVERRIDE bypass a chmod 000 file gets, so the read fails
+        // for root as well. Its directory stands in for the repository so
+        // the file is inside the jail.
+        let repo = Path::new("/proc/sys/vm");
+        let out = load_files_full(&["drop_caches".to_string()], repo);
         assert!(
-            out.contains("=== locked.py ===\n[READ ERROR:"),
+            out.contains("=== drop_caches ===\n[READ ERROR: Permission denied"),
             "unexpected: {out}"
         );
     }

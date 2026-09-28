@@ -64,4 +64,11 @@ mod tests {
     fn reset_run_default_clears_nothing() {
         assert_eq!(NullCheckpointStore.reset_run("run1"), 0);
     }
+
+    #[test]
+    fn prune_stale_default_removes_nothing() {
+        assert!(NullCheckpointStore
+            .prune_stale("run1", "remediate_", &[])
+            .is_empty());
+    }
 }

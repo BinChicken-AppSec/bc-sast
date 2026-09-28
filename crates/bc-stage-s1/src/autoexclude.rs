@@ -23,21 +23,56 @@ use bc_llm_client::{ChatRequest, LlmClient, LlmError, Message};
 use bc_repo_analysis::{suffix_lower, walk_repo, WalkConfig};
 use serde_json::Value;
 
-const SYSTEM: &str = "You are a build/scan triage agent. You will be shown a\n\
-deterministic survey of a source tree (directory layout, file counts,\n\
-extension histogram, and excerpts from build/README files). Decide which\n\
-parts are NOT production code so a security scanner can skip them.\n\
-\n\
-Examples of things to EXCLUDE: generated/auto-gen code, vendored or\n\
-third-party copies, test fixtures and sample data, IDE/editor metadata,\n\
-build/CI output, documentation-only trees, demo/example apps, large data\n\
-dumps, migration snapshots, localisation bundles.\n\
-\n\
-Be CONSERVATIVE — when unsure whether something is production code, do NOT\n\
-exclude it. Never exclude application source, configuration that affects\n\
-runtime behaviour, or infrastructure-as-code that provisions production.\n\
-\n\
-You MUST reply with a single fenced ```yaml block and nothing else.";
+/// Upstream v1.3's expanded triage prompt: explicit EXCLUDE and NEVER
+/// EXCLUDE category lists instead of one example sentence each.
+const SYSTEM: &str = r#"You are a build/scan triage agent. You will be shown a deterministic survey of
+a source tree (directory layout, file counts, extension histogram, and excerpts
+from build/README files). Decide which parts are NOT production code so a
+security scanner can skip them.
+
+EXCLUDE these categories:
+- Generated/auto-generated code: protobuf stubs, OpenAPI clients, code-gen
+  output, compiled assets, *.pb.go, *.generated.*, *_pb2.py
+- Vendored/third-party copies: vendor/, third_party/, node_modules/ (if checked
+  in), bower_components/, external/
+- Test-only trees: test fixtures, sample data, mock servers, e2e test suites,
+  cypress/fixtures, __snapshots__
+- IDE/editor metadata: .idea/, .vscode/ (except shared settings), .vs/,
+  *.swp, *~
+- Build/CI output: dist/, build/, out/, target/, bin/ (compiled output),
+  .cache/, coverage/
+- Documentation-only trees: docs/, documentation/, wiki/, man/, guides/
+- Demo/example apps: examples/, samples/, demo/, playground/, tutorial/
+- Data dumps: fixtures with large data files, seed data, migration SQL dumps,
+  database backups
+- Localisation bundles: locale/, i18n/, l10n/, translations/ (unless they
+  contain code)
+- Lock files and manifests that are not source: package-lock.json, yarn.lock,
+  Gemfile.lock, poetry.lock, go.sum, Cargo.lock
+
+NEVER EXCLUDE — these are in scope even if they look non-functional:
+- Application source code in ANY language
+- Configuration files that affect runtime behavior (nginx.conf, app.yaml,
+  settings.py, application.properties, .env.example)
+- Infrastructure-as-code that provisions production (Terraform, CloudFormation,
+  Helm charts, Kubernetes manifests, Ansible playbooks, Dockerfiles)
+- Database migration scripts (they modify production schema)
+- API schema definitions (OpenAPI/Swagger YAML, GraphQL SDL, protobuf .proto
+  source files — NOT generated stubs)
+- Security-related files (auth middleware, RBAC config, certificate handling)
+- Shared libraries or internal packages (even if they look like vendor code,
+  if they are maintained in this repo they are production)
+
+When unsure whether something is production code, do NOT exclude it. A false
+negative (scanning non-production code) wastes time; a false positive
+(excluding production code) misses vulnerabilities.
+
+You MUST reply with a single fenced ```yaml block and nothing else."#;
+
+/// Below this fraction of the pre-overlay scope surviving, the overlay is
+/// reported as aggressive. A reporting threshold only, never a rejection
+/// bar: only a fully emptied scope is unambiguously wrong.
+const AGGRESSIVE_KEEP_RATIO: f64 = 0.10;
 
 const EXCERPT_NAMES: &[&str] = &[
     "readme",
@@ -219,6 +254,16 @@ pub struct AutoExcludeConfig {
     /// [`bc_llm_client::ChatRequest::seed`] (OpenAI dialect only).
     /// `None` sends no seed.
     pub seed: Option<u64>,
+    /// Reasoning-effort tier for this stage's calls (the Python
+    /// original's `models.<role>.effort`, else `--reasoning-effort`),
+    /// forwarded to [`bc_llm_client::ChatRequest::reasoning_effort`].
+    /// `None` (the default) sends none, leaving the provider's default.
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+    /// Per-role OpenAI transport pin (Python's
+    /// `models.<role>.use_responses_api`), forwarded to
+    /// [`bc_llm_client::ChatRequest::openai_api`]. `None` (the default)
+    /// keeps the client-wide `--openai-api` choice.
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
     /// Per-call wall-clock deadline in seconds, overriding the shared
     /// gateway client's own 300 s default. `None` keeps that default —
     /// Python has no `step1.auto_exclude_timeout` key.
@@ -239,6 +284,29 @@ pub async fn run_autoexclude(
     dedup_min_cluster_size: usize,
     config: &AutoExcludeConfig,
 ) -> Result<AutoExcludeOverlay, LlmError> {
+    run_autoexclude_with_diagnostics(
+        client,
+        repo_root,
+        walk_config,
+        dedup_exts,
+        dedup_min_cluster_size,
+        config,
+    )
+    .await
+    .map(|(overlay, _)| overlay)
+}
+
+/// [`run_autoexclude`], also returning what the overlay guards decided
+/// (language vetoes, the scope before and after, and whether the overlay
+/// was discarded or flagged as aggressive).
+pub async fn run_autoexclude_with_diagnostics(
+    client: &dyn LlmClient,
+    repo_root: &Path,
+    walk_config: &WalkConfig,
+    dedup_exts: &[String],
+    dedup_min_cluster_size: usize,
+    config: &AutoExcludeConfig,
+) -> Result<(AutoExcludeOverlay, AutoExcludeDiagnostics), LlmError> {
     let (survey_text, n_files) = survey(repo_root, walk_config);
     let user_prompt = build_prompt(
         walk_config,
@@ -257,11 +325,14 @@ pub async fn run_autoexclude(
         temperature: config.temperature,
         top_p: config.top_p,
         seed: config.seed,
+        reasoning_effort: config.reasoning_effort,
+        openai_api: config.openai_api,
         thinking_budget: None,
         betas: Vec::new(),
         json_mode: false,
         timeout: config.timeout_secs.map(Duration::from_secs),
         stream: false,
+        ..ChatRequest::default()
     };
     let response = bc_llm_agentic::chat_with_retry(
         client,
@@ -271,7 +342,15 @@ pub async fn run_autoexclude(
     )
     .await?;
 
-    Ok(parse_response(&response.text(), walk_config))
+    let (overlay, vetoed) = parse_response(&response.text(), walk_config);
+    let mut diag = AutoExcludeDiagnostics {
+        vetoed,
+        ..AutoExcludeDiagnostics::default()
+    };
+    // `n_files` is the in-scope count by the very walk S1 runs, so it is
+    // the "before" side of the guard with no second walk.
+    let overlay = guard_scope(overlay, repo_root, walk_config, n_files, &mut diag);
+    Ok((overlay, diag))
 }
 
 /// Builds the three survey blocks (tree/histogram/excerpts) from
@@ -531,6 +610,113 @@ fn build_prompt(
     )
 }
 
+/// The bare extension if `entry` would drop an entire scanner-known
+/// language from scope (`.pug`, `*.hbs`, `**/*.hbs`, where the extension is
+/// in the language table), else `None`. Compound suffixes (`.pb.go`,
+/// `.min.js`, `.spec.ts`) are not table keys and pass, as do path-scoped
+/// globs (`rsn/**`, `frontend/dist/**`), which narrow a directory rather
+/// than a language. A directory glob can still hide a language whose files
+/// all live under one directory; that is legitimate scoping and
+/// unknowable in general, and the scope guard below is the backstop.
+/// Ported from upstream v1.3 `_erases_language`.
+fn erases_language(entry: &str) -> Option<String> {
+    let rest = entry.strip_prefix("**/").unwrap_or(entry);
+    let ext = rest.strip_prefix('*').unwrap_or(rest);
+    let bare = ext.len() > 1
+        && ext.starts_with('.')
+        && ext[1..]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    // A plain `.ext` entry must be exactly that; a glob form must have had
+    // its `*`. `**/.pug` (no star) is neither.
+    let well_formed = if rest.len() == entry.len() {
+        true
+    } else {
+        rest.starts_with('*')
+    };
+    if !(bare && well_formed) {
+        return None;
+    }
+    let ext = ext.to_lowercase();
+    bc_repo_analysis::ext_to_lang(&ext).map(|_| ext)
+}
+
+/// What the overlay guards decided, for the run's diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AutoExcludeDiagnostics {
+    /// Model-proposed extension or glob entries vetoed because each would
+    /// erase a whole scanner-known language from scope.
+    pub vetoed: Vec<String>,
+    /// In-scope files before and after the overlay, by the same walk S1
+    /// runs.
+    pub files_before: usize,
+    pub files_after: usize,
+    /// The overlay would have emptied the scope and was discarded.
+    pub discarded_empty_scope: bool,
+    /// The overlay keeps under 10% of the scope. Applied, but reported.
+    pub aggressive: bool,
+}
+
+/// The walk configuration S1 would run with `overlay` applied (lists
+/// appended, `max_file_kb` replaced), matching how the CLI applies it.
+fn with_overlay(walk_config: &WalkConfig, overlay: &AutoExcludeOverlay) -> WalkConfig {
+    let mut wc = walk_config.clone();
+    wc.exclude_dirs.extend(overlay.exclude_dirs.iter().cloned());
+    wc.exclude_exts.extend(overlay.exclude_exts.iter().cloned());
+    wc.exclude_globs
+        .extend(overlay.exclude_globs.iter().cloned());
+    if let Some(kb) = overlay.max_file_kb {
+        wc.max_file_kb = kb;
+    }
+    wc
+}
+
+/// Gate an LLM-authored overlay on its measured effect, through the
+/// authoritative walk (the language veto misses catch-all globs and never
+/// sees `exclude_dirs` or `max_file_kb`). The overlay is written by a
+/// model reading repository content, so it must not be able to silently
+/// remove the whole repository from a security scan: an overlay that would
+/// empty a non-empty scope is discarded (the scan runs as with
+/// `--no-auto-step1`), keeping only its `config_dedup` tuning. One that
+/// keeps under 10% is applied but flagged. Ported from upstream v1.3.
+fn guard_scope(
+    mut overlay: AutoExcludeOverlay,
+    repo_root: &Path,
+    walk_config: &WalkConfig,
+    files_before: usize,
+    diag: &mut AutoExcludeDiagnostics,
+) -> AutoExcludeOverlay {
+    diag.files_before = files_before;
+    let (after, _) = walk_repo(repo_root, &with_overlay(walk_config, &overlay));
+    diag.files_after = after.len();
+    if files_before == 0 {
+        return overlay;
+    }
+    if diag.files_after == 0 {
+        tracing::warn!(
+            files_before,
+            "[auto-step1] overlay would empty the scope ({files_before} files -> 0); \
+             DISCARDING it. Scanning with global step1 only."
+        );
+        diag.discarded_empty_scope = true;
+        overlay.exclude_dirs.clear();
+        overlay.exclude_exts.clear();
+        overlay.exclude_globs.clear();
+        overlay.max_file_kb = None;
+        diag.files_after = files_before;
+    } else if (diag.files_after as f64) / (files_before as f64) < AGGRESSIVE_KEEP_RATIO {
+        let files_after = diag.files_after;
+        tracing::warn!(
+            files_before,
+            files_after,
+            "[auto-step1] overlay is aggressive ({files_before} files -> {files_after}); \
+             applying it. Re-run with --no-auto-step1 if coverage looks wrong."
+        );
+        diag.aggressive = true;
+    }
+    overlay
+}
+
 fn builtin_and_configured_dirs(walk_config: &WalkConfig) -> Vec<String> {
     bc_repo_analysis::DEFAULT_EXCLUDE_DIRS
         .iter()
@@ -555,11 +741,18 @@ fn builtin_and_configured_exts(walk_config: &WalkConfig) -> Vec<String> {
 /// degrades to an all-empty overlay rather than an error — matching
 /// Python's own non-fatal "WARN + write empty overlay" behavior, since a
 /// bad model response should never abort the scan.
-fn parse_response(raw: &str, walk_config: &WalkConfig) -> AutoExcludeOverlay {
+///
+/// Enforces the system prompt's own "never exclude application source"
+/// rule deterministically: any model-proposed extension or glob that would
+/// erase a whole scanner-known language ([`erases_language`]) is vetoed
+/// and returned in the second slot. Only the model overlay is policed;
+/// built-in defaults and operator configuration never pass through here,
+/// so an operator can still exclude `.pug` deliberately.
+fn parse_response(raw: &str, walk_config: &WalkConfig) -> (AutoExcludeOverlay, Vec<String>) {
     let blob = extract_yaml_fence(raw);
     let data = match bc_yaml::parse(&blob) {
         Ok(v) => v,
-        Err(_) => return AutoExcludeOverlay::default(),
+        Err(_) => return (AutoExcludeOverlay::default(), Vec::new()),
     };
     let data = match &data {
         Value::Object(map) if map.len() == 1 && map.get("step1").is_some_and(Value::is_object) => {
@@ -568,7 +761,7 @@ fn parse_response(raw: &str, walk_config: &WalkConfig) -> AutoExcludeOverlay {
         other => other.clone(),
     };
     if !data.is_object() {
-        return AutoExcludeOverlay::default();
+        return (AutoExcludeOverlay::default(), Vec::new());
     }
 
     let base_dirs_l: std::collections::HashSet<String> = builtin_and_configured_dirs(walk_config)
@@ -600,6 +793,27 @@ fn parse_response(raw: &str, walk_config: &WalkConfig) -> AutoExcludeOverlay {
         .into_iter()
         .filter(|g| !base_globs.contains(g))
         .collect();
+    let vetoed: Vec<String> = exts
+        .iter()
+        .chain(globs.iter())
+        .filter(|x| erases_language(x).is_some())
+        .cloned()
+        .collect();
+    let exts: Vec<String> = exts
+        .into_iter()
+        .filter(|e| erases_language(e).is_none())
+        .collect();
+    let globs: Vec<String> = globs
+        .into_iter()
+        .filter(|g| erases_language(g).is_none())
+        .collect();
+    if !vetoed.is_empty() {
+        let list = vetoed.join(", ");
+        tracing::warn!(
+            "[auto-step1] vetoed language-wide exclusions proposed by the model \
+             (would erase scannable source): {list}"
+        );
+    }
 
     let max_file_kb = data
         .get("max_file_kb")
@@ -653,13 +867,16 @@ fn parse_response(raw: &str, walk_config: &WalkConfig) -> AutoExcludeOverlay {
         }
     }
 
-    AutoExcludeOverlay {
-        exclude_dirs: dirs,
-        exclude_exts: exts,
-        exclude_globs: globs,
-        max_file_kb,
-        config_dedup,
-    }
+    (
+        AutoExcludeOverlay {
+            exclude_dirs: dirs,
+            exclude_exts: exts,
+            exclude_globs: globs,
+            max_file_kb,
+            config_dedup,
+        },
+        vetoed,
+    )
 }
 
 fn extract_yaml_fence(text: &str) -> String {
@@ -720,28 +937,28 @@ mod tests {
     #[test]
     fn parse_response_extracts_a_fenced_yaml_block() {
         let raw = "here you go\n```yaml\nexclude_dirs:\n  - generated\n```\nthanks";
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert_eq!(overlay.exclude_dirs, vec!["generated".to_string()]);
     }
 
     #[test]
     fn parse_response_falls_back_to_raw_text_when_unfenced() {
         let raw = "exclude_dirs:\n  - generated\n";
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert_eq!(overlay.exclude_dirs, vec!["generated".to_string()]);
     }
 
     #[test]
     fn parse_response_degrades_to_empty_on_malformed_yaml() {
         let raw = "```yaml\nexclude_dirs: [unterminated\n```";
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert_eq!(overlay, AutoExcludeOverlay::default());
     }
 
     #[test]
     fn parse_response_unwraps_a_top_level_step1_key() {
         let raw = "```yaml\nstep1:\n  exclude_dirs:\n    - generated\n```";
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert_eq!(overlay.exclude_dirs, vec!["generated".to_string()]);
     }
 
@@ -749,7 +966,7 @@ mod tests {
     fn parse_response_drops_dirs_already_excluded_by_default() {
         // ".git" is one of bc_repo_analysis::DEFAULT_EXCLUDE_DIRS.
         let raw = "```yaml\nexclude_dirs:\n  - .git\n  - generated\n```";
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert_eq!(overlay.exclude_dirs, vec!["generated".to_string()]);
     }
 
@@ -758,14 +975,14 @@ mod tests {
         let mut config = wc();
         config.exclude_dirs.push("already-excluded".to_string());
         let raw = "```yaml\nexclude_dirs:\n  - already-excluded\n  - new-one\n```";
-        let overlay = parse_response(raw, &config);
+        let overlay = parse_response(raw, &config).0;
         assert_eq!(overlay.exclude_dirs, vec!["new-one".to_string()]);
     }
 
     #[test]
     fn parse_response_normalizes_extensions_to_have_a_leading_dot() {
         let raw = "```yaml\nexclude_exts:\n  - pb.go\n  - .g.dart\n```";
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert_eq!(
             overlay.exclude_exts,
             vec![".pb.go".to_string(), ".g.dart".to_string()]
@@ -776,7 +993,7 @@ mod tests {
     fn parse_response_drops_an_already_excluded_extension() {
         // ".png" is one of bc_repo_analysis::DEFAULT_EXCLUDE_EXTS.
         let raw = "```yaml\nexclude_exts:\n  - .png\n  - .foo\n```";
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert_eq!(overlay.exclude_exts, vec![".foo".to_string()]);
     }
 
@@ -785,7 +1002,7 @@ mod tests {
         let mut config = wc();
         config.exclude_globs.push("already/**".to_string());
         let raw = "```yaml\nexclude_globs:\n  - already/**\n  - tools/codegen/**\n```";
-        let overlay = parse_response(raw, &config);
+        let overlay = parse_response(raw, &config).0;
         assert_eq!(overlay.exclude_globs, vec!["tools/codegen/**".to_string()]);
     }
 
@@ -793,18 +1010,18 @@ mod tests {
     fn parse_response_max_file_kb_only_kept_when_positive_and_different() {
         let mut config = wc();
         config.max_file_kb = 1024;
-        let same = parse_response("```yaml\nmax_file_kb: 1024\n```", &config);
+        let same = parse_response("```yaml\nmax_file_kb: 1024\n```", &config).0;
         assert_eq!(same.max_file_kb, None);
-        let zero = parse_response("```yaml\nmax_file_kb: 0\n```", &config);
+        let zero = parse_response("```yaml\nmax_file_kb: 0\n```", &config).0;
         assert_eq!(zero.max_file_kb, None);
-        let changed = parse_response("```yaml\nmax_file_kb: 2048\n```", &config);
+        let changed = parse_response("```yaml\nmax_file_kb: 2048\n```", &config).0;
         assert_eq!(changed.max_file_kb, Some(2048));
     }
 
     #[test]
     fn parse_response_config_dedup_only_keeps_recognized_typed_keys() {
         let raw = "```yaml\nconfig_dedup:\n  exts: [.tfvars, cue]\n  min_cluster_size: 5\n  enabled: true\n  unknown_key: 7\n```";
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert_eq!(
             overlay.config_dedup.get("exts"),
             Some(&Value::Array(vec![
@@ -826,7 +1043,7 @@ mod tests {
     #[test]
     fn parse_response_config_dedup_absent_when_no_keys_recognized() {
         let raw = "```yaml\nconfig_dedup:\n  bogus: 1\n```";
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert!(overlay.config_dedup.is_empty());
     }
 
@@ -873,7 +1090,7 @@ mod tests {
     #[test]
     fn parse_response_config_dedup_exts_is_normalized_and_deduplicated() {
         let raw = "```yaml\nconfig_dedup:\n  exts: [tfvars, .cue, tfvars]\n```";
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert_eq!(
             overlay.config_dedup.get("exts"),
             Some(&Value::Array(vec![
@@ -885,7 +1102,7 @@ mod tests {
 
     #[test]
     fn parse_response_returns_default_when_the_top_level_value_is_not_an_object() {
-        let overlay = parse_response("```yaml\n- just\n- a\n- list\n```", &wc());
+        let overlay = parse_response("```yaml\n- just\n- a\n- list\n```", &wc()).0;
         assert_eq!(overlay, AutoExcludeOverlay::default());
     }
 
@@ -896,20 +1113,20 @@ mod tests {
         // included) is returned unparsed as-is — `bc_yaml::parse` then
         // fails on the stray "```yaml" line, degrading to an empty
         // overlay, exactly like any other malformed-YAML response.
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert_eq!(overlay, AutoExcludeOverlay::default());
     }
 
     #[test]
     fn norm_list_value_accepts_a_bare_string_not_just_an_array() {
-        let overlay = parse_response("```yaml\nexclude_dirs: generated\n```", &wc());
+        let overlay = parse_response("```yaml\nexclude_dirs: generated\n```", &wc()).0;
         assert_eq!(overlay.exclude_dirs, vec!["generated".to_string()]);
     }
 
     #[test]
     fn norm_list_value_skips_an_item_that_trims_to_empty() {
         let raw = "```yaml\nexclude_dirs:\n  - \"/\"\n  - generated\n```";
-        let overlay = parse_response(raw, &wc());
+        let overlay = parse_response(raw, &wc()).0;
         assert_eq!(overlay.exclude_dirs, vec!["generated".to_string()]);
     }
 
@@ -1053,6 +1270,8 @@ mod tests {
             temperature: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
+            openai_api: None,
             timeout_secs: None,
         };
         let result = run_autoexclude(&FailingClient, dir.path(), &wc(), &[], 3, &config).await;
@@ -1086,11 +1305,177 @@ mod tests {
             temperature: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
+            openai_api: None,
             timeout_secs: None,
         };
         let overlay = run_autoexclude(&FakeClient, dir.path(), &wc(), &[], 3, &config)
             .await
             .unwrap();
         assert_eq!(overlay.exclude_dirs, vec!["generated".to_string()]);
+    }
+
+    // ── upstream v1.3 overlay guards ─────────────────────────────────────
+
+    #[test]
+    fn erases_language_flags_only_whole_language_exclusions() {
+        for entry in [".pug", ".PY", "*.hbs", "**/*.hbs", "**/*.ts"] {
+            assert!(erases_language(entry).is_some(), "{entry}");
+        }
+        assert_eq!(erases_language("**/*.PY").as_deref(), Some(".py"));
+        for entry in [
+            ".pb.go",
+            ".min.js",
+            "*.spec.ts",
+            "rsn/**",
+            "frontend/dist/**",
+            "**/.pug",
+            "*pug",
+            ".",
+            "**/*.",
+            ".nosuchlang",
+            "src/*.py",
+        ] {
+            assert_eq!(erases_language(entry), None, "{entry}");
+        }
+    }
+
+    #[test]
+    fn parse_response_vetoes_language_wide_exts_and_globs() {
+        let raw = "```yaml\nexclude_exts:\n  - .pug\n  - .pb.go\nexclude_globs:\n  - \"**/*.hbs\"\n  - gen/**\n```";
+        let (overlay, vetoed) = parse_response(raw, &wc());
+        assert_eq!(overlay.exclude_exts, vec![".pb.go".to_string()]);
+        assert_eq!(overlay.exclude_globs, vec!["gen/**".to_string()]);
+        assert_eq!(vetoed, vec![".pug".to_string(), "**/*.hbs".to_string()]);
+    }
+
+    fn repo_with(files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for f in files {
+            let path = dir.path().join(f);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x\n").unwrap();
+        }
+        dir
+    }
+
+    fn overlay_of(globs: &[&str]) -> AutoExcludeOverlay {
+        AutoExcludeOverlay {
+            exclude_globs: globs.iter().map(|g| g.to_string()).collect(),
+            config_dedup: BTreeMap::from([("enabled".to_string(), Value::Bool(true))]),
+            ..AutoExcludeOverlay::default()
+        }
+    }
+
+    #[test]
+    fn an_overlay_that_would_empty_the_scope_is_discarded_but_keeps_dedup_tuning() {
+        let dir = repo_with(&["src/a.py", "lib/b.py"]);
+        let mut diag = AutoExcludeDiagnostics::default();
+        let mut overlay = overlay_of(&["**"]);
+        overlay.exclude_dirs = vec!["src".to_string()];
+        overlay.max_file_kb = Some(1);
+        let kept = guard_scope(overlay, dir.path(), &wc(), 2, &mut diag);
+        assert!(diag.discarded_empty_scope);
+        assert!(kept.exclude_globs.is_empty());
+        assert!(kept.exclude_dirs.is_empty());
+        assert_eq!(kept.max_file_kb, None);
+        assert_eq!(kept.config_dedup.len(), 1);
+        assert_eq!((diag.files_before, diag.files_after), (2, 2));
+    }
+
+    #[test]
+    fn an_aggressive_overlay_is_applied_and_flagged() {
+        let files: Vec<String> = (0..20).map(|i| format!("gen/f{i}.py")).collect();
+        let mut refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        refs.push("src/app.py");
+        let dir = repo_with(&refs);
+        let mut diag = AutoExcludeDiagnostics::default();
+        let kept = guard_scope(overlay_of(&["gen/**"]), dir.path(), &wc(), 21, &mut diag);
+        assert!(diag.aggressive);
+        assert!(!diag.discarded_empty_scope);
+        assert_eq!(diag.files_after, 1);
+        assert_eq!(kept.exclude_globs, vec!["gen/**".to_string()]);
+    }
+
+    #[test]
+    fn a_moderate_overlay_passes_the_guard_untouched() {
+        let dir = repo_with(&["gen/a.py", "src/b.py"]);
+        let mut diag = AutoExcludeDiagnostics::default();
+        let overlay = overlay_of(&["gen/**"]);
+        let kept = guard_scope(overlay.clone(), dir.path(), &wc(), 2, &mut diag);
+        assert_eq!(kept, overlay);
+        assert!(!diag.aggressive && !diag.discarded_empty_scope);
+        assert_eq!(diag.files_after, 1);
+    }
+
+    #[test]
+    fn an_empty_repo_is_never_reported_as_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut diag = AutoExcludeDiagnostics::default();
+        let overlay = overlay_of(&["**"]);
+        let kept = guard_scope(overlay.clone(), dir.path(), &wc(), 0, &mut diag);
+        assert_eq!(kept, overlay);
+        assert!(!diag.discarded_empty_scope);
+    }
+
+    #[test]
+    fn with_overlay_appends_lists_and_replaces_the_size_limit() {
+        let overlay = AutoExcludeOverlay {
+            exclude_dirs: vec!["gen".to_string()],
+            exclude_exts: vec![".foo".to_string()],
+            exclude_globs: vec!["x/**".to_string()],
+            max_file_kb: Some(7),
+            config_dedup: BTreeMap::new(),
+        };
+        let wc2 = with_overlay(&wc(), &overlay);
+        assert!(wc2.exclude_dirs.contains(&"gen".to_string()));
+        assert!(wc2.exclude_exts.contains(&".foo".to_string()));
+        assert!(wc2.exclude_globs.contains(&"x/**".to_string()));
+        assert_eq!(wc2.max_file_kb, 7);
+        let wc3 = with_overlay(&wc(), &AutoExcludeOverlay::default());
+        assert_eq!(wc3.max_file_kb, wc().max_file_kb);
+    }
+
+    #[tokio::test]
+    async fn a_model_cannot_exclude_the_whole_repository() {
+        // Security regression: the overlay is model-authored from repo
+        // content. A catch-all glob must not silently remove every file
+        // from the scan, and a bare language extension must be vetoed.
+        struct Hostile;
+        #[async_trait::async_trait]
+        impl LlmClient for Hostile {
+            async fn chat(
+                &self,
+                _request: &ChatRequest,
+            ) -> Result<bc_llm_client::ChatResponse, LlmError> {
+                Ok(bc_llm_client::ChatResponse {
+                    content: vec![bc_llm_client::ContentBlock::text(
+                        "```yaml\nexclude_globs:\n  - \"*\"\n  - \"**/*.py\"\nexclude_exts: [.py]\n```",
+                    )],
+                    stop_reason: bc_llm_client::StopReason::EndTurn,
+                    usage: bc_llm_client::Usage::default(),
+                })
+            }
+        }
+        let dir = repo_with(&["app.py", "pkg/util.py"]);
+        let config = AutoExcludeConfig {
+            model: "test-model".to_string(),
+            max_tokens: 8000,
+            max_transient_retries: 0,
+            retry_backoff_base: Duration::ZERO,
+            temperature: None,
+            top_p: None,
+            seed: None,
+            reasoning_effort: None,
+            openai_api: None,
+            timeout_secs: None,
+        };
+        let (overlay, diag) =
+            run_autoexclude_with_diagnostics(&Hostile, dir.path(), &wc(), &[], 3, &config)
+                .await
+                .unwrap();
+        assert_eq!(diag.vetoed, vec![".py".to_string(), "**/*.py".to_string()]);
+        assert!(diag.discarded_empty_scope);
+        assert_eq!(overlay, AutoExcludeOverlay::default());
     }
 }

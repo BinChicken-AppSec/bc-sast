@@ -52,6 +52,16 @@ where
     Ok(ChunkSize::from_canonical(&s))
 }
 
+fn deserialize_rationale<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s,
+        _ => String::new(),
+    })
+}
+
 fn default_chunk_size() -> ChunkSize {
     ChunkSize::Medium
 }
@@ -112,11 +122,26 @@ pub struct Chunk {
     /// CWE tags from S0 rule metadata (confirm/refute focus).
     #[serde(default)]
     pub sink_cwe: Vec<String>,
+    /// Which shared file bucket a specialist chunk reviews: `"shard-NN"`
+    /// for the default source buckets every unscoped lens shares, and
+    /// `"iac-shard-NN"` for the IaC-only buckets. Empty on every other
+    /// chunk kind. S3 emits specialist chunks shard-major (every lens for
+    /// shard 1, then shard 2, ...), so consecutive S4 calls with the same
+    /// `shard_id` send an identical source prefix and can reuse a provider
+    /// prompt cache. Ported from upstream v1.3 `Chunk.shard_id`.
+    #[serde(default)]
+    pub shard_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskManifest {
+    /// Deliberately required: a missing or null `chunks` key is what marks
+    /// a genuinely malformed strategist reply, which S3 must still degrade.
     pub chunks: Vec<Chunk>,
+    /// Defaulted (and a JSON `null` or non-string read as empty), as
+    /// upstream v1.3 does: a reply missing only its rationale used to fail
+    /// the whole manifest even though every chunk was well formed.
+    #[serde(default, deserialize_with = "deserialize_rationale")]
     pub rationale: String,
     /// Files `step3.catchall_mode=reachable_only` dropped from catch-all
     /// review (call-graph unreachable from any entry point/sink) — listed
@@ -180,6 +205,32 @@ mod tests {
     }
 
     #[test]
+    fn task_manifest_rationale_is_optional_and_null_tolerant_but_chunks_is_not() {
+        let m: TaskManifest = serde_json::from_value(serde_json::json!({"chunks": []})).unwrap();
+        assert_eq!(m.rationale, "");
+        let m: TaskManifest =
+            serde_json::from_value(serde_json::json!({"chunks": [], "rationale": null})).unwrap();
+        assert_eq!(m.rationale, "");
+        let m: TaskManifest =
+            serde_json::from_value(serde_json::json!({"chunks": [], "rationale": "r"})).unwrap();
+        assert_eq!(m.rationale, "r");
+        assert!(
+            serde_json::from_value::<TaskManifest>(serde_json::json!({"rationale": "r"})).is_err()
+        );
+    }
+
+    #[test]
+    fn chunk_shard_id_defaults_to_empty_and_round_trips() {
+        // A checkpoint written before the field existed must still load.
+        let c: Chunk = serde_json::from_value(serde_json::json!({"id": "c1"})).unwrap();
+        assert_eq!(c.shard_id, "");
+        let c: Chunk =
+            serde_json::from_value(serde_json::json!({"id": "c1", "shard_id": "shard-02"}))
+                .unwrap();
+        assert_eq!(serde_json::to_value(&c).unwrap()["shard_id"], "shard-02");
+    }
+
+    #[test]
     fn sorted_chunks_orders_by_ascending_risk_rank_stably() {
         let manifest = TaskManifest {
             chunks: vec![
@@ -198,6 +249,7 @@ mod tests {
                     source_ref: String::new(),
                     sink_ref: String::new(),
                     sink_cwe: vec![],
+                    shard_id: String::new(),
                 },
                 Chunk {
                     id: "c-a".into(),
@@ -214,6 +266,7 @@ mod tests {
                     source_ref: String::new(),
                     sink_ref: String::new(),
                     sink_cwe: vec![],
+                    shard_id: String::new(),
                 },
                 Chunk {
                     id: "c-c".into(),
@@ -230,6 +283,7 @@ mod tests {
                     source_ref: String::new(),
                     sink_ref: String::new(),
                     sink_cwe: vec![],
+                    shard_id: String::new(),
                 },
             ],
             rationale: "r".into(),

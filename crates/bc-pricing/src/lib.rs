@@ -40,7 +40,7 @@
 //!
 //! The scanner speaks to an OpenAI dialect or an Anthropic dialect
 //! endpoint at a configurable base URL. In practice that endpoint is
-//! frequently a gateway, and the upstream catalogue's long tail is
+//! frequently a gateway, and the upstream catalog's long tail is
 //! overwhelmingly gateways: OpenRouter, Vercel AI Gateway, LLM Gateway,
 //! Kilo, Requesty, Helicone, Cloudflare AI Gateway, and dozens more, each
 //! republishing hundreds of models at its own prices. Curating those out
@@ -87,7 +87,9 @@ use std::sync::LazyLock;
 
 pub use call::{Call, CallCost, CostTotal};
 pub use money::Money;
-pub use table::{ModelPrice, PriceTable, Rate, TableMeta, Tier, Unpriced};
+pub use table::{
+    ModelPrice, PriceTable, Rate, TableMeta, Tier, Unpriced, LONG_TTL_WRITE_MULTIPLIER,
+};
 
 /// The trimmed models.dev capture, exactly as committed.
 pub const VENDORED_JSON: &str = include_str!("../data/models-dev-prices.json");
@@ -266,7 +268,22 @@ mod tests {
         assert_eq!(meta.source, "https://models.dev/api.json");
         assert_eq!(meta.source_license, "MIT");
         assert!(meta.source_license_url.starts_with("https://"));
-        assert_eq!(meta.captured, "2026-09-09");
+        // Shape, not a pinned day: refreshing the table legitimately moves
+        // this date, and an equality assert only added a second file to edit
+        // on every refresh. A malformed or missing date still fails here.
+        let captured: Vec<&str> = meta.captured.split('-').collect();
+        assert_eq!(captured.len(), 3, "{}", meta.captured);
+        assert!(
+            captured[0].len() == 4
+                && captured[1].len() == 2
+                && captured[2].len() == 2
+                && meta
+                    .captured
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '-'),
+            "{} is not YYYY-MM-DD",
+            meta.captured
+        );
         assert!(meta.generator.ends_with("refresh_prices.py"));
         assert!(meta.rate_unit.contains("picodollars"));
     }
@@ -274,6 +291,20 @@ mod tests {
     #[test]
     fn the_vendored_table_is_parsed_once() {
         assert!(std::ptr::eq(vendored_table(), vendored_table()));
+    }
+
+    /// `claude-opus-5-5` comes from the refresh script's SUPPLEMENT (it
+    /// was not in the models.dev capture yet): 1M fresh input, 1M output,
+    /// 1M cache reads and 1M 5-minute cache writes at $4 / $20 / $0.20 /
+    /// $5 per million.
+    #[test]
+    fn claude_opus_5_5_is_priced_with_its_cache_rates() {
+        let pricer = Pricer::vendored();
+        let call = Call::from_usage(1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        let cost = pricer
+            .price_call("anthropic", "claude-opus-5-5", &call)
+            .expect("supplemented model");
+        assert_eq!(cost.total().to_usd_string(2), "29.20");
     }
 
     #[test]

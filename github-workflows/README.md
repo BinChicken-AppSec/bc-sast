@@ -9,6 +9,13 @@ Both are org-neutral: no account ids, no secrets, no cloud provider, no
 registry hostname. Everything environment-specific is a repository
 variable, a secret, or a clearly marked placeholder.
 
+Every action is pinned to a full commit sha with its version in a trailing
+comment, the same way this project's own CI pins them. A tag like `@v4` is
+mutable: whoever owns the action can repoint it, and a workflow with your
+repository's token would then run code you never reviewed. Keep the pins
+when you copy these, and re-pin deliberately when you update rather than
+loosening them back to a tag.
+
 This project's own CI is a different thing and lives where it belongs, in
 [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml). It builds
 and tests this code on pull requests and on `main`, uses no secrets, and

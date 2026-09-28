@@ -14,7 +14,10 @@ mod autoexclude;
 mod prompts;
 mod pure;
 
-pub use autoexclude::{run_autoexclude, AutoExcludeConfig, AutoExcludeOverlay};
+pub use autoexclude::{
+    run_autoexclude, run_autoexclude_with_diagnostics, AutoExcludeConfig, AutoExcludeDiagnostics,
+    AutoExcludeOverlay,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -87,6 +90,16 @@ pub struct Step1Config {
     /// [`bc_llm_client::ChatRequest::seed`] (OpenAI dialect only). `None`
     /// (the default) sends no seed.
     pub seed: Option<u64>,
+    /// Reasoning-effort tier for this stage's calls (the Python
+    /// original's `models.<role>.effort`, else `--reasoning-effort`),
+    /// forwarded to [`bc_llm_client::ChatRequest::reasoning_effort`].
+    /// `None` (the default) sends none, leaving the provider's default.
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+    /// Per-role OpenAI transport pin (Python's
+    /// `models.<role>.use_responses_api`), forwarded to
+    /// [`bc_llm_client::ChatRequest::openai_api`]. `None` (the default)
+    /// keeps the client-wide `--openai-api` choice.
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
     /// Per-turn wall-clock deadline in seconds, overriding the shared
     /// gateway client's own 300 s default. `None` (the default) keeps it.
     pub timeout_secs: Option<u64>,
@@ -115,6 +128,8 @@ impl Step1Config {
             temperature: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
+            openai_api: None,
             timeout_secs: None,
         }
     }
@@ -274,6 +289,8 @@ impl PipelineStage for Stage1 {
             agentic_config.temperature = self.config.temperature;
             agentic_config.top_p = self.config.top_p;
             agentic_config.seed = self.config.seed;
+            agentic_config.reasoning_effort = self.config.reasoning_effort;
+            agentic_config.openai_api = self.config.openai_api;
             agentic_config.timeout_secs = self.config.timeout_secs;
 
             let outcome = run_agentic(

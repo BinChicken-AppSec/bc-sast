@@ -150,7 +150,7 @@ pub static SYSTEM: LazyLock<String> = LazyLock::new(|| {
 /// so a pure-C++ slice gets the C++-specific hints (iterators, `c_str()`
 /// lifetime, `reinterpret_cast`, exception safety) and a pure-C slice is
 /// not told about containers it does not have. A mixed chunk — or one
-/// whose files are all headers of the other flavour — keeps `"c-cpp"`,
+/// whose files are all headers of the other flavor — keeps `"c-cpp"`,
 /// whose body covers both. Every other key passes through untouched.
 fn refined_languages(chunk: &Chunk) -> Vec<&str> {
     let mut langs: Vec<&str> = chunk.languages.iter().map(String::as_str).collect();
@@ -207,6 +207,18 @@ pub fn build_research_lens(chunk: &Chunk, code: Option<&str>) -> String {
 /// EXCLUSION_RULES group A ("no real attacker") itself instead of
 /// emitting a false positive the verifier must drop. `""` when neither
 /// `ctx.app_profile` nor `ctx.threat_model` is present.
+///
+/// Only the confirm/refute prompt still renders this. The open-ended
+/// prompt carries the richer [`crate::shared_context::shared_context_block`]
+/// in its cache prefix instead, as upstream v1.4.0 does.
+///
+/// **Divergence from Python, deliberate.** Upstream v1.4.0 also dropped
+/// this block from `_build_confirm_refute_prompt`, as a side effect of
+/// moving the context into the cache prefix, which the confirm/refute
+/// call does not use. Deciding whether the seeded source is
+/// attacker-controlled is exactly what a confirm/refute verdict turns on,
+/// so this port keeps the compact block there: the caching change is
+/// not a reason to change what that prompt says.
 pub fn trust_context_block(ctx: &ContextPackage) -> String {
     let ap = ctx.app_profile.as_ref();
     let tm = ctx.threat_model.as_ref();
@@ -294,28 +306,72 @@ fn compliance_guidance_block(ctx: &ContextPackage) -> String {
     format!("\nCOMPLIANCE GUIDANCE:\n{}\n", ctx.compliance_guidance)
 }
 
-/// The full USER prompt for one deep-dive run, ported from
-/// `_build_prompt`. `code` is the chunk's already-assembled source (full
-/// files or sliding window) with neighbor-context already appended by the
-/// caller, exactly as the Python original mutates its own local `code`
-/// variable before calling `_build_prompt`.
+/// The USER text for one open-ended deep-dive run, ported from upstream
+/// v1.4.0 `_build_prompt`. `code` is the chunk's already-assembled source
+/// (full files or sliding window) with neighbor context already appended
+/// by the caller, exactly as the Python original mutates its own local
+/// `code` variable before calling `_build_prompt`.
+///
+/// This is only the volatile remainder of the prompt. The scan-constant
+/// context ([`crate::shared_context::shared_context_block`], which
+/// supersedes [`trust_context_block`] here) travels separately as the
+/// request's cache prefix, ahead of this text, so it is deliberately not
+/// rendered here a second time. See [`crate::prompt_layout`].
 pub fn build_prompt(chunk: &Chunk, ctx: &ContextPackage, code: &str) -> String {
+    format!(
+        "{}\nSOURCE CODE:\n{code}\n\nAnalyze this code and respond with ONLY the JSON findings object.",
+        prompt_head(chunk, ctx, code),
+    )
+}
+
+/// The USER text for a shard-major specialist chunk (non-empty
+/// `chunk.shard_id`), upstream v1.4.0 `_build_prompt`'s `if
+/// chunk.shard_id:` branch. Identical to [`build_prompt`] minus the SOURCE
+/// CODE section: every lens on one shard reviews byte-identical code, so
+/// the code rides in the cache prefix instead (see [`shard_source_block`])
+/// and the lens framing, the only part that differs between lenses, comes
+/// after it.
+///
+/// Upstream's comment on this branch says the lens now sits "last, right
+/// before the closing imperative"; its f-string, mirrored byte for byte
+/// here, keeps `RESEARCH LENS:` at the head of the user text, so the lens
+/// comes after the shared source but before the chunk header. The code
+/// wins over the comment for parity.
+///
+/// `code` is still taken because the research lens is chosen from it.
+pub fn build_shard_prompt(chunk: &Chunk, ctx: &ContextPackage, code: &str) -> String {
+    format!(
+        "{}\nAnalyze this code and respond with ONLY the JSON findings object.",
+        prompt_head(chunk, ctx, code),
+    )
+}
+
+/// The shard's SOURCE CODE section, rendered once so it can close the
+/// cache prefix of every lens on the shard. Ported from upstream
+/// `_shard_source_block`.
+pub fn shard_source_block(code: &str) -> String {
+    format!("SOURCE CODE:\n{code}\n\n")
+}
+
+/// Everything [`build_prompt`] and [`build_shard_prompt`] share: the
+/// research lens, the chunk header, the related CVEs and the compliance
+/// guidance (scan-constant, but kept here rather than in the shared block
+/// so its position in the prompt is unchanged).
+fn prompt_head(chunk: &Chunk, ctx: &ContextPackage, code: &str) -> String {
     let focus = if chunk.focus_entry_points.is_empty() {
         "(none)".to_string()
     } else {
         chunk.focus_entry_points.join(", ")
     };
     format!(
-        "RESEARCH LENS:\n{}\n\nCHUNK: {}  SIZE: {}\nHYPOTHESIS: {}\nFOCUS ENTRY POINTS: {}\n{}{}{}\nSOURCE CODE:\n{}\n\nAnalyze this code and respond with ONLY the JSON findings object.",
+        "RESEARCH LENS:\n{}\n\nCHUNK: {}  SIZE: {}\nHYPOTHESIS: {}\nFOCUS ENTRY POINTS: {}\n{}{}",
         build_research_lens(chunk, Some(code)),
         chunk.id,
         chunk_size_str(chunk.size),
         chunk.hypothesis,
         focus,
-        trust_context_block(ctx),
         cve_block(chunk, ctx),
         compliance_guidance_block(ctx),
-        code,
     )
 }
 
@@ -833,6 +889,7 @@ mod tests {
             source_ref: String::new(),
             sink_ref: String::new(),
             sink_cwe: Vec::new(),
+            shard_id: String::new(),
         }
     }
 
@@ -1324,6 +1381,50 @@ mod tests {
     fn build_prompt_omits_compliance_guidance_when_absent() {
         let out = build_prompt(&chunk(), &ContextPackage::default(), "code");
         assert!(!out.contains("COMPLIANCE GUIDANCE"));
+    }
+
+    /// The trust context now travels in the cache prefix (the shared
+    /// block), so the user text must not carry it a second time.
+    #[test]
+    fn build_prompt_no_longer_embeds_the_trust_context() {
+        let ctx = ContextPackage {
+            app_profile: Some(AppProfile {
+                application_id: "A".to_string(),
+                name: String::new(),
+                externally_facing: true,
+                pci_scoped: false,
+                processes_pan: false,
+                pii: false,
+                source: String::new(),
+            }),
+            ..ContextPackage::default()
+        };
+        let out = build_prompt(&chunk(), &ctx, "code");
+        assert!(!out.contains("TRUST CONTEXT"));
+        assert!(!out.contains("TRUST RULE"));
+    }
+
+    #[test]
+    fn build_shard_prompt_is_build_prompt_minus_the_source_code_section() {
+        let ctx = ContextPackage {
+            compliance_guidance: "PCI first.".to_string(),
+            ..ContextPackage::default()
+        };
+        let normal = build_prompt(&chunk(), &ctx, "SECRET_CODE_BODY");
+        let shard = build_shard_prompt(&chunk(), &ctx, "SECRET_CODE_BODY");
+        assert!(!shard.contains("SOURCE CODE:"));
+        assert!(!shard.contains("SECRET_CODE_BODY"));
+        assert!(shard.starts_with("RESEARCH LENS:\n"));
+        assert!(shard.contains("COMPLIANCE GUIDANCE:\nPCI first."));
+        assert_eq!(
+            normal.replace("SOURCE CODE:\nSECRET_CODE_BODY\n\n", ""),
+            shard
+        );
+    }
+
+    #[test]
+    fn shard_source_block_ends_with_a_blank_line_so_the_user_text_can_follow() {
+        assert_eq!(shard_source_block("x = 1"), "SOURCE CODE:\nx = 1\n\n");
     }
 
     // -- norm_rel_path -------------------------------------------------

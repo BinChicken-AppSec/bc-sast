@@ -25,7 +25,7 @@ use bc_callgraph::annotator::{
     supplement_with_heuristics, SYSTEM_PROMPT,
 };
 use bc_callgraph::{Candidate, FileIndex, MatchSpec};
-use bc_llm_client::{ChatRequest, LlmClient, Message};
+use bc_llm_client::{ChatRequest, LlmClient, LlmError, Message};
 use serde_json::Value;
 
 /// `step0.callgraph.llm.*` knobs. Defaults match `default.yaml`'s own
@@ -71,6 +71,16 @@ pub struct Step0LlmConfig {
     /// [`bc_llm_client::ChatRequest::seed`] (OpenAI dialect only).
     /// `None` (the default) sends no seed.
     pub seed: Option<u64>,
+    /// Reasoning-effort tier for this stage's calls (the Python
+    /// original's `models.<role>.effort`, else `--reasoning-effort`),
+    /// forwarded to [`bc_llm_client::ChatRequest::reasoning_effort`].
+    /// `None` (the default) sends none, leaving the provider's default.
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+    /// Per-role OpenAI transport pin (Python's
+    /// `models.<role>.use_responses_api`), forwarded to
+    /// [`bc_llm_client::ChatRequest::openai_api`]. `None` (the default)
+    /// keeps the client-wide `--openai-api` choice.
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
     /// Per-call wall-clock deadline in seconds, overriding the shared
     /// gateway client's own 300 s default. `None` (the default) keeps
     /// that default — Python has no `step0.callgraph.llm.timeout` key.
@@ -93,6 +103,8 @@ impl Step0LlmConfig {
             temperature: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
+            openai_api: None,
             timeout_secs: None,
         }
     }
@@ -160,9 +172,20 @@ fn accept_row(
 
 /// Infer source/sink `MatchSpec`s from observed call fingerprints via a
 /// single-shot (non-agentic) LLM classification call per batch. Never
-/// fails — any error or empty result degrades to `(vec![], vec![],
-/// {})`, which the caller (`run_callgraph_engine`) already treats as
-/// "fall back to rules". Ported from `_annotator.py::detect_specs`.
+/// fails: an empty result degrades to `(vec![], vec![], {})`, which the
+/// caller (`run_callgraph_engine`) already treats as "fall back to
+/// rules". Ported from `_annotator.py::detect_specs`.
+///
+/// Failure is contained PER BATCH (upstream v1.3): one provider hiccup on
+/// batch 3 used to discard the specs batches 1 and 2 had already produced
+/// and silently drop the whole scan to rules mode. A failed batch is now
+/// skipped and the others kept. An error that will hit every remaining
+/// batch identically (quota exhausted, guardrail refusal of the
+/// classification itself) stops issuing further calls instead of paying
+/// for them. Upstream additionally re-raises authentication and proxy
+/// errors to end the scan; this client has no such error class, so that
+/// half is left to the orchestrator's own handling of the next stage's
+/// identical failure.
 pub async fn detect_specs(
     client: &dyn LlmClient,
     file_indices: &[FileIndex],
@@ -193,20 +216,33 @@ pub async fn detect_specs(
             temperature: config.temperature,
             top_p: config.top_p,
             seed: config.seed,
+            reasoning_effort: config.reasoning_effort,
+            openai_api: config.openai_api,
             thinking_budget: None,
             betas: Vec::new(),
             json_mode: false,
             timeout: config.timeout_secs.map(std::time::Duration::from_secs),
             stream: false,
+            ..ChatRequest::default()
         };
         let response = match client.chat(&request).await {
             Ok(r) => r,
             Err(e) => {
+                // Quota, credential and proxy/TLS failures (`halts_scan`)
+                // and a guardrail block fail every remaining batch alike.
+                let fatal = e.halts_scan() || matches!(e, LlmError::GuardrailBlocked { .. });
+                if fatal {
+                    tracing::warn!(
+                        "[s0/callgraph] llm detection batch failed: {e}; not sending the \
+                         remaining batches"
+                    );
+                    break;
+                }
                 tracing::warn!(
-                    "[s0/callgraph] llm detection failed: {e} — falling back to \
-                     configured rules YAML."
+                    "[s0/callgraph] llm detection batch failed: {e}; skipping this batch \
+                     and keeping the others"
                 );
-                return empty_specs();
+                continue;
             }
         };
         for row in parse_results(&response.text()) {
@@ -398,9 +434,109 @@ mod tests {
     async fn detect_specs_empty_on_call_failure() {
         let idx = observed_call("python", "request", "args_get");
         let client = FailingClient;
-        let config = Step0LlmConfig::new("m");
+        let mut config = Step0LlmConfig::new("m");
+        config.heuristic_supplement = false;
         let (s, k, c) = detect_specs(&client, &[idx], &["python".to_string()], &config).await;
         assert!(s.is_empty() && k.is_empty() && c.is_empty());
+    }
+
+    /// Replays `outcomes` in order, one per `chat` call, counting calls.
+    struct SequenceClient {
+        outcomes: std::sync::Mutex<Vec<Result<String, LlmError>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for SequenceClient {
+        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let text = self.outcomes.lock().unwrap().remove(0)?;
+            Ok(ChatResponse {
+                content: vec![ContentBlock::Text(text)],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    fn two_candidates() -> FileIndex {
+        let call = |line: usize, receiver: &str, method: &str| ObservedCall {
+            file: "a.py".to_string(),
+            language: "python".to_string(),
+            line,
+            receiver: receiver.to_string(),
+            method: method.to_string(),
+            snippet: format!("{receiver}.{method}()"),
+            ..Default::default()
+        };
+        FileIndex {
+            file: "a.py".to_string(),
+            language: "python".to_string(),
+            observed_calls: vec![call(1, "request", "args_get"), call(2, "os", "system")],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn one_failed_batch_no_longer_discards_the_others() {
+        let client = SequenceClient {
+            outcomes: std::sync::Mutex::new(vec![
+                Err(LlmError::ServerError {
+                    status: 503,
+                    message: "down".to_string(),
+                }),
+                Ok(r#"[{"id":"c2","role":"sink","confidence":0.9,"cwe":"CWE-78"}]"#.to_string()),
+            ]),
+            calls: Default::default(),
+        };
+        let mut config = Step0LlmConfig::new("m");
+        config.max_batch_candidates = 1;
+        config.heuristic_supplement = false;
+        let (source_specs, sink_specs, _) = detect_specs(
+            &client,
+            &[two_candidates()],
+            &["python".to_string()],
+            &config,
+        )
+        .await;
+        assert!(source_specs.is_empty());
+        assert_eq!(sink_specs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_account_level_failure_stops_the_remaining_batches() {
+        for err in [
+            LlmError::QuotaExhausted {
+                message: "no credit".to_string(),
+            },
+            LlmError::GuardrailBlocked {
+                message: "refused".to_string(),
+            },
+            LlmError::Authentication {
+                status: Some(401),
+                message: "bad key".to_string(),
+            },
+        ] {
+            let client = SequenceClient {
+                outcomes: std::sync::Mutex::new(vec![
+                    Err(err),
+                    Ok(r#"[{"id":"c2","role":"sink","confidence":0.9}]"#.to_string()),
+                ]),
+                calls: Default::default(),
+            };
+            let mut config = Step0LlmConfig::new("m");
+            config.max_batch_candidates = 1;
+            config.heuristic_supplement = false;
+            let (s, k, _) = detect_specs(
+                &client,
+                &[two_candidates()],
+                &["python".to_string()],
+                &config,
+            )
+            .await;
+            assert!(s.is_empty() && k.is_empty());
+            assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]

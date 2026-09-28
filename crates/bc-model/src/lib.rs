@@ -11,6 +11,7 @@
 
 mod coerce;
 mod context;
+mod diagnostics;
 mod diff_scope;
 mod finding;
 mod manifest;
@@ -27,10 +28,14 @@ pub use context::{
     EntryPointKind, Impact, Likelihood, ModuleInfo, Sensitivity, Sink, TaintEvidencePath,
     TaintSymbolRef, TaintTransferEdge, Threat, ThreatModel, TrustBoundary,
 };
+pub use diagnostics::{
+    AutoExcludeCounts, DecomposeCounts, DeepdiveCounts, PipelineDiagnostics, PrefilterCounts,
+    ThreatModelCounts, VerifyCounts,
+};
 pub use diff_scope::DiffScope;
 pub use finding::{DupLocation, Finding, Verdict, VulnClass};
 pub use manifest::{Chunk, ChunkSize, TaskManifest};
 pub use report::{
     offensive_label, Chain, DropReason, DroppedFinding, FinalReport, RankedFinding, ScanMetrics,
-    ScopeEntry, ScopeKind, Severity, VerificationEvidence,
+    ScopeEntry, ScopeKind, Severity, StageTiming, VerificationEvidence,
 };

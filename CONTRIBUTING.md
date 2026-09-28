@@ -42,9 +42,16 @@ not have one: `cargo test --workspace --exclude bc-parity-tests`.
 
 ## Style
 
-- **Australian English**, and no em-dashes or en-dashes in prose. Restructure the
-  sentence instead: a colon for a label, commas or parentheses for an
-  aside, or two sentences.
+- **US English** ("behavior", "honor", "normalize", "canceled") in prose,
+  comments, identifiers and our own messages. `scripts/style_check.py`
+  checks it. The one exception is text ported verbatim from the Python
+  original (prompt strings, and the verdict codes and config keys it
+  defines, such as `max_api_artefacts`): it keeps upstream's spelling so
+  it stays byte-comparable. A released wire name (a JSON, SARIF or CSV
+  field, a flag or a config key) also keeps its spelling; rename the Rust
+  item and keep the old name with `#[serde(rename = ...)]`.
+- No em-dashes or en-dashes in prose. Restructure the sentence instead: a
+  colon for a label, commas or parentheses for an aside, or two sentences.
 - Prose in Markdown wraps at about 76 to 80 columns.
 - Prompt strings and report text are user-facing. Changing one usually
   means updating a test that asserts it.

@@ -129,7 +129,7 @@ const LANGUAGE_FACTS: &str = "LANGUAGE FACTS THAT DECIDE A VERDICT ON THEIR OWN
   FALSE_POSITIVE. It IS a race when the two halves are SEPARATE calls
   (`containsKey` then `put`, `get` then `put`, `size` then `add`), because
   per-call atomicity says nothing about the gap between calls, or when the
-  two halves synchronise on different objects.
+  two halves synchronize on different objects.
 
   C/C++ bounded vs unbounded copies (CWE-120/121/122/787). `strcpy`,
   `strcat`, `sprintf`, `vsprintf`, `gets` and `scanf(\"%s\")` with no field
@@ -144,7 +144,7 @@ const LANGUAGE_FACTS: &str = "LANGUAGE FACTS THAT DECIDE A VERDICT ON THEIR OWN
   destination UNTERMINATED when the source fills it, which is a real defect
   in whatever reads it next.
 
-  Python and Ruby interpreter locks (CWE-362/367). The GIL serialises
+  Python and Ruby interpreter locks (CWE-362/367). The GIL serializes
   bytecode and nothing more: it is released around every I/O call and by C
   extensions, and it does not exist across processes at all — which is how
   these apps are deployed (gunicorn/uwsgi workers, Puma clusters, Celery,
@@ -198,7 +198,7 @@ const LANGUAGE_FACTS: &str = "LANGUAGE FACTS THAT DECIDE A VERDICT ON THEIR OWN
 /// never mentions the field leaves it `false` — which would read as
 /// "guarded" while actually meaning "unknown". Only S0's framework plane
 /// sets it from the guard facts `bc_callgraph::framework` extracted, so
-/// only S0's entry points are labelled; the rest are printed bare, which
+/// only S0's entry points are labeled; the rest are printed bare, which
 /// the LANGUAGE FACTS block tells the verifier settles nothing. The same
 /// rule gates `bc_stage_s5::route_gates`, the deterministic half of this.
 ///
@@ -301,6 +301,35 @@ CVSS: CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_",
         bc_prompts::EXCLUSION_RULES
     )
 });
+
+/// One-shot verdict-format repair re-ask, ported from `s6_verify.py::
+/// _repair_verdict_prompt` (v1.4.0): the S6 analogue of S2/S4's JSON
+/// repair prompt. S6's contract is the two-line VERDICT/CVSS footer, not
+/// JSON, so it needs its own prompt.
+///
+/// It asks ONLY for the two lines to be RESTATED and deliberately does not
+/// reopen the analysis: the failure was one of shape, not judgment, and
+/// re-litigating a security verdict could flip a correct answer, which is
+/// worse than the drop this exists to avoid. The same reasoning is why the
+/// verdict parser is not loosened instead. The contract lines are
+/// byte-identical to the tail of [`SYSTEM`]; the one prose dash upstream
+/// has is a colon here (house style), which changes no instruction.
+pub fn repair_verdict_prompt(raw: &str) -> String {
+    format!(
+        "REPAIR TASK:
+Your previous reply reached a conclusion but did not end with the two required
+lines, so the pipeline could not read your verdict. Do NOT reconsider or change
+your conclusion: restate it now in the exact required format and output NOTHING
+ELSE:
+
+VERDICT: TRUE_POSITIVE|FALSE_POSITIVE (confidence: N/10) \u{2014} brief reason
+CVSS: CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_
+
+YOUR PREVIOUS REPLY:
+{raw}
+"
+    )
+}
 
 fn controls_for(file: &str, controls: &[Control]) -> Vec<String> {
     controls
@@ -731,7 +760,7 @@ mod tests {
     }
 
     /// The single highest-volume verdict in the pipeline: an injection
-    /// finding on a query the driver already parameterises. The fact has
+    /// finding on a query the driver already parameterizes. The fact has
     /// to name the binding spelling in each language, or the verifier
     /// cannot tell it from the concatenating one.
     #[test]
@@ -792,7 +821,7 @@ mod tests {
     }
 
     /// Go is where the JS event-loop rule above does the most damage if
-    /// it is over-generalised, so the Go entry says outright that it does
+    /// it is over-generalized, so the Go entry says outright that it does
     /// not apply.
     #[test]
     fn system_prompt_says_the_event_loop_rule_does_not_apply_to_go() {
@@ -849,11 +878,11 @@ mod tests {
         );
     }
 
-    /// The mirror image of the JavaScript entry: a lock that serialises
+    /// The mirror image of the JavaScript entry: a lock that serializes
     /// bytecode is not an event loop, and the verifier must not borrow the
     /// Node reasoning for Python or Ruby.
     #[test]
-    fn system_prompt_refuses_the_gil_as_a_defence_against_a_race() {
+    fn system_prompt_refuses_the_gil_as_a_defense_against_a_race() {
         let p = &*SYSTEM;
         assert!(p.contains("Python and Ruby interpreter locks"), "{p}");
         assert!(p.contains("NEVER a reason to refute a"), "{p}");
@@ -972,7 +1001,7 @@ mod tests {
             p.contains("`[UNAUTH-REACHABLE]` means S0 found NO guard"),
             "{p}"
         );
-        // …and an unlabelled entry point settles nothing.
+        // …and an unlabeled entry point settles nothing.
         assert!(p.contains("neither marker are not framework routes"), "{p}");
     }
 
@@ -1092,7 +1121,7 @@ mod tests {
     /// and the LANGUAGE FACTS block tells the verifier `[UNAUTH-REACHABLE]`
     /// means the seed plane found no guard, which would make that opinion
     /// read as a static-analysis fact. Only S0's framework plane sets the
-    /// field from evidence, so only `Framework` rows are labelled.
+    /// field from evidence, so only `Framework` rows are labeled.
     #[test]
     fn build_user_prompt_shows_entry_points_and_leaves_non_framework_kinds_unmarked() {
         let mut ctx = minimal_ctx();

@@ -30,11 +30,21 @@ pub struct GatewayConfig {
     /// warning the way that backend does; this crate has no logging of its
     /// own.
     pub verify_tls: bool,
+    /// A PEM client certificate (chain) to present for mutual TLS, for a
+    /// gateway that authenticates callers by certificate. May also hold
+    /// the private key, in which case [`Self::client_key_path`] stays
+    /// `None`. Ported from the Python original's `client_cert` setting
+    /// (`backends/llm/tls.py`), but fail-closed: see [`crate::build_client`].
+    pub client_cert_path: Option<PathBuf>,
+    /// The PEM private key for [`Self::client_cert_path`], when it lives
+    /// in a file of its own. Setting it without a certificate is refused.
+    pub client_key_path: Option<PathBuf>,
 }
 
 impl GatewayConfig {
-    /// A config with the default 300s timeout, no custom CA, and TLS
-    /// verification on — the safe default for a fresh gateway target.
+    /// A config with the default 300s timeout, no custom CA, TLS
+    /// verification on and no client certificate: the safe default for
+    /// a fresh gateway target.
     /// See [`Self::timeout`] on why 300 s stays the default even though
     /// several stages need far longer: they carry their own per-request
     /// deadline instead of raising the floor for every call.
@@ -44,6 +54,8 @@ impl GatewayConfig {
             timeout: Duration::from_secs(300),
             ca_cert_path: None,
             verify_tls: true,
+            client_cert_path: None,
+            client_key_path: None,
         }
     }
 }
@@ -59,6 +71,8 @@ mod tests {
         assert_eq!(cfg.timeout, Duration::from_secs(300));
         assert!(cfg.ca_cert_path.is_none());
         assert!(cfg.verify_tls);
+        assert!(cfg.client_cert_path.is_none());
+        assert!(cfg.client_key_path.is_none());
     }
 
     #[test]

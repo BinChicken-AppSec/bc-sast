@@ -84,10 +84,67 @@ pub fn run_checks(cli: &Cli, client_result: &Result<Arc<dyn LlmClient>, String>)
         // `repo_path`.
         check_git(cli.repo.as_deref()),
     ];
+    if let Some(check) = check_client_identity(cli, client_result) {
+        checks.push(check);
+    }
     if cli.config.is_some() {
         checks.push(check_config_loads(cli));
     }
+    checks.extend(check_model_lifecycles(
+        cli,
+        &bc_llm_client::capabilities::today_utc(),
+    ));
     checks
+}
+
+/// The startup model gate's verdict (`crate::model_policy`), as checks:
+/// a retired model is a blocking failure (unless
+/// `--allow-unsupported-model`), a deprecated or legacy one a warning,
+/// and a clean set one `ok` line naming the models.
+fn check_model_lifecycles(cli: &Cli, today: &str) -> Vec<Check> {
+    let models =
+        crate::model_policy::configured_models(&cli.model, &crate::lenient_config_data(cli));
+    let report = crate::model_policy::check(&models, today, cli.allow_unsupported_model);
+    if report.refused.is_empty() && report.warnings.is_empty() {
+        return vec![Check::ok("models", models.join(", "))];
+    }
+    report
+        .refused
+        .into_iter()
+        .map(|line| Check::fail("model lifecycle", line, true))
+        .chain(
+            report
+                .warnings
+                .into_iter()
+                .map(|line| Check::warn("model lifecycle", line)),
+        )
+        .collect()
+}
+
+/// Whether the `--client-cert`/`--client-key` identity is in use, shown
+/// only when one was configured. The identity is loaded by
+/// `build_llm_client`, so a bad file has already failed the "gateway
+/// client" check (blocking) with the reason; this line exists so an
+/// operator can see mTLS is on, and which file it presents, without
+/// reading that error.
+fn check_client_identity(
+    cli: &Cli,
+    client_result: &Result<Arc<dyn LlmClient>, String>,
+) -> Option<Check> {
+    let described = match (&cli.client_cert, &cli.client_key) {
+        (None, None) => return None,
+        (Some(cert), None) => cert.display().to_string(),
+        (Some(cert), Some(key)) => format!("{} (key {})", cert.display(), key.display()),
+        (None, Some(key)) => format!("key {} without --client-cert", key.display()),
+    };
+    Some(match client_result {
+        Ok(_) => Check::ok("mTLS client certificate", described),
+        Err(_) => Check::fail(
+            "mTLS client certificate",
+            format!("{described}: not loaded, see the gateway client check"),
+            true,
+        ),
+    })
 }
 
 pub fn n_blocking(checks: &[Check]) -> usize {
@@ -194,7 +251,7 @@ fn check_config_loads(cli: &Cli) -> Check {
         .config
         .as_deref()
         .expect("caller only invokes this when cli.config is Some");
-    match bc_config::load(path, &getenv)
+    match crate::config_load::load(path)
         .map_err(|e| e.to_string())
         .and_then(|_| {
             bc_config::check_config_trust(path, repo_path(cli), &getenv).map_err(|e| e.to_string())
@@ -216,7 +273,7 @@ pub async fn probe_gateway(client: &dyn LlmClient, model: &str) -> Check {
         system: None,
         messages: vec![Message::user_text("ping")],
         tools: Vec::new(),
-        max_tokens: 4,
+        max_tokens: PROBE_MAX_TOKENS,
         temperature: None,
         top_p: None,
         seed: None,
@@ -225,6 +282,7 @@ pub async fn probe_gateway(client: &dyn LlmClient, model: &str) -> Check {
         json_mode: false,
         timeout: None,
         stream: false,
+        ..ChatRequest::default()
     };
     // A transient error is retried a few times before it means anything:
     // eight scans starting at once on 2026-09-07 each got a 429 on this
@@ -233,7 +291,14 @@ pub async fn probe_gateway(client: &dyn LlmClient, model: &str) -> Check {
     let mut last_err = None;
     for attempt in 0..PROBE_ATTEMPTS {
         match client.chat(&request).await {
-            Ok(_) => return Check::ok("live probe", format!("{model} reachable")),
+            // Any reply proves reachability, including one cut off by the
+            // probe's own budget (`StopReason::MaxTokens`, or the
+            // `Truncated` error a retrying client turns it into): the
+            // question is "can we reach this model", not "was the answer
+            // complete". Python's `_reachable_despite_truncated_reply`.
+            Ok(_) | Err(LlmError::Truncated { .. }) => {
+                return Check::ok("live probe", format!("{model} reachable"))
+            }
             Err(e) if e.is_retryable() && attempt + 1 < PROBE_ATTEMPTS => {
                 let delay = PROBE_BACKOFF_BASE * 2u32.pow(attempt);
                 if !delay.is_zero() {
@@ -264,6 +329,14 @@ pub async fn probe_gateway(client: &dyn LlmClient, model: &str) -> Check {
 /// them (1 s, 2 s): long enough to outlive a burst 429, short enough not
 /// to make `--doctor` feel broken.
 const PROBE_ATTEMPTS: u32 = 3;
+
+/// The probe's output budget. It was 4, and the Python original found
+/// the same number too small ("at 4 every sdk/openai probe truncated",
+/// `orchestrator/preflight.py::_PROBE_PING_MAX_TOKENS`): a model that
+/// thinks, or opens with a word of preamble, spends 4 tokens before it
+/// says anything. 256 clears a one-word reply plus preamble and still
+/// costs next to nothing.
+const PROBE_MAX_TOKENS: u32 = 256;
 const PROBE_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// `  {icon} {name:<30} {detail}` per check, plus a `N ok · M warning(s)
@@ -468,6 +541,170 @@ mod tests {
         let result = crate::build_llm_client(&c);
         let with = run_checks(&c, &result);
         assert!(with.iter().any(|c| c.name == "--config"));
+    }
+
+    #[test]
+    fn current_or_unknown_models_are_one_ok_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = cli(dir.path());
+        let checks = check_model_lifecycles(&c, "2026-09-25");
+        assert_eq!(checks, [Check::ok("models", "m")]);
+        let result = crate::build_llm_client(&c);
+        assert!(run_checks(&c, &result).iter().any(|c| c.name == "models"));
+    }
+
+    #[test]
+    fn a_retired_role_model_blocks_and_a_legacy_one_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "models:\n  verify:\n    id: claude-3-5-sonnet\n",
+        )
+        .unwrap();
+        let mut c = cli(dir.path());
+        c.model = "gpt-4o".to_string();
+        c.config = Some(config_path);
+        let checks = check_model_lifecycles(&c, "2026-09-25");
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[0].status, CheckStatus::Fail);
+        assert!(checks[0].required);
+        assert!(checks[0].detail.contains("claude-3-5-sonnet is retired"));
+        assert_eq!(checks[1].status, CheckStatus::Warn);
+        assert!(checks[1].detail.contains("gpt-4o is legacy"));
+
+        // Allowed: the refusal becomes a warning, and nothing blocks.
+        c.allow_unsupported_model = true;
+        let checks = check_model_lifecycles(&c, "2026-09-25");
+        assert_eq!(n_blocking(&checks), 0);
+        assert!(checks.iter().all(|c| c.status == CheckStatus::Warn));
+    }
+
+    fn gateway_fixture(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../bc-gateway-http/tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn no_client_identity_check_is_shown_when_mtls_is_not_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = cli(dir.path());
+        let result = crate::build_llm_client(&c);
+        assert!(check_client_identity(&c, &result).is_none());
+        assert!(!run_checks(&c, &result)
+            .iter()
+            .any(|c| c.name == "mTLS client certificate"));
+    }
+
+    /// `--client-cert`/`--client-key` reach the gateway client: a good
+    /// pair builds and is reported, naming both files.
+    #[test]
+    fn a_loadable_client_identity_is_reported_ok_with_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cli(dir.path());
+        c.client_cert = Some(gateway_fixture("client-cert.pem"));
+        c.client_key = Some(gateway_fixture("client-key.pem"));
+        let result = crate::build_llm_client(&c);
+        let check = check_client_identity(&c, &result).unwrap();
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.detail.contains("client-cert.pem"), "{}", check.detail);
+        assert!(check.detail.contains("(key "), "{}", check.detail);
+
+        c.client_key = None;
+        c.client_cert = Some(gateway_fixture("client-combined.pem"));
+        let result = crate::build_llm_client(&c);
+        let check = check_client_identity(&c, &result).unwrap();
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(
+            check.detail.ends_with("client-combined.pem"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// Fail closed: an unusable identity blocks both the gateway client
+    /// and this check, rather than scanning without mTLS.
+    #[test]
+    fn an_unloadable_client_identity_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cli(dir.path());
+        c.client_key = Some(gateway_fixture("client-key.pem"));
+        let result = crate::build_llm_client(&c);
+        let err = result.as_ref().err().expect("a key alone is refused");
+        assert!(err.contains("without a client certificate"), "{err}");
+        let checks = run_checks(&c, &result);
+        let check = checks
+            .iter()
+            .find(|c| c.name == "mTLS client certificate")
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.required);
+        assert!(
+            check.detail.contains("without --client-cert"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// Records the probe's output budget, then answers the way `reply`
+    /// says.
+    struct BudgetProbe {
+        seen: std::sync::Mutex<Option<u32>>,
+        reply: fn() -> Result<bc_llm_client::ChatResponse, LlmError>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for BudgetProbe {
+        async fn chat(
+            &self,
+            request: &ChatRequest,
+        ) -> Result<bc_llm_client::ChatResponse, LlmError> {
+            *self.seen.lock().unwrap() = Some(request.max_tokens);
+            (self.reply)()
+        }
+    }
+
+    fn cut_off() -> bc_llm_client::ChatResponse {
+        bc_llm_client::ChatResponse {
+            content: vec![bc_llm_client::ContentBlock::text("po")],
+            stop_reason: bc_llm_client::StopReason::MaxTokens,
+            usage: bc_llm_client::Usage::default(),
+        }
+    }
+
+    /// At 4 tokens every probe of a thinking model truncated (Python's
+    /// own finding); 256 clears a one-word reply plus preamble.
+    #[tokio::test]
+    async fn probe_gateway_asks_for_a_256_token_budget() {
+        let client = BudgetProbe {
+            seen: std::sync::Mutex::new(None),
+            reply: || Ok(cut_off()),
+        };
+        let check = probe_gateway(&client, "m").await;
+        assert_eq!(*client.seen.lock().unwrap(), Some(256));
+        assert_eq!(
+            check.status,
+            CheckStatus::Ok,
+            "a reply cut off by the budget still proves reachability"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_gateway_counts_a_truncated_reply_error_as_reachable() {
+        let client = BudgetProbe {
+            seen: std::sync::Mutex::new(None),
+            reply: || {
+                Err(LlmError::Truncated {
+                    requested: 256,
+                    retried_at: Some(512),
+                    partial: Box::new(cut_off()),
+                })
+            },
+        };
+        let check = probe_gateway(&client, "m").await;
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert_eq!(check.detail, "m reachable");
     }
 
     #[tokio::test]

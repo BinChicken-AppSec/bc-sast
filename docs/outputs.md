@@ -14,6 +14,9 @@ Per scan, under the **out-dir** (`--out-dir`, default
 - `remediation.patch`: a unified diff, **only** written by a
   worktree-isolated `--remediate` run that actually produced edits (see
   "Worktree-isolated remediation" below). Not overridable.
+- `run_manifest.json`: what the whole run did, stage by stage through
+  S11 (see "`run_manifest.json`" below). Written for every scan that
+  ran, whatever it stopped at; `--out-run-manifest <path>` moves it.
 
 **No output flag is needed for the first four.** A scan reaching S9 writes
 the three report formats and, when a Git SHA is known, `findings.json`, and `--out-md`/`--out-sarif`/`--out-csv`/`--out-findings-json`
@@ -85,8 +88,8 @@ not relocate them:
 
 | Artifact | When written and what it means |
 |---|---|
-| `target-tests.json` | Target-test preparation and validation evidence when `--target-tests` is enabled during full-scan remediation. Records discovery, compiled policy identity, model review, generated-file metadata, command results, and gaps. |
-| `remediation.patch` | Default worktree delivery, when accepted edits exist. Contains source fixes and generated or extended tests together. |
+| `target-tests.json` | Target-test preparation and validation evidence when `--target-tests` is enabled during full-scan remediation. Records discovery, compiled policy identity, model review, generated-file metadata, command results, and gaps, plus an `api_spec` object for the API specification step (per-document standard, from `openapi` to `wsdl` and `odata`, action, version, syntax (`json`, `yaml`, `xml` and the text formats), diagnostics, missing and unverified operations, inventory, moved references and review verdict, with run notes such as an OData service whose CSDL is never created; see [target testing](target-testing.md#api-specifications)). |
+| `remediation.patch` | Default worktree delivery, when accepted edits exist. Contains source fixes, generated or extended tests, and a reviewed API specification (a relocation appears as a rename) together. |
 | `remediated-source.zip` | Successful explicit ZIP delivery. Contains the updated isolated source tree, including accepted tests, with recorded exclusions. Git is not required. |
 | `delivery.json` | Successful explicit branch or ZIP delivery receipt, including destination, exclusions, known scan revision, and scoped validation state. A delivery failure may produce no receipt. |
 
@@ -146,7 +149,11 @@ empty:
    `S6: token budget of 3000000 reached (3012044 spent): 412 of 1881
    finding(s) verified, 1469 left unverified`); the findings it never
    verified appear as `[UNCONFIRMED]` bullets under `## Dropped Findings`
-   and are not counted as true positives
+   and are not counted as true positives. A run the operator canceled
+   (Ctrl-C) leads with `- ⚠️ **CANCELED** by the operator (Ctrl-C)
+   ({budget_stop}). This is a PARTIAL report: ...` instead: the stop
+   travels through the same channel, but it is not a budget, and the
+   report must not read as a finished one (`ScanMetrics::canceled`)
 6. `## Threat Model`: omitted if `report.threat_model` is `None`
 7. `## Verification`: always present. Seven bullets: raw findings, true
    positives, false positives, verifier errors, duplicates collapsed,
@@ -158,7 +165,7 @@ empty:
    never touched, and is omitted entirely otherwise. Those are counted
    there and in no other bullet: the scan formed no verdict on them, so
    folding them into false positives, verifier errors or the precision
-   denominator would claim a judgement it never made. That last figure
+   denominator would claim a judgment it never made. That last figure
    is true positives over the findings the verifier actually **examined**
    (`tp / (tp + fp)`), not over `raw_findings_count`. A budget stop
    leaves candidates unexamined, and charging each one against precision
@@ -175,7 +182,7 @@ empty:
     bullet per dropped finding, tagged with its reason: `[FP]`,
     `[DUP of #N]`, `[DUP (pre-verify)]`, `[UNCONFIRMED]`, `[VERIFY-ERR]`,
     `[EXCLUDED]`, `[GUARDRAIL]`, or `[OUT OF DIFF SCOPE]`. The last one is
-    the only tag that is not a judgement about the finding: it means the
+    the only tag that is not a judgment about the finding: it means the
     file was outside a `--diff-scope` run's changed set, so this scan never
     examined it (see
     [`third-party-ingestion.md`](third-party-ingestion.md))
@@ -229,6 +236,31 @@ run recorded any spend, the money:
 - Cost (USD): 3.207750
 ```
 
+A `### Pipeline Diagnostics` subsection follows the folder count, before
+the token table, when something the pipeline's guards, repairs or caps
+did is worth a reader's attention (ported in spirit from vvaharness
+v1.3 `models/_scan.py::_render_pipeline_diagnostics`). One bullet per
+event: auto-exclude entries vetoed for erasing a language, an overlay
+discarded or flagged as aggressive, a degraded or repaired threat model,
+threats truncated or re-promoted by the cap, undisposed baseline items,
+specialist chunks per lens and lenses gated off, strategist file
+references that were unknown, dropped or repaired by a suffix match,
+invalid or empty chunks dropped, files added back by the coverage
+backstop or left out as unreachable, threat-fallback chunks built,
+capped or trimmed, deep-dive JSON repairs, findings discarded by
+`step4.max_findings_per_run`, clamped vote thresholds, shard-gate cap
+expiries, evidence-exempted findings in S5, verifier verdict repairs,
+and replies lost to the output-token budget (VVAH-E005). Context lines
+(repository kinds, an agentic S2, the time shard siblings spent parked)
+appear only alongside a noteworthy one, so a clean run has no such
+section. Unlike Python, whose section renders on almost every run, this
+one stays silent unless something happened. Every value that did not
+originate in the renderer (above all the model-authored auto-exclude
+entries) is neutralized as the rest of the report is. The same counters
+are in `report.metrics.pipeline_diagnostics` (`bc_model::
+PipelineDiagnostics`); a stage restored from a `--resume` checkpoint did
+not run and contributes none.
+
 The per-phase `### Tokens by Phase` table gains a `Cost (USD)` column on
 the same figures:
 
@@ -280,10 +312,30 @@ can honestly be given), `unpriced_tokens`, `unpriced_calls`,
 `tokens_by_phase`. The `bc-sast` run summary line prints the same total
 beside the findings count.
 
-Remediation (`--remediate`) and fix validation are **not** included in any
-of this. They run after the report is built and have never appeared in
-`tokens_by_phase` either; the cost figure covers the scan model calls in S0-S8. S9 uses no model.
-S9 adds no model calls. Target-test generator and reviewer usage from
+`ScanMetrics` also carries the run's telemetry, ported from the Python
+original's `STAGES` recorder and `COUNTERS`:
+
+- `cache_read_tokens` / `cache_write_tokens`: the per-phase `cache_read` /
+  `cache_write` buckets summed over the run (`null` when no backend
+  reported usage). Cache writes are already inside `prompt_tokens`; cache
+  reads are not, for the reason above.
+- `llm_truncated_replies`: model replies the transport gave up on as
+  truncated (VVAH-E005). Each is a chunk or session whose result was
+  lost; a truncation the doubled-budget retry fixed is not counted.
+- `stage_timings`: `{"s4": {"outcome": "completed", "duration_sec":
+  41.2}, ...}` for S0-S8. `outcome` is one of `completed`,
+  `completed_with_errors`, `cached` (restored by `--resume`), `skipped`
+  (switched off by configuration), `disabled` or `error`; `duration_sec`
+  is `null` for a stage that ran no timed body. S9-S11 run after the
+  report is assembled, so their timings are in the run manifest only.
+
+Remediation (`--remediate`) and fix validation are **not** included in
+the report's figures: they run after the report is built, so its
+`tokens_by_phase` and cost cover the scan model calls in S0-S7 (S8's own
+calls happen after its metrics are assembled). S9 adds no model calls.
+S8, S10 and S11 are metered all the same, S10 and S11 as phases of their
+own, and their tokens and cost are in `run_manifest.json`, the one output
+that sees the whole run. Target-test generator and reviewer usage from
 completed sessions is recorded separately in `target-tests.json`, together
 with requested model names and the compiled policy identity. It is not
 added to the main scan cost; usage from failed sessions may be unknown.
@@ -381,6 +433,19 @@ field/heading order for one finding (`i` = 1-based position in
 `crates/bc-report-md/src/wire.rs::verdict_str`. `SEVERITY` is
 `CRITICAL`/`HIGH`/`MEDIUM`/`LOW`/`INFO`.)
 
+Every model- or repo-sourced value embedded in a table cell, a
+single-line bullet or an inline code span goes through
+`bc_report_md::md_cell` or `md_code_span`
+(`crates/bc-report-md/src/sanitize.rs`). Both fold every line-breaking
+character (`\r`, `\n`, VT, FF, FS/GS/RS, NEL, U+2028, U+2029) to a space
+and strip the remaining C0 controls, DEL, zero-width characters (U+200B
+to U+200D, U+2060 to U+2064, U+FEFF, soft hyphen) and bidirectional
+marks, embeddings, overrides and isolates (U+200E, U+200F, U+061C,
+U+202A to U+202E, U+2066 to U+2069). Without this, a finding title
+carrying U+202E could visually reorder report text (a Trojan Source
+style spoof) and U+2028 could forge a new table row. `md_cell` then
+escapes `\` and `|`; `md_code_span` replaces a backtick with U+02CB.
+
 **`## Baseline Comparison`** (only with `--baseline`): appended at the very
 end of the report by `bc_report_md::append_baseline_section`, after
 remediation/validation have finished rewriting everything above it. It
@@ -441,7 +506,9 @@ heading):
 `Status` is `fix_status.as_str()` on `bc_validation_scoring::FixVerdict`.
 The four possible values are `"Fixed"`, `"Partially Fixed"`, `"Not Fixed"`,
 and `"UNVERIFIABLE"` (this last one deliberately not title-cased, matching
-the Python original's own wire vocabulary). This augmentation is a no-op
+the Python original's own wire vocabulary). An `UNVERIFIABLE` panel has no
+score, so it renders as `(score: n/a)` rather than the `0.00` its internal
+placeholder would print. This augmentation is a no-op
 (report left byte-identical) if the number of `### N. [...]` headings found
 doesn't exactly match the number of validation-slot entries. It fails
 closed rather than guessing.
@@ -578,7 +645,10 @@ populated only in the second, post-remediation SARIF write, via
 `by_id: BTreeMap<String, ValidationScore>` is keyed by the same
 `finding_id`. `validationStatus` is `fix_status.as_str()`; `mergeReadiness`
 is `bc_validation_scoring::derive_merge_readiness(fix_status).as_str()`
-(`"Ready"` / `"Ready with Conditions"` / `"Not Ready"`). `build_sarif`
+(`"Ready"` / `"Ready with Conditions"` / `"Not Ready"`).
+`validationScore` is omitted for an `UNVERIFIABLE` result: the panel
+reached no verdict, so there is no score to report, and the `0.0` earlier
+releases wrote read as "scored zero". `build_sarif`
 (used for the first, pre-remediation write) is a thin wrapper that always
 passes an empty map, so every validation property is simply absent on that
 first write.
@@ -617,7 +687,7 @@ given.
 The annotation is applied by re-parsing the SARIF this run already wrote
 and stamping it, so it cannot drift from `build_sarif`'s output; any
 misalignment between results and findings leaves the document untouched
-rather than mislabelled.
+rather than mislabeled.
 
 **`remediationStatus`**: S10's own verdict for this finding (`"Fixed"`,
 `"Not Fixed"`, `"Denied"` and so on, or the policy gate's capped
@@ -787,6 +857,8 @@ Written when `--remediate` runs after the scan completes S9
 struct RemediationExport {
     refused: Option<String>,          // Some(reason) if the S10 staleness preflight refused to run at all
     results: Vec<RemediationOutcomeExport>,
+    totals: RemediationTotalsExport,  // run-level counts and the exit code they imply
+    rollup: RollupExport,             // { cases, states, decisions }
 }
 
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -813,6 +885,7 @@ enum RemediationOutcomeExport {
       "diff": "--- a/app/login.py\n+++ b/app/login.py\n@@ ...",
       "validation": {
         "raw_score": 0.9,
+        "decision": "fixed",
         "fix_status": "Fixed",
         "justification": "fix verified",
         "gate_results": [
@@ -829,7 +902,20 @@ enum RemediationOutcomeExport {
       }
     },
     { "status": "failed", "finding_index": 2, "error": "agent run exceeded max turns" }
-  ]
+  ],
+  "totals": {
+    "attempted": 2,
+    "fixed": 1,
+    "not_fixed": 0,
+    "failed": 1,
+    "validation_failures": 0,
+    "exit_code": 1
+  },
+  "rollup": {
+    "cases": 1,
+    "states": { "validated": 1 },
+    "decisions": { "fixed": 1 }
+  }
 }
 ```
 
@@ -846,6 +932,28 @@ each `Processed` record with a non-empty diff. It ignores `validation`,
 strictly more detail than what actually gets posted to GitHub as a
 fix-suggestion comment.
 
+`raw_score` is `null` when the panel was inconclusive (`fix_status:
+"UNVERIFIABLE"`), and `decision` is the label to branch on:
+`"fixed"`/`"partially_fixed"`/`"not_fixed"`/`"inconclusive"`
+(`bc_validation_scoring::Decision`, vvaharness v1.4.0's vocabulary).
+`fix_status` keeps its historical values for existing consumers. A file
+written before `decision` existed reads back with it empty, and its numeric
+`raw_score` still loads.
+
+`totals` counts the run: `attempted` findings, of which `fixed` stand as
+fixes (verdict `Fixed`, a non-empty diff, not rolled back by an S10 gate or
+by S11), `not_fixed` were processed without a standing fix, and `failed`
+were S10 calls that errored. `exit_code` is what the process exits with
+under `--remediation-exit-code` (see [Exit codes](#exit-codes)).
+
+`rollup` is vvaharness v1.4.0's run-manifest rollup (`case_rollup.py`):
+one case per processed finding, counted by case state (`validated`,
+`failed` (partially or not fixed), `open` (inconclusive), `remediated`
+(a patch stands but nothing validated it), `declined` (no patch stands))
+and by validator decision. Only observed names appear, so read a missing
+key as zero. Counts only: no title or path from the scanned target enters
+it. An S10 call that errored is counted in `totals.failed`, not as a case.
+
 `confidence` is `"HIGH"` or `"FLAGGED"` for a gate the S11 persona panel
 synthesized (`bc_validation_scoring::SynthesisConfidence`), so triage can
 see which gate lacked consensus without parsing the justification prose.
@@ -853,6 +961,79 @@ It is *absent*, not `null`, for a gate that never went through synthesis,
 and the reader defaults it, so a `remediation.json` written before this
 key existed still loads. `--post-fixes-from` reads only `finding_id` and
 `diff` either way.
+
+## Exit codes
+
+A run that did not remediate exits `0` on success and `1` on an error,
+exactly as before. A run the operator canceled with Ctrl-C exits `130`,
+whatever else happened (see [Canceling a run](#canceling-a-run-ctrl-c)).
+A `--remediate` run additionally reports how the
+remediation went (`bc_cli::RemediationSummary::exit_code`, ported from
+vvaharness v1.4.0's `case_rollup.py`):
+
+| Code | Meaning |
+| ---- | ------- |
+| `0` | Remediation completed and either validated at least one fix, or failed none (an all-inconclusive run is `0`: re-validating is the answer, not a red build). A refused remediation (stale HEAD) is also `0`: the scan itself finished and its output is valid. |
+| `1` | An S10 remediation call failed, or an S11 validation errored. An incomplete run outranks anything it concluded. |
+| `3` | `EXIT_NOT_REMEDIATED`: S11 validated nothing as fixed and graded at least one fix `Partially Fixed` or `Not Fixed`. |
+| `130` | Canceled by the operator (Ctrl-C), in any mode. Takes precedence over every other code, an error included: the error of a run that was told to stop is a consequence of the stop. |
+
+The condition for `3` is deliberately narrow: one validated fix clears it.
+`--remediation-exit-code false` restores the old behavior (`0` whenever
+the scan succeeded); the GitHub Action passes its `fail-on-remediation`
+input there, and that input defaults to `false` (see
+docs/github-action.md). `--doctor`/`--setup` keep their own exit codes.
+
+## Canceling a run (Ctrl-C)
+
+The first Ctrl-C during a scan (or a `--remediate-from` run) cancels it
+cooperatively, the way a spent budget stops it: no stage starts new work,
+the model calls already in flight finish, every stage not yet started is
+recorded as `skipped` with the detail `canceled by user (Ctrl-C)`, and
+S8 builds the report without its chain call. What the run already has is
+still written: `report.md` (marked `**CANCELED**` in `## Scan Health`),
+`report.sarif`, `report.csv`, `findings.json` and `run_manifest.json`
+(with `"canceled": true` and `"exit_code": 130`). Findings S6 never
+verified are listed as not verified, never as true positives.
+
+A canceled run takes no action outside the machine: nothing is
+published to a provider, no PR comment is posted, and remediation does
+not start (S10 and S11 close as `skipped`). A cancellation during
+remediation starts no further finding, refuses the running agent's next
+model call (its own error path rolls the partial patch back), kills the
+`verify_command` together with every process it started, starts no
+target-test or API-specification generation session and no target-test
+process, skips S11, and withholds delivery. No `--resume` checkpoint is
+saved for a stage the cancellation cut short, so a resumed run redoes it
+in full.
+
+A second Ctrl-C exits at once, without waiting for the calls in flight
+or writing anything further. Ctrl-C in a mode with nothing to wind down
+(`--repo-file` batches, `--doctor`, `--setup`, `--estimate`, `--gc`, the
+posting modes) exits at once as well. Every case exits `130`.
+
+## `s6_progress.json` (`--s6-progress-file`)
+
+With `--s6-progress-file` (or `step6_verify.progress_file: true`), S6
+keeps `<state-dir>/s6_progress/<run_id>/s6_progress.json` up to date
+while it verifies, where `<state-dir>` is the checkpoint database's
+directory (`BC_STATE_DIR`, default `~/.bc-sast/state`) and `<run_id>` its
+run id for the repository. Ported from the Python original's
+`_S6Progress`:
+
+```json
+{"status":"running","total":12,"completed":5,"remaining":7,"outcomes":{"FALSE_POSITIVE":2,"TRUE_POSITIVE":3},"updated_at":"2026-09-25T10:14:41Z"}
+```
+
+It is rewritten after every verification, atomically (a temporary file
+in the same directory, flushed to disk, renamed into place), so a reader
+never sees half a record. `outcomes` counts `TRUE_POSITIVE`,
+`FALSE_POSITIVE`, `UNCONFIRMED`, `VERIFY_ERROR` and `GUARDRAIL_BLOCKED`.
+`status` is `running`, then `completed`; unlike Python, a pass that ends
+with findings left unverified (a budget stop or a Ctrl-C) ends as
+`stopped`, and nothing is written for an S6 with nothing to verify or
+restored from `--resume`. The directories under the state root are
+created as needed and refused if any of them is a symlink or a file.
 
 ## `batch_summary.md` (`--repo-file` / `--out-batch-summary`)
 
@@ -927,24 +1108,54 @@ to `runs`; the cascade is done in application code, in `delete_run`. A 100
 MiB payload cap is enforced both at save time and by the `CHECK`
 constraint.
 
-This store backs **both** halves of `--resume`: the S1-S7 scan-pipeline
-stage checkpoints and S10 remediation's per-finding ones. The scan writes
+This store backs every part of `--resume`: the S1-S7 scan-pipeline
+stage checkpoints, S10 remediation's per-finding ones, and (through
+`bc_stage_s11::validate_finding_checkpointed`) S11 validation scores. The scan writes
 its checkpoints unconditionally and only *reads* them under `--resume`.
 
+Downstream stage rows are **chained**, as in the Python original: the S5
+row is consulted only when S4 was itself restored from its row, S6 only
+when S5 was, and S7 only when S6 was. Once any of S4-S7 re-runs, every
+later row describes inputs this run no longer has, so those stages re-run
+too rather than applying a stale result on top of a fresh one. The S4 row
+carries each chunk's outcome alongside the findings, so a resumed scan
+still reports the chunks the original run lost (`chunks_failed`,
+`errors_by_stage["s4"]`); an older findings-only S4 row still loads, with
+no outcomes. S2 is checkpointed only when it produced a non-empty,
+non-degraded threat model, so a failed or empty threat model is retried by
+the next `--resume` instead of being inherited forever.
+
 - `run_id` = `bc_checkpoint::run_id_for(repo)`: hex SHA-1 of the
-  canonicalised repo path, truncated to 32 chars. That is one `run_id` per
+  canonicalized repo path, truncated to 32 chars. That is one `run_id` per
   repo path, stable across separate invocations. Falls back to hashing the raw
-  (unresolved) path if the repo can't be canonicalised.
-- `step` = `"s1"`..`"s7"` for the scan pipeline's stage checkpoints, and
-  `format!("remediate_{finding_index}")` for remediation, one row per
-  finding position there, not per pipeline stage.
-- `payload` = a JSON-serialized snapshot of the finding's identity hash
-  (a SHA-1 over NUL-separated finding index/title/file/rendered body) plus
-  the `RemediationRecord` produced for that finding.
+  (unresolved) path if the repo can't be canonicalized.
+- `step` = `"s1"`..`"s7"` for the scan pipeline's stage checkpoints;
+  `remediate_<digest>` for remediation, one row per finding; and
+  `validate_<digest>` for an S11 score. The digest
+  (`bc_checkpoint::step_key_for`, 16 hex characters of a SHA-1) covers the
+  engine that produced the row (`bc-sast.s10`/`bc-sast.s11`, this
+  release's version, the model (for S11, every persona's model plus
+  whether the cross-repo persona and the fact tools took part), the API
+  dialect and the gateway host) and the case: the finding's identity for
+  S10, the finding id plus a digest of the redacted diff for S11. Change
+  the model, the endpoint, the release or the fix, and the old row is
+  simply not found. Ported from vvaharness v1.3.0's `step_key_for`; before
+  this, a `remediate_<index>` row written under one model was served as
+  another model's result.
+- `payload` = JSON. For S10: the finding's identity hash (a SHA-1 over
+  NUL-separated finding index/title/file/rendered body), the engine fields,
+  and the `RemediationRecord` with its diff redacted
+  (`bc_redact::redact_diff`). A row without matching engine fields is
+  refused. For S11: the `ValidationScore` with every free-text field
+  redacted.
 
 `--resume` skips re-remediating a finding only when a saved checkpoint's own
-identity hash matches the finding being processed *now*: same position,
-title, file, and rendered body. Checkpoints are always written when the
+identity hash and engine match the finding and configuration being
+processed *now*: same position, title, file, rendered body, model, dialect,
+gateway host and release. A `--remediate` batch walk also prunes
+(`CheckpointStore::prune_stale`) every `remediate_*` row of the run that no
+selected finding claims, so rows from an earlier model or finding set
+neither pile up nor come back. Checkpoints are always written when the
 store opened successfully, regardless of `--resume`; `--resume` only
 controls whether they're **consulted** before re-running a finding. If the
 default-location store can't be opened (e.g. an unwritable `$HOME`),
@@ -968,6 +1179,124 @@ touches any `security-scan/` output:
 
 Both modes skip scanning entirely; `--repo` is still a required argument
 but is unused. See `USER_GUIDE.md` §1b.
+
+## `run_manifest.json` (`--out-run-manifest`)
+
+One JSON record of the whole invocation, ported from the Python
+original's `manifest.py`: the only output that sees the full run, since
+the reports are rendered at S9 and S10/S11 happen after them. Default
+path `<out-dir>/run_manifest.json`, one fixed name rather than Python's
+timestamped one in the working directory, so a CI step can upload it
+without globbing.
+
+It is written for every scan that actually ran, successful, failed or
+canceled (`exit_code` is `0`, `1` or `130`), and never for an argument
+error, a failure
+before the scan starts (the pre-scan readiness gate, a config that does
+not load) or a utility mode (`--doctor`, `--setup`, `--estimate`,
+`--gc`, the `--post-*-from` modes, `--remediate-from`, `--repo-file`
+batches). A manifest that cannot be written is a warning on stderr,
+never a failed run.
+
+```json
+{
+  "schema_version": 1,
+  "tool": "bc-sast",
+  "tool_version": "1.0.0",
+  "started_at": "2026-09-25T10:00:00Z",
+  "finished_at": "2026-09-25T10:14:41Z",
+  "duration_sec": 881.2,
+  "exit_code": 0,
+  "canceled": false,
+  "argv": ["bc-sast", "--repo", "/src/app", "--gateway-api-key", "***"],
+  "config_path": "/cfg/config.yaml",
+  "config_sha256": "3f1c...",
+  "local_overlay_sha256": null,
+  "input_hashes": {"cve_file": {"path": "/cfg/cves.json", "sha256": "9ab0..."}},
+  "target": {"repo_name": "app", "git_sha": "4e1d..."},
+  "models": {
+    "deepdive": {"id": "claude-sonnet-4-5", "dialect": "anthropic",
+                 "gateway_host": "api.anthropic.com",
+                 "pricing_provider": "anthropic", "transport": "messages"}
+  },
+  "stages": {
+    "s4": {"label": "deep-dive", "outcome": "completed", "duration_sec": 412.6,
+           "tokens": {"input": 812004, "output": 61220, "cache_read": 2140880,
+                      "cache_write": 1204, "calls": 23},
+           "cost_usd": 2.24261, "cost_estimated": false,
+           "counts": {"findings": 9, "chunks": 23, "chunks_failed": 0,
+                      "chunks_skipped": 0},
+           "detail": null},
+    "s10": {"label": "remediate", "outcome": "completed", "...": "..."}
+  },
+  "totals": {"tokens": {"input": 0, "output": 0, "cache_read": 0,
+                        "cache_write": 0, "calls": 0},
+             "cost_usd": 3.2, "unpriced_tokens": 0},
+  "errors_by_stage": {},
+  "remediation": {"attempted": 3, "fixed": 2, "not_fixed": 1, "failed": 0,
+                  "validated": 2, "validation_passed": 2,
+                  "validation_failed": 0},
+  "counters": {"llm_truncated_replies": 0}
+}
+```
+
+(On the OpenAI dialect `counters` also carries `responses_fallbacks`,
+and each role's `transport` is `chat`, `responses` or `auto`.)
+
+- **`argv`** is scrubbed before it is written: the value of any flag
+  whose name looks secret-bearing (`token`, `password`, `secret`,
+  `api-key`, `auth`, `credential`, `bearer`, or a whole `key` word, so
+  `--gateway-api-key`, `--git-token`, `--client-key`) is replaced with
+  `***` in both the `--flag value` and `--flag=value` forms, and every
+  argument is then shape-redacted (URL userinfo, JWTs, cloud keys). The
+  whole manifest is shape-redacted once more as it is written, since
+  stage details can carry error text.
+- **Hashes** are hex SHA-256 of the `--config` file, of the
+  `config.local.yaml` overlay when it was applied, and of each
+  configured input (`cve_file`, `controls_file` from the flag or
+  `inject.*`, `cmdb_csv`, `remediation_policy`, `remediation_playbook`).
+  A file that cannot be read is recorded with `sha256: null`.
+- **`models`** names each routed role's model id, dialect, pricing
+  provider and the gateway's **host only** (never its scheme, port,
+  path, query or credentials). Roles whose stage is switched off are
+  left out. `transport` is the wire API the role's calls use: the
+  role's own `models.<role>.use_responses_api` pin (`responses` or
+  `chat`) when it has one, else the client-wide `--openai-api` choice
+  (`chat`, `responses` or `auto`), and `messages` on the Anthropic
+  dialect. `auto` records the configuration, not which API each call
+  ended up on; `counters.responses_fallbacks` says how many models left
+  the Responses API.
+- **`counters`** always has `llm_truncated_replies` (see above). On the
+  OpenAI dialect it also has `responses_fallbacks`: how many models the
+  client moved from the Responses API to Chat Completions during the run
+  because the endpoint rejected the Responses request shape (see
+  [`llm-transport.md`](llm-transport.md#auto-which-api-first-and-the-learned-fallback)).
+  Non-zero under `auto` means a gateway that does not route
+  `/responses` for that model, and so a reasoning model that ran
+  without its reasoning carried across tool calls.
+- **`stages`** is in pipeline order, `s0` to `s11`. `outcome` is one of
+  `completed`, `completed_with_errors`, `cached`, `skipped`, `disabled`
+  or `error` (an `error` with no duration is a stage the scan aborted
+  inside); `duration_sec` is `null` for a stage that ran no timed body.
+  `tokens.input` is billable input (fresh plus cache writes), the same
+  figure the report calls "prompt"; `cache_write` is broken out of it
+  and `cache_read` is kept out of it. `cost_usd` is `null` when nothing
+  the stage called could be priced, and `cost_estimated` is `true` when
+  it is a lower bound because some of its tokens had no published rate.
+  `counts` are the stage-done counters the progress lines print. S10
+  and S11 close `disabled` (with a `detail`) when remediation was not
+  requested, was refused, or had nothing to do, and S11 when validation
+  is off.
+- **`canceled`** is `true` for a run the operator canceled with Ctrl-C;
+  the stages it no longer reached are then `skipped` with the detail
+  `canceled by user (Ctrl-C)`.
+- **`totals`** sums every stage. Model calls made outside any stage
+  (the pre-scan credential probe, `--auto-step1`) are not metered, so
+  unlike Python there is no `unattributed` bucket.
+- **`errors_by_stage`** counts S4's failed chunks, S10's failed agent
+  sessions, and 1 for any other stage that closed with errors.
+- **`remediation`** is present only when S10 ran; its validation half is
+  `null` when S11 did not.
 
 ## A note on step 0
 

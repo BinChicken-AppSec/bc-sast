@@ -132,7 +132,7 @@ to a severity-band score when no numeric score is available:
 | HIGH | 7.0 |
 | MEDIUM | 4.0 |
 | LOW | 1.0 |
-| INFO / unrecognised | 0.0 |
+| INFO / unrecognized | 0.0 |
 
 Ties break by stable original (scan) order, smaller index first.
 
@@ -230,8 +230,9 @@ warning. The only real spend knobs are `--max-tokens` and
 |---|---|---|---|
 | Write journal | *(automatic)* | on | Every `Write`/`Edit` records the file's pre-edit **bytes** the first time it is touched, so a rollback is exact, on a non-git target too, and for files the finding never named. |
 | Policy post-gate | `enforce_policy` | off | Unchanged: reverts edits that hit a `deny_paths`/`forbid_patch_paths` glob and forces `REJECT`. Runs first, so its compliance audit trail is never pre-empted by a later gate. |
+| Workflow-pin gate | *(automatic)* | on | A newly introduced `uses: owner/repo/.github/workflows/<name>.yml@<ref>` must be a non-placeholder 40-hex commit SHA that the pre-edit repository already pins that same workflow to. Anything else (a branch, a tag, an all-zero or repeating SHA, a plausible hash nobody established) rolls back the whole patch, sets the verdict to `Not Fixed` and the record to `REJECT` with `policy_reason: "unsafe_workflow_reference"`. See below. |
 | Syntax gate | `syntax_check` | `true` | Re-parses every touched file with tree-sitter. Any file that no longer parses rolls back **the whole patch** and downgrades the verdict to `Needs Review`. |
-| Verify command | `verify_command` / `verify_timeout_secs` | `null` / `600` | Runs an operator-supplied `sh -c` command (build/lint/tests) in the repo root. Non-zero exit or timeout rolls the patch back, with the last 40 lines of output in the note. **Fails closed when there is no `sh` at all** (see below). |
+| Verify command | `verify_command` / `verify_timeout_secs` | `null` / `600` | Runs an operator-supplied `sh -c` command (build/lint/tests) in the repo root. Non-zero exit or timeout rolls the patch back, with the last 40 lines of output in the note. The command runs as its own process group, and a timeout or a Ctrl-C kills the whole group, so nothing it started (a compiler, a test runner) keeps running behind the rollback. **Fails closed when there is no `sh` at all** (see below). |
 | Size caps | `max_diff_lines` / `max_files_touched` | `200` / `1` | A remediation is a targeted fix for one finding; a sprawling patch is a run that went wrong. At the shipped `max_files_touched: 1`, a fix reaching into a second file is refused outright: crossing a file boundary is a design decision about how two parts of the system talk to each other, and that is a reviewer's call. The finding is still reported, and the refusal and its reason are rendered on the finding's `Patch` line. Either cap at `0` disables that half. |
 | Dry run | `dry_run` | `false` | Run every gate, then roll everything back regardless, but keep the diff in the record. |
 | Unverified rollback | `keep_unverified` | `false` | Anything but a clean `Fixed` verdict rolls the patch back: `Not Fixed`, `Partially Fixed`, `Needs Review`, `False Positive` and `Denied` alike (the check is literally "not `Fixed`", so the list is exhaustive by construction). `true` restores the old leave-it-applied behavior. |
@@ -266,6 +267,51 @@ Two consequences worth stating plainly:
   "revert everything git reports as changed" would `git checkout` the
   user's in-progress edits, which is the exact failure these gates exist
   to prevent.
+
+### The workflow-pin gate
+
+Ported from vvaharness v1.3.0 (`remediation_agent/policy/workflow_refs.py`).
+A finding such as "the privileged workflow delegates to
+`org/shared/.github/workflows/security.yml@develop`" invites the model to
+pin the call, and with no network access it can only invent a commit: an
+all-zero SHA, or a plausible hash that names nothing. Either breaks the
+pipeline, and a guessed SHA that happens to exist in a fork is worse than
+the mutable ref it replaced. The only commit S10 can vouch for is one the
+repository already pins the same workflow to, so that is the only one
+accepted.
+
+- Every top-level `.github/workflows/*.yml`/`*.yaml` file is snapshotted
+  before the agent runs, policy or not, so the gate can tell an introduced
+  reference from an existing one and a rollback has a baseline for a
+  workflow the model edited without listing it.
+- Only remote reusable-workflow calls are gated. An action
+  (`uses: actions/checkout@v4`) is not a workflow call, and a local call
+  (`uses: ./.github/workflows/x.yml`) carries no `@ref`.
+- Pre-existing references are never blamed on an unrelated edit: only
+  occurrences beyond what the same file already had are checked.
+- Reads are confined to the repository and bounded at 1 MiB per file; a
+  larger workflow cannot be verified, so it fails closed.
+- The S10 system prompt carries the matching rule ("WORKFLOW PINS: never
+  invent a commit SHA ... make no edit and report Not Fixed").
+
+Two deliberate differences from Python: the gate runs on every
+remediation, not only under `--enforce-remediation-policy` (an invented
+SHA breaks CI whether or not a CWE policy is loaded), and a SHA that
+repeats with a period of 20 characters or fewer (`deadbeef` five times)
+also counts as a placeholder, where Python only rejects a single repeated
+character.
+
+### What `ACCEPT` means
+
+`final_verdict` is an audit label, present only when a policy context
+was supplied. On the clean post-gate path it is `ACCEPT` only when the
+agent's three evidence gates all passed, its verdict is `Fixed` or
+`Partially Fixed`, **and** the change produced a non-empty diff: a policy
+allow is permission to patch, never evidence that a patch happened. The
+label is then reconciled against the diff the record actually ends up
+with, so an `ACCEPT` whose patch a later gate rolled back becomes
+`REJECT` with `policy_reason: "no_diff_captured"` (ported from v1.4.0's
+`postgate.py` and `plugin_runner/run.py::_reconcile_post_meta`).
 
 ### How the S11 rollback restores
 
@@ -567,14 +613,14 @@ An earlier rule always wins over a later one:
 
 1. **Missing/unparseable policy**: fail-closed to `GuidanceOnly` (`no_policy_loaded`).
 2. **Kill-switch active** (checked on *every* call, never cached): `GuidanceOnly` (`kill_switch`).
-3. **Unrecognised/unmapped CWE id**: `GuidanceOnly` (`unmapped_cwe`).
+3. **Unrecognized/unmapped CWE id**: `GuidanceOnly` (`unmapped_cwe`).
 4. **CWE (or a declared descendant) is deny-listed**: `GuidanceOnly`, reason from the policy's own `deny` entry. This wins over an allow-list entry for the *same* CWE.
 5. **File path matches a `deny_paths` glob**: `GuidanceOnly` (`sensitive_path:<pattern>`). This blocks even an allow-listed CWE.
 6. **CWE is allow-listed**: `Patch` (`allow_list`).
 7. **Otherwise**: the policy's own `default_action` (`default_action`).
 
 `default_action: allow` is the only YAML value that parses to
-`Action::Patch`; a missing key, `"deny"`, or any unrecognised value all
+`Action::Patch`; a missing key, `"deny"`, or any unrecognized value all
 resolve to `GuidanceOnly`, fail-closed at the field level.
 
 ### Kill-switch
@@ -610,15 +656,23 @@ R1). Concretely, for each file the post-gate flags:
 5. `final_verdict` is forced to `"REJECT"`.
 
 On the clean path (nothing forbidden touched), `final_verdict` is
-`cap_verdict(decision.action, verdict.gates.all_pass())`, an
-`ACCEPT`/`REJECT` audit label distinct from the agent's own `verdict`
-enum.
+`cap_verdict(decision.action, gates_passed)`, an `ACCEPT`/`REJECT` audit
+label distinct from the agent's own `verdict` enum, where `gates_passed`
+also requires a claimed fix and a non-empty diff (see
+[What `ACCEPT` means](#what-accept-means)).
+
+When no git status is available, the post-gate finds forbidden files by
+walking the working tree itself. That walk never enters a symlinked
+directory (a repository containing `loop -> .` or `root -> /` used to
+walk forever or walk the host), and stops as soon as it has seen 20,000
+files or 20,000 directories, as vvaharness v1.4.0's
+`os.walk(followlinks=False)` walk does.
 
 ## `--resume` / checkpointing
 
 | Flag | Field | Default | Effect |
 |---|---|---|---|
-| `--resume` | `resume: bool` | `false` | Skip a finding whose checkpoint's stored identity still matches it exactly. |
+| `--resume` | `resume: bool` | `false` | Skip a finding whose checkpoint's stored identity and engine still match it exactly. |
 | `--force` | `force: bool` | `false` | Overrides S10's git-HEAD-staleness safety refusal (remediation otherwise refuses to run if HEAD has moved since the scan, since stale line numbers would misdirect the agent's file:line evidence). |
 
 A finding's identity (`finding_identity`) is a SHA-1 hex digest over
@@ -631,13 +685,58 @@ prior checkpoint is *consulted* before re-running a finding, so a later
 `--resume` run always has something to load from an earlier non-resume
 run.
 
+Checkpoints are **engine-keyed** (ported from vvaharness v1.3.0's
+`step_key_for`): the step is `remediate_<digest>`, where the digest covers
+the finding's identity and the engine that produced the record (this
+stage, this release, the model, the API dialect and the gateway host),
+and the payload records the same engine fields. A record written under one
+model or endpoint is therefore never served as another's; before this, a
+`--resume` after switching models republished the old model's fix. A
+batch walk prunes every `remediate_*` row of the run that no selected
+finding claims. The checkpointed diff is stored redacted
+(`bc_redact::redact_diff`). S11 has its own checkpoints: see
+docs/validation.md.
+
+## Outcome counts and exit codes
+
+A remediation run is summarized as `attempted` findings, of which
+`fixed` stand as fixes (verdict `Fixed`, a non-empty diff, not rolled back
+by an S10 gate or by S11: `bc_stage_s10::is_kept_fix`), `not_fixed` were
+processed without one (denied, out of scope, declined, rolled back, or
+answered with anything but `Fixed`), and `failed` were agentic calls that
+errored. The one-line summary prints them
+(`Remediation: N processed, M failed. Outcome: F fixed, X not fixed.`) and
+`remediation.json` carries them under `totals`, with a `rollup` of case
+states and validator decisions (docs/outputs.md).
+`bc_stage_s10::RemediationCounts` and
+`bc_validation_scoring::ValidationCounts` expose the same numbers for a
+progress line.
+
+The process exit code of a `--remediate` run follows vvaharness v1.4.0:
+
+- `1` when an S10 call failed or an S11 validation errored;
+- `3` (`EXIT_NOT_REMEDIATED`) when S11 validated nothing as fixed and
+  graded at least one fix partially or not fixed (an all-inconclusive run
+  does not trip it);
+- `0` otherwise, including a refused (stale-HEAD) run.
+
+A run without `--remediate` is unaffected, and
+`--remediation-exit-code false` restores `0` for any run whose scan
+succeeded. The GitHub Action defaults to that (`fail-on-remediation:
+"false"`) so an existing workflow does not start failing; see
+docs/github-action.md.
+
 ## Output
 
 `--out-remediation-json <path>` writes a `RemediationExport` (`{refused,
-results[]}`); each result is either `Processed` (finding_index,
-finding_id, verdict, policy_action/reason, final_verdict, changes,
-summary, diff, and, if S11 validation ran, its score) or `Failed
-{finding_index, error}`. `--post-fixes-from <path>` is a separate,
+results[], totals, rollup}`); each result is either `Processed`
+(finding_index, finding_id, verdict, policy_action/reason, final_verdict,
+changes, summary, diff, and, if S11 validation ran, its score) or `Failed
+{finding_index, error}`. Every diff in it is redacted structure-aware
+(`bc_redact::redact_diff`): hunk headers, line prefixes and line endings
+survive, so the patch still parses, while PEM bodies and hardcoded
+credentials are masked and a credential read from configuration
+(`os.environ["DB_PASSWORD"]`) stays readable. `--post-fixes-from <path>` is a separate,
 scan-skipping mode that reads this JSON back and posts/updates GitHub
 fix-suggestion comments from it (needs `--github-token`/
 `--github-repo`/`--pr-number`); see `docs/github-action.md`.

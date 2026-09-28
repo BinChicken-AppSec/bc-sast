@@ -181,142 +181,6 @@ fn diff_impact_map_without_a_trust_boundary_path_says_so() {
     );
 }
 
-// ── PatternScan ─────────────────────────────────────────────────────────
-
-#[test]
-fn pattern_scan_finds_a_hardcoded_secret_with_its_file_and_line() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write(
-        dir.path(),
-        "app/config.yaml",
-        "name: svc\npassword: hunter2hunter2\n",
-    );
-    let hits = pattern_scan(dir.path(), "secret_exposure").expect("known set");
-    let hits = hits.as_array().expect("an array of matches");
-    assert_eq!(hits.len(), 1, "{hits:?}");
-    assert_eq!(hits[0]["file"], "app/config.yaml");
-    assert_eq!(hits[0]["line"], 2);
-    assert_eq!(hits[0]["rule"], "__builtin__");
-    assert_eq!(hits[0]["pattern_set"], "secret_exposure");
-    assert_eq!(hits[0]["description"], "hardcoded secret or credential");
-}
-
-#[test]
-fn pattern_scan_redacts_the_credential_out_of_the_snippet() {
-    // The one deliberate divergence from Python: the persona is told
-    // WHERE the secret is, never what it is.
-    let dir = tempfile::tempdir().expect("tempdir");
-    write(dir.path(), "keys.env", "AWS_KEY = AKIAAAAAAAAAAAAAAAAA\n");
-    let hits = pattern_scan(dir.path(), "secret_exposure").expect("known set");
-    let rendered = hits.to_string();
-    assert!(!rendered.contains("AKIAAAAAAAAAAAAAAAAA"), "{rendered}");
-    assert!(rendered.contains("keys.env"), "{rendered}");
-}
-
-#[test]
-fn pattern_scan_finds_insecure_values_and_orders_hits_by_file_then_line() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    write(dir.path(), "z.yaml", "debug: true\n");
-    write(
-        dir.path(),
-        "a.yaml",
-        "x: 1\nssl_verify: false\ndebug: true\n",
-    );
-    let hits = pattern_scan(dir.path(), "insecure_value").expect("known set");
-    let hits = hits.as_array().expect("an array of matches");
-    let located: Vec<(&str, u64)> = hits
-        .iter()
-        .map(|h| {
-            (
-                h["file"].as_str().expect("file"),
-                h["line"].as_u64().expect("line"),
-            )
-        })
-        .collect();
-    assert_eq!(located, vec![("a.yaml", 2), ("a.yaml", 3), ("z.yaml", 1)]);
-    assert_eq!(hits[0]["description"], "insecure configuration value");
-}
-
-#[test]
-fn pattern_scan_rejects_an_unknown_set_rather_than_returning_nothing() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let err = pattern_scan(dir.path(), "made_up").expect_err("unknown set");
-    assert_eq!(
-        err,
-        "unknown pattern_set 'made_up'; available: insecure_value, secret_exposure"
-    );
-}
-
-#[test]
-fn pattern_scan_skips_binary_media_vendor_and_test_files() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let secret = "password: hunter2hunter2\n";
-    write(dir.path(), "node_modules/dep/conf.yaml", secret); // infra dir
-    write(dir.path(), "tests/fixture.yaml", secret); // test dir
-    write(dir.path(), "logo.SVG", secret); // excluded ext, case-insensitively
-    write(dir.path(), "diff.patch", secret); // host artifact
-    std::fs::write(dir.path().join("blob.dat"), b"password: hunter2hunter2\x00")
-        .expect("binary fixture"); // NUL byte -> binary
-    write(dir.path(), "keep.yaml", secret);
-
-    let hits = pattern_scan(dir.path(), "secret_exposure").expect("known set");
-    let files: Vec<&str> = hits
-        .as_array()
-        .expect("array")
-        .iter()
-        .map(|h| h["file"].as_str().expect("file"))
-        .collect();
-    assert_eq!(files, vec!["keep.yaml"], "{hits}");
-}
-
-#[test]
-fn pattern_scan_reads_invalid_utf8_lossily_instead_of_skipping_the_file() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::write(
-        dir.path().join("mixed.yaml"),
-        [b"password: hunter2hunter2\n".as_slice(), &[0xff, 0xfe]].concat(),
-    )
-    .expect("fixture");
-    let hits = pattern_scan(dir.path(), "secret_exposure").expect("known set");
-    assert_eq!(hits.as_array().expect("array").len(), 1, "{hits}");
-}
-
-#[cfg(unix)]
-#[test]
-fn pattern_scan_skips_an_unreadable_file_instead_of_failing_the_scan() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().expect("tempdir");
-    write(dir.path(), "ok.yaml", "password: hunter2hunter2\n");
-    let locked = dir.path().join("locked.yaml");
-    std::fs::write(&locked, "password: hunter2hunter2\n").expect("fixture");
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-    let hits = pattern_scan(dir.path(), "secret_exposure").expect("known set");
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-    let files: Vec<&str> = hits
-        .as_array()
-        .expect("array")
-        .iter()
-        .map(|h| h["file"].as_str().expect("file"))
-        .collect();
-    assert_eq!(files, vec!["ok.yaml"]);
-}
-
-#[cfg(unix)]
-#[test]
-fn pattern_scan_never_follows_a_symlink_out_of_the_repo() {
-    // The host-file-disclosure guard `_scope.py::_escapes_workspace`
-    // exists for: a symlinked "config" pointing at a host secrets file.
-    let base = tempfile::tempdir().expect("tempdir");
-    let root = base.path().join("repo");
-    std::fs::create_dir(&root).expect("repo dir");
-    let outside = base.path().join("host-secrets.yaml");
-    std::fs::write(&outside, "password: hunter2hunter2\n").expect("fixture");
-    std::os::unix::fs::symlink(&outside, root.join("config.yaml")).expect("symlink");
-
-    let hits = pattern_scan(&root, "secret_exposure").expect("known set");
-    assert_eq!(hits, json!([]), "escaped the repo root: {hits}");
-}
-
 // ── TestInventory ───────────────────────────────────────────────────────
 
 #[test]
@@ -426,72 +290,42 @@ fn every_test_file_naming_convention_python_recognizes_is_recognized_here() {
     }
 }
 
-#[cfg(unix)]
+/// Moves the directory `staged` (built at a short path) to a new location
+/// whose own path is 100 bytes short of Linux's `PATH_MAX`, and returns
+/// it. An entry inside it with a name of 100 bytes or more is then listed
+/// by `read_dir`, but its full path is refused with ENAMETOOLONG before any
+/// permission check, so no user, root included, can open it.
+#[cfg(target_os = "linux")]
+fn bury_near_path_max(staged: &Path) -> PathBuf {
+    const TARGET: usize = 4096 - 100;
+    let mut deep = staged
+        .parent()
+        .expect("staged directory has a parent")
+        .canonicalize()
+        .expect("staging parent resolves");
+    while TARGET.saturating_sub(deep.as_os_str().len() + 1) > 255 {
+        deep.push("d".repeat(200));
+    }
+    std::fs::create_dir_all(&deep).expect("deep fixture directory");
+    let buried = deep.join("r".repeat(TARGET - deep.as_os_str().len() - 1));
+    std::fs::rename(staged, &buried).expect("move the staged tree into place");
+    buried
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn test_inventory_skips_an_unreadable_test_file() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().expect("tempdir");
-    let locked = dir.path().join("test_locked.py");
-    std::fs::write(&locked, "x\n").expect("fixture");
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-    let out = test_inventory(dir.path());
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-    assert_eq!(out["total_test_files"], 0);
-}
-
-// ── the scope partition ─────────────────────────────────────────────────
-
-#[test]
-fn the_test_dir_partition_is_still_a_subset_of_the_production_exclude_set() {
-    // Python enforces this at import time with a `raise`
-    // (`validation/tools/_scope.py:48-52`): if the production walk adds a
-    // new test directory and this list is not updated, `TestInventory`
-    // silently stops seeing that directory's tests. Rust has no import
-    // hook, so the guard lives here, where CI runs it.
-    let production: BTreeSet<&str> = bc_repo_analysis::DEFAULT_EXCLUDE_DIRS
-        .iter()
-        .copied()
-        .collect();
-    let missing: Vec<&str> = TEST_DIRS
-        .iter()
-        .copied()
-        .filter(|d| !production.contains(d))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "TEST_DIRS drifted from bc_repo_analysis::DEFAULT_EXCLUDE_DIRS: {missing:?}"
-    );
-    // ...and the infra half is exactly the rest of it.
-    assert_eq!(INFRA_DIRS.len(), production.len() - TEST_DIRS.len());
-}
-
-#[test]
-fn regexes_match_the_s1_preprocess_originals() {
-    // Spot-checks pinning the two ported patterns to the behaviours the
-    // Python source documents, so a future edit to either string is
-    // caught by a failing assertion rather than by a silent scan gap.
-    assert!(SECRET_RX
-        .is_match("api_key = 'abcdefghijkl'")
-        .expect("no backtrack limit"));
-    // Templated / vault refs are deliberately NOT secrets.
-    assert!(!SECRET_RX.is_match("password: ${DB_PASSWORD}").expect("ok"));
-    assert!(!SECRET_RX.is_match("password: vault:secret/db").expect("ok"));
-    // A nested key whose "value" is really another key.
-    assert!(!SECRET_RX
-        .is_match("auth-token:\n  timeout: 30")
-        .expect("ok"));
-    assert!(INSECURE_RX
-        .is_match("InsecureSkipVerify = true")
-        .expect("ok"));
-    assert!(INSECURE_RX.is_match("allow_anonymous: yes").expect("ok"));
-    assert!(!INSECURE_RX.is_match("tls_verify: true").expect("ok"));
-}
-
-#[test]
-fn pattern_set_resolves_both_builtin_names_and_nothing_else() {
-    assert!(pattern_set("secret_exposure").is_some());
-    assert!(pattern_set("insecure_value").is_some());
-    assert!(pattern_set("SECRET_EXPOSURE").is_none());
+    // A test file the walk lists but cannot open. A permission bit cannot
+    // stop root, so the open is refused by a path longer than `PATH_MAX`,
+    // which fails for every user.
+    let base = tempfile::tempdir().expect("tempdir");
+    let staged = base.path().join("staged");
+    write(&staged, "test_ok.py", "x\n");
+    write(&staged, &format!("test_{}.py", "x".repeat(200)), "x\n");
+    let root = bury_near_path_max(&staged);
+    let out = test_inventory(&root);
+    assert_eq!(out["total_test_files"], 1);
+    assert_eq!(out["test_files"][0]["file"], "test_ok.py");
 }
 
 // ── the executor wrapper ────────────────────────────────────────────────

@@ -1,41 +1,129 @@
-//! [`OpenAiClient`]: the `LlmClient` implementation for the OpenAI-compatible
-//! chat-completions dialect, ported from `backends/oai.py`'s single-call
-//! `prompt()`/`agentic()` request path. Makes exactly one HTTP attempt per
-//! [`LlmClient::chat`] call for anything network-transient (rate limits,
-//! server errors, connection failures) — that retry/backoff policy is
-//! `bc-llm-agentic`'s job, not this crate's, so it applies uniformly
-//! across dialects instead of being duplicated per backend the way
-//! `backends/oai.py`/`backends/sdk.py` each do today.
+//! [`OpenAiClient`]: the `LlmClient` implementation for the OpenAI
+//! dialect, speaking either Chat Completions (`/chat/completions`,
+//! ported from `backends/oai.py`) or the Responses API (`/responses`,
+//! ported from the Python original's DeepAgents route), per
+//! [`OpenAiApi`].
 //!
-//! The one exception, [`adjust_for_unsupported_parameter`]: a bounded,
-//! same-call self-correction for OpenAI request-shape assumptions that
-//! don't hold for every model — two of them mirroring `backends/oai.py::
-//! prompt`'s own retry-and-swap, two with no Python precedent at all (see
-//! that function's own doc comment). This isn't resilience to transience
-//! (the same request would fail again unmodified); it's correcting a
-//! wrong guess about what shape a *specific model* accepts, discovered
-//! only from that model's own rejection of the first attempt.
+//! Makes one HTTP attempt per [`LlmClient::chat`] call for anything
+//! network-transient (rate limits, server errors, connection failures):
+//! that retry/backoff policy is `bc-llm-agentic`'s job, so it applies
+//! uniformly across dialects.
+//!
+//! Two bounded exceptions, both about request SHAPE rather than
+//! transience (the same request would fail again unmodified):
+//!
+//! - **Same-call corrections** ([`crate::quirks`]): a 400 naming a
+//!   parameter this model rejects is corrected and resent, and the
+//!   correction remembered for the model.
+//! - **Transport fallback** ([`crate::transport`]): in
+//!   [`OpenAiApi::Auto`], a Responses call the endpoint rejects on shape
+//!   is retried once on Chat Completions (and the model remembered as
+//!   Chat-only); a Chat Completions call rejected with "use
+//!   /v1/responses" is retried once on the Responses API. If the second
+//!   transport also fails, what was learned is undone and the ORIGINAL
+//!   error returned.
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use bc_llm_client::{ChatRequest, ChatResponse, LlmClient, LlmError, SseDecoder};
-use serde_json::Value;
+use bc_llm_client::capabilities::capabilities;
+use bc_llm_client::{ChatRequest, ChatResponse, LlmClient, LlmError, OpenAiApi};
 
-use crate::request::build_request_body;
-use crate::response::{classify_http_error, parse_response_body, parse_retry_after};
-use crate::stream::StreamAssembler;
+use crate::errors::classify_http_error;
+use crate::http::{post, read_body, Rejected};
+use crate::quirks::{degrade_reasoning_to_none, QuirkMemory, Shape};
+use crate::transport::{
+    responses_shape_rejection, route, wants_responses_api, ModelTransport, Route, ShapeRejection,
+    TransportMemory,
+};
+use crate::{chat, responses};
 
-/// Talks to an OpenAI-compatible `/chat/completions` endpoint — either
-/// `https://api.openai.com/v1` directly or an AI gateway (Bifrost, Portkey)
-/// speaking the same dialect. The `reqwest::Client` is built and owned by
-/// the caller (see `bc-gateway-http::build_client`) so this crate has no
-/// TLS/proxy configuration of its own.
+/// At most this many same-call corrections per request. Each correction
+/// removes, moves or lowers the key it acts on, so this only bounds how
+/// many DISTINCT rejections one call will self-correct.
+const MAX_CORRECTIONS: u8 = 6;
+
+/// Everything this process has learned about individual models: which
+/// transport each works on and which parameters each rejects. Shared by
+/// every call through a client, and by several clients when handed the
+/// same `Arc` ([`OpenAiClient::with_learned_models`]).
+#[derive(Debug, Default)]
+pub struct LearnedModels {
+    transport: TransportMemory,
+    quirks: QuirkMemory,
+}
+
+impl LearnedModels {
+    pub fn new() -> Self {
+        LearnedModels::default()
+    }
+
+    /// Per-model transport state, for diagnostics.
+    pub fn transport(&self, model: &str) -> ModelTransport {
+        self.transport.state(model)
+    }
+
+    /// How many Responses-to-Chat-Completions fallbacks this process has
+    /// made, for the run manifest.
+    pub fn responses_fallbacks(&self) -> u64 {
+        self.transport.fallbacks()
+    }
+}
+
+/// Talks to an OpenAI-compatible endpoint: `https://api.openai.com/v1`
+/// directly or an AI gateway (Bifrost, Portkey) speaking the same
+/// dialect. The `reqwest::Client` is built and owned by the caller (see
+/// `bc-gateway-http::build_client`) so this crate has no TLS/proxy
+/// configuration of its own.
 pub struct OpenAiClient {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
+    api: OpenAiApi,
+    learned: Arc<LearnedModels>,
+}
+
+/// Why one transport attempt failed, kept rich enough to decide whether
+/// the OTHER transport is worth a try.
+enum Failure {
+    Rejected(Rejected),
+    /// A 2xx from `/responses` that is not a Responses document.
+    NoOutput,
+    /// Chat Completions answered "use /v1/responses" in `Auto` mode.
+    WantsResponses(Rejected),
+    Error(LlmError),
+}
+
+impl From<LlmError> for Failure {
+    fn from(e: LlmError) -> Self {
+        Failure::Error(e)
+    }
+}
+
+impl Failure {
+    fn shape_rejection(&self) -> Option<ShapeRejection> {
+        match self {
+            Failure::Rejected(r) => responses_shape_rejection(r.status, &r.body),
+            Failure::NoOutput => Some(ShapeRejection::NoOutput),
+            Failure::WantsResponses(_) | Failure::Error(_) => None,
+        }
+    }
+
+    fn into_error(self) -> LlmError {
+        match self {
+            Failure::Rejected(r) | Failure::WantsResponses(r) => {
+                classify_http_error(r.status, &r.body, r.retry_after)
+            }
+            Failure::NoOutput => LlmError::Other {
+                message: "the /responses endpoint answered without an `output` array".to_string(),
+            },
+            Failure::Error(e) => e,
+        }
+    }
 }
 
 impl OpenAiClient {
+    /// A client speaking Chat Completions, the historical default.
     pub fn new(
         http: reqwest::Client,
         base_url: impl Into<String>,
@@ -45,6 +133,193 @@ impl OpenAiClient {
             http,
             base_url: base_url.into(),
             api_key,
+            api: OpenAiApi::Chat,
+            learned: Arc::new(LearnedModels::new()),
+        }
+    }
+
+    /// Choose the API shape (`--openai-api`). A request's own
+    /// [`ChatRequest::openai_api`] still wins for that request.
+    pub fn with_api(mut self, api: OpenAiApi) -> Self {
+        self.api = api;
+        self
+    }
+
+    /// Share learned per-model state with other clients.
+    pub fn with_learned_models(mut self, learned: Arc<LearnedModels>) -> Self {
+        self.learned = learned;
+        self
+    }
+
+    /// The configured API shape.
+    pub fn api(&self) -> OpenAiApi {
+        self.api
+    }
+
+    /// What this client has learned so far.
+    pub fn learned_models(&self) -> &Arc<LearnedModels> {
+        &self.learned
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}/{path}", self.base_url.trim_end_matches('/'))
+    }
+
+    /// One Chat Completions call, with same-call corrections. With
+    /// `auto`, a "use /v1/responses" rejection is handed back as
+    /// [`Failure::WantsResponses`] instead of degrading reasoning.
+    async fn send_chat(&self, request: &ChatRequest, auto: bool) -> Result<ChatResponse, Failure> {
+        let model = request.model.as_str();
+        let mut body = chat::request::build_request_body(request);
+        self.learned
+            .quirks
+            .apply_learned(&mut body, Shape::Chat, model);
+        let url = self.url("chat/completions");
+        let mut corrections = MAX_CORRECTIONS;
+        loop {
+            match post(
+                &self.http,
+                &url,
+                self.api_key.as_deref(),
+                &body,
+                request.timeout,
+            )
+            .await?
+            {
+                Ok(resp) => {
+                    let value =
+                        read_body::<chat::stream::StreamAssembler>(resp, request.stream).await?;
+                    return Ok(chat::response::parse_response_body(&value)?);
+                }
+                Err(rejected) => {
+                    if rejected.status == 400 && corrections > 0 {
+                        let corrected = if wants_responses_api(&rejected.body) {
+                            if auto {
+                                return Err(Failure::WantsResponses(rejected));
+                            }
+                            degrade_reasoning_to_none(&mut body, model)
+                        } else {
+                            self.learned.quirks.correct(
+                                &mut body,
+                                Shape::Chat,
+                                model,
+                                &rejected.body,
+                            )
+                        };
+                        if corrected {
+                            corrections -= 1;
+                            continue;
+                        }
+                    }
+                    return Err(Failure::Rejected(rejected));
+                }
+            }
+        }
+    }
+
+    /// One Responses API call, with same-call corrections.
+    async fn send_responses(&self, request: &ChatRequest) -> Result<ChatResponse, Failure> {
+        let model = request.model.as_str();
+        let mut body = responses::request::build_request_body(request);
+        self.learned
+            .quirks
+            .apply_learned(&mut body, Shape::Responses, model);
+        let url = self.url("responses");
+        let mut corrections = MAX_CORRECTIONS;
+        loop {
+            match post(
+                &self.http,
+                &url,
+                self.api_key.as_deref(),
+                &body,
+                request.timeout,
+            )
+            .await?
+            {
+                Ok(resp) => {
+                    let value =
+                        read_body::<responses::stream::StreamAssembler>(resp, request.stream)
+                            .await?;
+                    if !responses::response::has_output(&value) {
+                        return Err(Failure::NoOutput);
+                    }
+                    return Ok(responses::response::parse_response_body(&value)?);
+                }
+                Err(rejected) => {
+                    if rejected.status == 400
+                        && corrections > 0
+                        && self.learned.quirks.correct(
+                            &mut body,
+                            Shape::Responses,
+                            model,
+                            &rejected.body,
+                        )
+                    {
+                        corrections -= 1;
+                        continue;
+                    }
+                    return Err(Failure::Rejected(rejected));
+                }
+            }
+        }
+    }
+
+    /// A Responses call that may fall back to Chat Completions.
+    async fn responses_then_chat(
+        &self,
+        request: &ChatRequest,
+        may_fall_back: bool,
+    ) -> Result<ChatResponse, LlmError> {
+        let model = request.model.as_str();
+        let transport = &self.learned.transport;
+        let failure = match self.send_responses(request).await {
+            Ok(resp) => {
+                transport.mark_proven(model);
+                return Ok(resp);
+            }
+            Err(failure) => failure,
+        };
+        let kind = match failure.shape_rejection() {
+            Some(kind) if may_fall_back && transport.may_fall_back(model, kind) => kind,
+            _ => return Err(failure.into_error()),
+        };
+        let original = failure.into_error();
+        transport.learn_chat_only(model, kind);
+        match self.send_chat(request, false).await {
+            Ok(resp) => Ok(resp),
+            Err(_) => {
+                // Both transports failed, so the first rejection proved
+                // nothing about the endpoint: un-learn it, and report the
+                // error the operator's chosen transport actually hit.
+                transport.forget(model);
+                Err(original)
+            }
+        }
+    }
+
+    /// A Chat Completions call that, in `Auto` mode, moves to the
+    /// Responses API when Chat Completions itself points there.
+    async fn chat_then_responses(
+        &self,
+        request: &ChatRequest,
+        auto: bool,
+    ) -> Result<ChatResponse, LlmError> {
+        let model = request.model.as_str();
+        let transport = &self.learned.transport;
+        let original = match self.send_chat(request, auto).await {
+            Err(Failure::WantsResponses(rejected)) => Failure::Rejected(rejected).into_error(),
+            other => return other.map_err(Failure::into_error),
+        };
+        let before = transport.state(model);
+        match self.send_responses(request).await {
+            Ok(resp) => {
+                transport.mark_proven(model);
+                Ok(resp)
+            }
+            Err(_) => {
+                transport.restore(model, before);
+                Err(original)
+            }
         }
     }
 }
@@ -52,199 +327,14 @@ impl OpenAiClient {
 #[async_trait]
 impl LlmClient for OpenAiClient {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        let mut body = build_request_body(request);
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        // At most 4 same-call corrections: max_tokens<->max_completion_tokens
-        // swap once, a too-large completion-token budget clamped down once,
-        // temperature removal once, reasoning_effort-to-"none" once. Each
-        // mutates/removes (or bounds) the exact key it acts on, so the
-        // identical correction can't legitimately fire twice — this only
-        // bounds how many *distinct* rejections one call will self-correct,
-        // not a generic retry budget.
-        let mut retries_left = 4u8;
-
-        loop {
-            let mut req = self.http.post(&url).json(&body);
-            if let Some(key) = &self.api_key {
-                req = req.bearer_auth(key);
+        let model = request.model.as_str();
+        let state = self.learned.transport.state(model);
+        let reasoning = capabilities(model).is_reasoning();
+        match route(self.api, request.openai_api, state, reasoning) {
+            Route::Chat { auto } => self.chat_then_responses(request, auto).await,
+            Route::Responses { may_fall_back } => {
+                self.responses_then_chat(request, may_fall_back).await
             }
-            // Per-request deadline overriding the shared client's own
-            // default (`bc_gateway_http::GatewayConfig::timeout`, 300 s),
-            // mirroring `backends/oai.py:278`'s
-            // `client.with_options(timeout=float(timeout))`. A stage
-            // asking for 64k output tokens needs the per-step budget
-            // (`step3/4/8.timeout`, 1800-3600 s), not the client default.
-            if let Some(timeout) = request.timeout {
-                req = req.timeout(timeout);
-            }
-
-            let mut resp = req.send().await.map_err(map_reqwest_error)?;
-            let status = resp.status();
-            let retry_after = parse_retry_after(resp.headers());
-
-            // A non-2xx never has a stream body to read, whatever was
-            // requested — providers answer a rejected request with an
-            // ordinary JSON error document. Reading it whole keeps the
-            // parameter-correction path below identical in both modes.
-            if !status.is_success() {
-                let text = resp.text().await.map_err(map_reqwest_error)?;
-                if status.as_u16() == 400
-                    && retries_left > 0
-                    && adjust_for_unsupported_parameter(&mut body, &text)
-                {
-                    retries_left -= 1;
-                    continue;
-                }
-                return Err(classify_http_error(status.as_u16(), &text, retry_after));
-            }
-
-            let parsed = if request.stream {
-                read_stream(&mut resp).await?
-            } else {
-                let text = resp.text().await.map_err(map_reqwest_error)?;
-                serde_json::from_str(&text).map_err(|e| LlmError::Other {
-                    message: format!("invalid JSON response: {e}"),
-                })?
-            };
-            return parse_response_body(&parsed);
-        }
-    }
-}
-
-/// Drains a `text/event-stream` response body into the non-streaming
-/// response document it amounts to (see [`crate::stream`] for why the
-/// reassembly targets the JSON body rather than a `ChatResponse`).
-///
-/// The whole drain runs inside the deadline the caller already set on
-/// this request: `reqwest`'s per-request timeout is a TOTAL one, applied
-/// "from when the request starts connecting until the response body has
-/// finished" — so a stream that stalls halfway is bounded by exactly the
-/// same `ChatRequest::timeout` a non-streamed call is, with no separate
-/// idle timer to keep in sync.
-async fn read_stream(resp: &mut reqwest::Response) -> Result<Value, LlmError> {
-    let mut decoder = SseDecoder::new();
-    let mut assembler = StreamAssembler::default();
-    while let Some(chunk) = resp.chunk().await.map_err(map_reqwest_error)? {
-        for payload in decoder.push(&chunk) {
-            assembler.push(&payload)?;
-        }
-    }
-    // A final event whose terminating blank line never arrived — for
-    // this dialect that is the chunk carrying `finish_reason` and the
-    // usage totals, so dropping it would silently downgrade an ordinary
-    // response to "stop reason missing, zero tokens spent".
-    if let Some(payload) = decoder.finish() {
-        assembler.push(&payload)?;
-    }
-    Ok(assembler.finish())
-}
-
-/// Corrects `body` in place for a `400` whose text names one of three
-/// known self-correctable OpenAI request-shape rejections. Returns `true`
-/// (retry with the corrected body) when it recognized and applied one of
-/// these; `false` (the caller should give up and propagate the original
-/// error) for anything else — including a `body` that, despite the error
-/// text matching, doesn't actually have the key being corrected (nothing
-/// to fix, so nothing to gain by retrying):
-///
-/// - Swaps whichever of `max_tokens`/`max_completion_tokens` is currently
-///   present for the other (a model rejecting one always names
-///   `max_completion_tokens` somewhere in its error text, whichever
-///   direction the rejection runs). Mirrors `backends/oai.py::prompt`'s
-///   own retry-and-swap.
-/// - Clamps whichever of `max_tokens`/`max_completion_tokens` is present
-///   down to the model's own declared ceiling when OpenAI rejects the
-///   value as too large (`"...supports at most N completion tokens..."`).
-///   No Python precedent: this project's per-stage `max_tokens` defaults
-///   (`bc-config`'s `step_defaults`) were ported verbatim from the Python
-///   original, tuned for a larger-output backend (an AI gateway or Claude,
-///   per the architecture plan) — talking to OpenAI's API directly can
-///   request more than a given model actually allows. Parses the limit
-///   straight out of OpenAI's own error text rather than hardcoding a
-///   per-model table, so it tracks whatever the real API says today
-///   instead of going stale as OpenAI's limits change.
-/// - Drops `temperature` (reasoning-class models reject a non-default
-///   value entirely). Also mirrored from `backends/oai.py::prompt`.
-/// - Sets `reasoning_effort` to `"none"` (some reasoning-effort models
-///   reject function/tool calls on the classic chat-completions endpoint
-///   unless this is explicit) — a one-shot correction guarded by checking
-///   it isn't already `"none"`, since setting it can't help twice. No
-///   Python precedent: `reasoning_effort` doesn't exist anywhere in the
-///   Python original, which predates this model class; found live against
-///   a real OpenAI endpoint, not read out of `backends/oai.py`.
-fn adjust_for_unsupported_parameter(body: &mut Value, error_text: &str) -> bool {
-    let lower = error_text.to_ascii_lowercase();
-    let Some(map) = body.as_object_mut() else {
-        return false;
-    };
-    let max_tokens_swapped = lower.contains("max_completion_tokens")
-        && (swap_key(map, "max_completion_tokens", "max_tokens")
-            || swap_key(map, "max_tokens", "max_completion_tokens"));
-    if max_tokens_swapped || (lower.contains("temperature") && map.remove("temperature").is_some())
-    {
-        return true;
-    }
-    if parse_completion_token_limit(&lower).is_some_and(|limit| clamp_max_tokens_key(map, limit)) {
-        return true;
-    }
-    let already_none = map.get("reasoning_effort").and_then(Value::as_str) == Some("none");
-    if lower.contains("reasoning_effort") && !already_none {
-        map.insert(
-            "reasoning_effort".to_string(),
-            Value::String("none".to_string()),
-        );
-        return true;
-    }
-    false
-}
-
-/// Extracts `N` from an OpenAI rejection naming the model's actual
-/// completion-token ceiling (`"...supports at most N completion
-/// tokens..."`, case-insensitive — `error_text` is expected already
-/// lowercased). `None` for any text that doesn't contain this exact
-/// phrasing, including a `find` match with no digits following it.
-fn parse_completion_token_limit(lower_error_text: &str) -> Option<u64> {
-    let marker = "supports at most ";
-    let idx = lower_error_text.find(marker)?;
-    let rest = &lower_error_text[idx + marker.len()..];
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
-}
-
-/// Sets whichever of `max_completion_tokens`/`max_tokens` is present in
-/// `map` to `limit`, returning whether either key was found. `chat()`
-/// always sends exactly one of the two (`build_request_body`'s default,
-/// or whatever `swap_key` last left behind), so in practice at most one
-/// iteration ever matches.
-fn clamp_max_tokens_key(map: &mut serde_json::Map<String, Value>, limit: u64) -> bool {
-    for key in ["max_completion_tokens", "max_tokens"] {
-        if map.contains_key(key) {
-            map.insert(key.to_string(), Value::from(limit));
-            return true;
-        }
-    }
-    false
-}
-
-/// Moves `map[from]` to `map[to]` if present, returning whether it did.
-fn swap_key(map: &mut serde_json::Map<String, Value>, from: &str, to: &str) -> bool {
-    match map.remove(from) {
-        Some(v) => {
-            map.insert(to.to_string(), v);
-            true
-        }
-        None => false,
-    }
-}
-
-fn map_reqwest_error(e: reqwest::Error) -> LlmError {
-    if e.is_timeout() || e.is_connect() {
-        LlmError::ConnectionError {
-            message: e.to_string(),
-        }
-    } else {
-        LlmError::Other {
-            message: e.to_string(),
         }
     }
 }
@@ -575,11 +665,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(body_partial_json(json!({"max_completion_tokens": 100})))
+            .and(body_partial_json(json!({"max_completion_tokens": 64000})))
             .respond_with(ResponseTemplate::new(400).set_body_json(json!({
                 "error": {
-                    "message": "max_tokens is too large: 100. This model supports at \
-                        most 16384 completion tokens, whereas you provided 100.",
+                    "message": "max_tokens is too large: 64000. This model supports at \
+                        most 16384 completion tokens, whereas you provided 64000.",
                     "type": "invalid_request_error",
                     "param": "max_tokens",
                     "code": "invalid_value",
@@ -597,99 +687,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let resp = client_for(&server).chat(&request()).await.unwrap();
+        let mut req = request();
+        req.max_tokens = 64_000;
+        let resp = client_for(&server).chat(&req).await.unwrap();
         assert_eq!(resp.text(), "ok");
-    }
-
-    #[test]
-    fn parse_completion_token_limit_extracts_the_digits_after_the_marker() {
-        assert_eq!(
-            parse_completion_token_limit(
-                "this model supports at most 16384 completion tokens, whereas you provided 100."
-            ),
-            Some(16384)
-        );
-    }
-
-    #[test]
-    fn parse_completion_token_limit_is_none_without_the_marker_phrase() {
-        assert_eq!(
-            parse_completion_token_limit("rate limit exceeded, please slow down"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_completion_token_limit_is_none_when_no_digits_follow_the_marker() {
-        assert_eq!(
-            parse_completion_token_limit("this model supports at most a lot of tokens"),
-            None
-        );
-    }
-
-    #[test]
-    fn clamp_max_tokens_key_prefers_max_completion_tokens_when_both_are_absent_it_is_a_no_op() {
-        let mut body = json!({"model": "gpt-4o"});
-        let map = body.as_object_mut().unwrap();
-        assert!(!clamp_max_tokens_key(map, 16384));
-    }
-
-    #[test]
-    fn clamp_max_tokens_key_overwrites_the_legacy_max_tokens_key_when_present() {
-        let mut body = json!({"model": "gpt-4o", "max_tokens": 64000});
-        let map = body.as_object_mut().unwrap();
-        assert!(clamp_max_tokens_key(map, 16384));
-        assert_eq!(body["max_tokens"], 16384);
-    }
-
-    #[test]
-    fn adjust_for_unsupported_parameter_clamps_a_too_large_legacy_max_tokens_value() {
-        // Exercised directly (rather than only through the wiremock e2e
-        // test above, which covers the default `max_completion_tokens`
-        // key) so the legacy-key branch of `clamp_max_tokens_key` is
-        // reachable without needing `build_request_body` to ever produce
-        // that shape.
-        let mut body = json!({"model": "gpt-4o", "max_tokens": 64000});
-        let adjusted = adjust_for_unsupported_parameter(
-            &mut body,
-            "max_tokens is too large: 64000. This model supports at most 16384 \
-             completion tokens, whereas you provided 64000.",
-        );
-        assert!(adjusted);
-        assert_eq!(body["max_tokens"], 16384);
-    }
-
-    #[test]
-    fn adjust_for_unsupported_parameter_on_a_non_object_body_is_a_no_op() {
-        // `build_request_body` always produces a JSON object, so this
-        // shape is unreachable through the normal `chat()` path — a
-        // direct, whitebox test of the defensive fallback rather than
-        // something contrived through the public API.
-        let mut body = json!([1, 2, 3]);
-        assert!(!adjust_for_unsupported_parameter(
-            &mut body,
-            "max_completion_tokens is not supported"
-        ));
-        assert_eq!(body, json!([1, 2, 3]));
-    }
-
-    #[test]
-    fn a_model_requiring_max_completion_tokens_retries_when_max_tokens_was_sent() {
-        // Only reachable if some future caller builds a request whose body
-        // already carries the legacy `max_tokens` key instead of
-        // `build_request_body`'s own `max_completion_tokens` default —
-        // exercised directly against `adjust_for_unsupported_parameter`
-        // rather than contriving that through `build_request_body`, which
-        // has no way to produce this shape today.
-        let mut body = json!({"model": "o1", "messages": [], "max_tokens": 100});
-        let adjusted = adjust_for_unsupported_parameter(
-            &mut body,
-            "Unsupported parameter: 'max_tokens' is not supported with this model. \
-             Use 'max_completion_tokens' instead.",
-        );
-        assert!(adjusted);
-        assert_eq!(body["max_completion_tokens"], 100);
-        assert!(body.get("max_tokens").is_none());
     }
 
     #[tokio::test]
@@ -749,18 +750,6 @@ mod tests {
 
         let resp = client_for(&server).chat(&request()).await.unwrap();
         assert_eq!(resp.text(), "ok");
-    }
-
-    #[test]
-    fn adjust_for_unsupported_parameter_does_not_retry_when_reasoning_effort_is_already_none() {
-        // Guards against an infinite retry loop against a server that
-        // keeps rejecting on `reasoning_effort` for some other reason once
-        // it's already been set to the one value this correction offers.
-        let mut body = json!({"model": "x", "reasoning_effort": "none"});
-        assert!(!adjust_for_unsupported_parameter(
-            &mut body,
-            "reasoning_effort is not supported"
-        ));
     }
 
     #[tokio::test]
@@ -842,6 +831,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_responses_connection_failure_is_a_connection_error_and_never_a_fallback() {
+        let client = OpenAiClient::new(reqwest::Client::new(), "http://127.0.0.1:0", None)
+            .with_api(OpenAiApi::Auto);
+        let err = client.chat(&tool_request("gpt-5.1")).await.unwrap_err();
+        assert!(matches!(err, LlmError::ConnectionError { .. }), "{err:?}");
+        assert_eq!(
+            client.learned_models().transport("gpt-5.1"),
+            ModelTransport::Unknown
+        );
+    }
+
+    #[tokio::test]
     async fn a_send_error_that_is_neither_a_timeout_nor_a_connect_failure_is_other() {
         // A 308 redirecting to itself forever hits reqwest's default
         // max-redirects cap, producing a `send()`-level error that is
@@ -857,5 +858,567 @@ mod tests {
 
         let err = client_for(&server).chat(&request()).await.unwrap_err();
         assert!(matches!(err, LlmError::Other { .. }));
+    }
+
+    // ---- Responses API transport and learned fallback -----------------
+
+    fn auto_client(server: &MockServer) -> OpenAiClient {
+        client_for(server).with_api(OpenAiApi::Auto)
+    }
+
+    fn tool_request(model: &str) -> ChatRequest {
+        let mut req = ChatRequest::new(model, vec![Message::user_text("find the bug")], 1000);
+        req.tools.push(bc_llm_client::ToolSpec {
+            name: "Read".into(),
+            description: "read a file".into(),
+            parameters: json!({"type": "object"}),
+        });
+        req
+    }
+
+    fn responses_ok(text: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "status": "completed",
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        }))
+    }
+
+    fn chat_ok(text: &str) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+        }))
+    }
+
+    async fn mount(server: &MockServer, route: &str, reply: ResponseTemplate, times: u64) {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(reply)
+            .expect(times)
+            .mount(server)
+            .await;
+    }
+
+    #[test]
+    fn a_new_client_speaks_chat_completions_until_told_otherwise() {
+        let client = OpenAiClient::new(reqwest::Client::new(), "http://x", None);
+        assert_eq!(client.api(), OpenAiApi::Chat);
+        let shared = Arc::new(LearnedModels::new());
+        let client = client
+            .with_api(OpenAiApi::Auto)
+            .with_learned_models(shared.clone());
+        assert_eq!(client.api(), OpenAiApi::Auto);
+        assert!(Arc::ptr_eq(client.learned_models(), &shared));
+        assert_eq!(shared.responses_fallbacks(), 0);
+    }
+
+    /// The CLI default: `Auto` + gpt-5.6-luna + tools goes to the
+    /// Responses API first, stateless and asking for encrypted reasoning.
+    #[tokio::test]
+    async fn auto_with_gpt_5_6_luna_and_tools_hits_responses_first() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer test-key"))
+            .and(body_partial_json(json!({
+                "model": "gpt-5.6-luna",
+                "store": false,
+                "include": ["reasoning.encrypted_content"],
+            })))
+            .respond_with(responses_ok("found it"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount(&server, "/chat/completions", chat_ok("wrong"), 0).await;
+
+        let client = auto_client(&server);
+        let resp = client.chat(&tool_request("gpt-5.6-luna")).await.unwrap();
+        assert_eq!(resp.text(), "found it");
+        assert_eq!(
+            client.learned_models().transport("gpt-5.6-luna"),
+            ModelTransport::Proven
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_starts_a_non_reasoning_model_on_chat_completions() {
+        let server = MockServer::start().await;
+        mount(&server, "/responses", responses_ok("wrong"), 0).await;
+        mount(&server, "/chat/completions", chat_ok("chat"), 1).await;
+        let resp = auto_client(&server)
+            .chat(&tool_request("gpt-4o"))
+            .await
+            .unwrap();
+        assert_eq!(resp.text(), "chat");
+    }
+
+    /// A 404 from `/responses` falls back to Chat Completions, and the
+    /// second call goes straight there.
+    #[tokio::test]
+    async fn a_missing_responses_route_falls_back_and_is_remembered() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/responses",
+            ResponseTemplate::new(404).set_body_string("no such route"),
+            1,
+        )
+        .await;
+        mount(&server, "/chat/completions", chat_ok("via chat"), 2).await;
+
+        let client = auto_client(&server);
+        for _ in 0..2 {
+            let resp = client.chat(&tool_request("gpt-5.1")).await.unwrap();
+            assert_eq!(resp.text(), "via chat");
+        }
+        let learned = client.learned_models();
+        assert_eq!(learned.transport("gpt-5.1"), ModelTransport::ChatOnly);
+        assert_eq!(learned.responses_fallbacks(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_responses_parameter_or_a_non_responses_body_falls_back() {
+        for reply in [
+            ResponseTemplate::new(400).set_body_string("Unknown parameter: 'store'."),
+            ResponseTemplate::new(200).set_body_json(json!({"choices": []})),
+        ] {
+            let server = MockServer::start().await;
+            mount(&server, "/responses", reply, 1).await;
+            mount(&server, "/chat/completions", chat_ok("via chat"), 1).await;
+            let resp = auto_client(&server)
+                .chat(&tool_request("gpt-5.1"))
+                .await
+                .unwrap();
+            assert_eq!(resp.text(), "via chat");
+        }
+    }
+
+    /// A transient failure says nothing about the endpoint's shape and
+    /// must reach the retry layer unchanged.
+    #[tokio::test]
+    async fn rate_limits_server_errors_and_bad_bodies_never_fall_back() {
+        let cases = [
+            (
+                ResponseTemplate::new(429).set_body_string("slow down"),
+                "RateLimited",
+            ),
+            (
+                ResponseTemplate::new(500).set_body_string("boom"),
+                "ServerError",
+            ),
+            (
+                ResponseTemplate::new(200).set_body_string("not json"),
+                "Other",
+            ),
+        ];
+        for (reply, kind) in cases {
+            let server = MockServer::start().await;
+            mount(&server, "/responses", reply, 1).await;
+            mount(&server, "/chat/completions", chat_ok("wrong"), 0).await;
+            let client = auto_client(&server);
+            let err = client.chat(&tool_request("gpt-5.1")).await.unwrap_err();
+            assert!(format!("{err:?}").starts_with(kind), "{err:?}");
+            assert_eq!(
+                client.learned_models().transport("gpt-5.1"),
+                ModelTransport::Unknown
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn when_both_transports_fail_the_model_is_unlearned_and_the_original_error_returned() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/responses",
+            ResponseTemplate::new(404).set_body_string("responses route missing"),
+            1,
+        )
+        .await;
+        mount(
+            &server,
+            "/chat/completions",
+            ResponseTemplate::new(500).set_body_string("chat down"),
+            1,
+        )
+        .await;
+        let client = auto_client(&server);
+        let err = client.chat(&tool_request("gpt-5.1")).await.unwrap_err();
+        assert_eq!(
+            err,
+            LlmError::InvalidRequest {
+                message: "responses route missing".into()
+            }
+        );
+        assert_eq!(
+            client.learned_models().transport("gpt-5.1"),
+            ModelTransport::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_transport_never_falls_back() {
+        // Client-level pin.
+        let server = MockServer::start().await;
+        mount(&server, "/responses", ResponseTemplate::new(404), 2).await;
+        mount(&server, "/chat/completions", chat_ok("wrong"), 0).await;
+        let client = client_for(&server).with_api(OpenAiApi::Responses);
+        assert!(client.chat(&tool_request("gpt-5.1")).await.is_err());
+        // Per-request pin on an Auto client.
+        let auto = auto_client(&server);
+        let mut req = tool_request("gpt-5.1");
+        req.openai_api = Some(OpenAiApi::Responses);
+        assert!(auto.chat(&req).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_per_request_chat_pin_beats_an_auto_client() {
+        let server = MockServer::start().await;
+        mount(&server, "/responses", responses_ok("wrong"), 0).await;
+        mount(&server, "/chat/completions", chat_ok("chat"), 1).await;
+        let mut req = tool_request("gpt-5.6-luna");
+        req.openai_api = Some(OpenAiApi::Chat);
+        assert_eq!(
+            auto_client(&server).chat(&req).await.unwrap().text(),
+            "chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proven_model_does_not_fall_back_on_a_body_without_output() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(responses_ok("first"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"odd": true})))
+            .mount(&server)
+            .await;
+        mount(&server, "/chat/completions", chat_ok("wrong"), 0).await;
+        let client = auto_client(&server);
+        client.chat(&tool_request("gpt-5.1")).await.unwrap();
+        let err = client.chat(&tool_request("gpt-5.1")).await.unwrap_err();
+        assert!(
+            matches!(&err, LlmError::Other { message } if message.contains("output")),
+            "{err:?}"
+        );
+    }
+
+    /// A reasoning model behind a gateway alias starts on Chat
+    /// Completions; its "use /v1/responses" rejection moves it over.
+    #[tokio::test]
+    async fn chat_pointing_at_responses_moves_an_auto_model_over_for_good() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/chat/completions",
+            ResponseTemplate::new(400).set_body_string(
+                "Function tools with reasoning_effort are not supported for my-alias in \
+                 /v1/chat/completions. To use function tools, use /v1/responses.",
+            ),
+            1,
+        )
+        .await;
+        mount(&server, "/responses", responses_ok("moved"), 2).await;
+        let client = auto_client(&server);
+        for _ in 0..2 {
+            let resp = client.chat(&tool_request("my-alias")).await.unwrap();
+            assert_eq!(resp.text(), "moved");
+        }
+        assert_eq!(
+            client.learned_models().transport("my-alias"),
+            ModelTransport::Proven
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_move_to_responses_restores_the_state_and_returns_the_chat_error() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/chat/completions",
+            ResponseTemplate::new(400).set_body_string("use /v1/responses"),
+            1,
+        )
+        .await;
+        mount(&server, "/responses", ResponseTemplate::new(503), 1).await;
+        let client = auto_client(&server);
+        let err = client.chat(&tool_request("my-alias")).await.unwrap_err();
+        assert_eq!(
+            err,
+            LlmError::InvalidRequest {
+                message: "use /v1/responses".into()
+            }
+        );
+        assert_eq!(
+            client.learned_models().transport("my-alias"),
+            ModelTransport::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_move_keeps_a_chat_only_model_chat_only() {
+        let server = MockServer::start().await;
+        // Learn chat-only first.
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(chat_ok("chat"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("use /v1/responses"))
+            .mount(&server)
+            .await;
+        let client = auto_client(&server);
+        client.chat(&tool_request("gpt-5.1")).await.unwrap();
+        assert_eq!(
+            client.learned_models().transport("gpt-5.1"),
+            ModelTransport::ChatOnly
+        );
+        assert!(client.chat(&tool_request("gpt-5.1")).await.is_err());
+        assert_eq!(
+            client.learned_models().transport("gpt-5.1"),
+            ModelTransport::ChatOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_responses_call_reads_the_terminal_event() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"stream": true})))
+            .respond_with(sse(&[
+                r#"{"type":"response.created","response":{}}"#,
+                r#"{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"streamed"}]}],"usage":{"input_tokens":3,"output_tokens":1}}}"#,
+            ]))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(&server).with_api(OpenAiApi::Responses);
+        let mut req = tool_request("gpt-5.1");
+        req.stream = true;
+        let resp = client.chat(&req).await.unwrap();
+        assert_eq!(resp.text(), "streamed");
+        assert_eq!(resp.usage.input_tokens, 3);
+        let sent: serde_json::Value = server.received_requests().await.unwrap()[0]
+            .body_json()
+            .unwrap();
+        assert!(sent.get("stream_options").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_responses_shape_gets_same_call_corrections_too() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(body_partial_json(json!({"temperature": 0.3})))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "Unsupported parameter: 'temperature' is not supported with this model.",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount(&server, "/responses", responses_ok("ok"), 2).await;
+        let client = client_for(&server).with_api(OpenAiApi::Responses);
+        let mut req = tool_request("my-reasoning-alias");
+        req.temperature = Some(0.3);
+        for _ in 0..2 {
+            assert_eq!(client.chat(&req).await.unwrap().text(), "ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unrecognized_responses_400_is_returned_as_is() {
+        let server = MockServer::start().await;
+        mount(
+            &server,
+            "/responses",
+            ResponseTemplate::new(400).set_body_string("bad tool schema"),
+            1,
+        )
+        .await;
+        let client = client_for(&server).with_api(OpenAiApi::Responses);
+        let err = client.chat(&tool_request("gpt-5.1")).await.unwrap_err();
+        assert_eq!(
+            err,
+            LlmError::InvalidRequest {
+                message: "bad tool schema".into()
+            }
+        );
+    }
+
+    /// A learned rejection is paid for once: the failing mock is hit
+    /// exactly once across two calls.
+    #[tokio::test]
+    async fn a_learned_temperature_rejection_is_not_paid_twice() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({"temperature": 0.2})))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("unsupported value: 'temperature'"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount(&server, "/chat/completions", chat_ok("ok"), 2).await;
+        let client = client_for(&server);
+        let mut req = request();
+        req.temperature = Some(0.2);
+        for _ in 0..2 {
+            assert_eq!(client.chat(&req).await.unwrap().text(), "ok");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rejected_prompt_cache_key_is_dropped_and_remembered() {
+        let server = MockServer::start().await;
+        let mut req = ChatRequest::new("gpt-4o", vec![Message::user_text("x".repeat(6_000))], 100);
+        req.cache_key = Some("s4:repo".into());
+        let key = crate::cache_key::prompt_cache_key(&req).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({"prompt_cache_key": key})))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string("Unrecognized request argument supplied: prompt_cache_key"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount(&server, "/chat/completions", chat_ok("ok"), 2).await;
+        let client = client_for(&server);
+        for _ in 0..2 {
+            assert_eq!(client.chat(&req).await.unwrap().text(), "ok");
+        }
+    }
+
+    struct OneFile;
+
+    impl bc_llm_client::ToolExecutor for OneFile {
+        fn available_tools(&self) -> Vec<bc_llm_client::ToolSpec> {
+            vec![bc_llm_client::ToolSpec {
+                name: "Read".into(),
+                description: "read a file".into(),
+                parameters: json!({"type": "object"}),
+            }]
+        }
+
+        fn execute(&self, _name: &str, _args: &serde_json::Value) -> String {
+            "fn main() {}".into()
+        }
+    }
+
+    /// End to end through `run_agentic`: the second request carries the
+    /// first turn's reasoning item, then its function call, then the
+    /// tool's output, in that order.
+    #[tokio::test]
+    async fn a_two_turn_agentic_run_replays_reasoning_before_its_function_call() {
+        let reasoning = json!({
+            "type": "reasoning", "id": "rs_1", "summary": [],
+            "encrypted_content": "gAAAA-ciphertext",
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "completed",
+                "output": [
+                    reasoning,
+                    {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                     "name": "Read", "arguments": "{\"path\":\"main.rs\"}"},
+                ],
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount(&server, "/responses", responses_ok("no bug"), 1).await;
+
+        let client = auto_client(&server);
+        let mut config = bc_llm_agentic::AgenticConfig::new("gpt-5.6-luna");
+        config.allowed_tools = vec!["Read".into()];
+        config.retry_backoff_base = std::time::Duration::ZERO;
+        let outcome = bc_llm_agentic::run_agentic(&client, &OneFile, "find the bug", &config)
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_text, "no bug");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let second: serde_json::Value = requests[1].body_json().unwrap();
+        assert_eq!(
+            second["input"],
+            json!([
+                {"role": "user", "content": "find the bug"},
+                reasoning,
+                {"type": "function_call", "call_id": "call_1", "name": "Read",
+                 "arguments": "{\"path\":\"main.rs\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "fn main() {}"},
+            ])
+        );
+    }
+
+    /// The cost of one cached call against one uncached call, computed
+    /// from a real usage document through the whole pricing path, at the
+    /// vendored gpt-5.6-luna rates.
+    #[test]
+    fn cached_and_uncached_calls_are_priced_at_their_own_rates() {
+        let uncached = chat::response::parse_response_body(&json!({
+            "choices": [{"message": {"content": "x"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100_000, "completion_tokens": 1_000,
+                      "prompt_tokens_details": {"cached_tokens": 0}},
+        }))
+        .unwrap()
+        .usage;
+        let cached = responses::response::parse_response_body(&json!({
+            "output": [],
+            "usage": {"input_tokens": 100_000, "output_tokens": 1_000,
+                      "input_tokens_details": {"cached_tokens": 90_000}},
+        }))
+        .unwrap()
+        .usage;
+        let pricer = bc_pricing::Pricer::vendored();
+        let price = |u: bc_llm_client::Usage| {
+            let call = bc_pricing::Call::from_usage(
+                u.input_tokens,
+                u.output_tokens,
+                u.cache_read_input_tokens,
+                u.cache_creation_input_tokens,
+            );
+            let cost = pricer.price_call("openai", "gpt-5.6-luna", &call).unwrap();
+            assert_eq!(cost.unrated_tokens, 0);
+            cost.total()
+        };
+        let rates = pricer
+            .resolve("openai", "gpt-5.6-luna")
+            .unwrap()
+            .price
+            .clone();
+        let input = u128::from(rates.input);
+        let output = u128::from(rates.output);
+        let read = u128::from(rates.cache_read.unwrap());
+        assert!(read < input, "the cached-input rate is a discount");
+        assert_eq!(
+            price(uncached),
+            bc_pricing::Money::from_picodollars(100_000 * input + 1_000 * output)
+        );
+        assert_eq!(
+            price(cached),
+            bc_pricing::Money::from_picodollars(10_000 * input + 90_000 * read + 1_000 * output)
+        );
     }
 }

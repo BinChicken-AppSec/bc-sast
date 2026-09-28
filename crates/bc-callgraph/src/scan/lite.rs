@@ -744,7 +744,7 @@ fn c_fn_name(node: Node, src: &[u8]) -> String {
 /// identifier (see `rules::BARE_CALL_RX`), so the brackets are written
 /// out as a word. It is deliberately NOT `new`, `new_array` or
 /// `array_new`: those are all names a C or C++ program could plausibly
-/// give a function of its own, and a synthesised allocator colliding
+/// give a function of its own, and a synthesized allocator colliding
 /// with a real function would attribute one program's calls to another
 /// language's operator. `operator_new_array` collides with nothing —
 /// `operator` is a keyword in C++, so no C++ identifier can begin with
@@ -825,7 +825,7 @@ fn c_new_array_length<'a>(node: Node<'a>) -> Option<Node<'a>> {
 ///
 /// A `call_expression` hands over its `arguments` list. An array `new
 /// T[n]` has no argument list — `new int[n * m]()` carries one, but it
-/// holds the value-initialiser's arguments and never the size — so its
+/// holds the value-initializer's arguments and never the size — so its
 /// size expression is read as argument 0 instead. That is what lets the
 /// SAME corpus predicate (`requires_arithmetic_arg` at index 0) cover
 /// `malloc(n * m)` and `new T[n * m]` without knowing they are
@@ -837,7 +837,7 @@ fn c_arguments<'a>(node: Node<'a>) -> Vec<Node<'a>> {
     }
 }
 
-/// [`field_arg_count`] with array-new's synthesised size argument
+/// [`field_arg_count`] with array-new's synthesized size argument
 /// counted, so the one argument [`c_arguments`] reports is the one a
 /// `requires_any_arg` rule sees.
 fn c_arg_count(node: Node) -> Option<usize> {
@@ -1313,7 +1313,7 @@ mod tests {
                 // the `type` field, never where the size lives.
                 ("operator_new_array", vec![true], Some(1)),
                 // `new T[n]()` DOES carry an `arguments` list, but it
-                // holds the value-initialiser's arguments — the size is
+                // holds the value-initializer's arguments — the size is
                 // still the declarator's length.
                 ("operator_new_array", vec![true], Some(1)),
             ]

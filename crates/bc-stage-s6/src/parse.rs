@@ -130,11 +130,11 @@ mod tests {
 
     #[test]
     fn parse_verdict_false_positive() {
-        let raw = format!("Analysis body.\nVERDICT: FALSE_POSITIVE (confidence: 8/10) — upstream allow-list neutralises input\nCVSS: {GOOD_CVSS}\n");
+        let raw = format!("Analysis body.\nVERDICT: FALSE_POSITIVE (confidence: 8/10) — upstream allow-list neutralizes input\nCVSS: {GOOD_CVSS}\n");
         let p = parse_verdict(&raw);
         assert_eq!(p.verdict, Verdict::FalsePositive);
         assert_eq!(p.confidence, 8);
-        assert_eq!(p.reason, "upstream allow-list neutralises input");
+        assert_eq!(p.reason, "upstream allow-list neutralizes input");
         assert_eq!(p.cvss.as_deref(), Some(GOOD_CVSS));
     }
 

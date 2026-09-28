@@ -223,6 +223,48 @@ impl CheckpointStore for SqliteCheckpointStore {
         con.execute("DELETE FROM checkpoints WHERE run_id = ?1", params![run_id])
             .unwrap_or(0)
     }
+
+    fn prune_stale(&self, run_id: &str, prefix: &str, live_keys: &[String]) -> Vec<String> {
+        self.try_prune_stale(run_id, prefix, live_keys)
+            .unwrap_or_default()
+    }
+}
+
+impl SqliteCheckpointStore {
+    /// [`CheckpointStore::prune_stale`] with its errors visible, so the
+    /// trait method can stay best effort while every failure path is still
+    /// a plain `?`. The prefix is compared with `substr`, not `LIKE`, so
+    /// the `_` in `remediate_` is a literal rather than a wildcard.
+    fn try_prune_stale(
+        &self,
+        run_id: &str,
+        prefix: &str,
+        live_keys: &[String],
+    ) -> Result<Vec<String>, CheckpointError> {
+        let mut con = self.connect()?;
+        let tx = con.transaction()?;
+        let stale: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT step FROM checkpoints \
+                 WHERE run_id = ?1 AND substr(step, 1, length(?2)) = ?2 ORDER BY step",
+            )?;
+            let steps = stmt
+                .query_map(params![run_id, prefix], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            steps
+                .into_iter()
+                .filter(|step| !live_keys.contains(step))
+                .collect()
+        };
+        for step in &stale {
+            tx.execute(
+                "DELETE FROM checkpoints WHERE run_id = ?1 AND step = ?2",
+                params![run_id, step],
+            )?;
+        }
+        tx.commit()?;
+        Ok(stale)
+    }
 }
 
 /// What one `prune` call (age/count-based `gc`) did or would do —
@@ -689,6 +731,46 @@ mod tests {
         let (dir, store) = store();
         std::fs::remove_file(dir.path().join("state.db")).unwrap();
         assert_eq!(store.load("run1", "s1"), None);
+    }
+
+    #[test]
+    fn prune_stale_removes_only_unclaimed_rows_under_the_prefix() {
+        let (_dir, store) = store();
+        for step in [
+            "remediate_aaa",
+            "remediate_bbb",
+            "remediateXccc",
+            "validate_ddd",
+            "s1",
+        ] {
+            store.save("run1", step, b"x").unwrap();
+        }
+        store.save("run2", "remediate_zzz", b"x").unwrap();
+        let removed = store.prune_stale("run1", "remediate_", &["remediate_bbb".to_string()]);
+        assert_eq!(removed, vec!["remediate_aaa".to_string()]);
+        assert_eq!(store.load("run1", "remediate_aaa"), None);
+        // `_` is literal: `remediateXccc` does not share the prefix.
+        for kept in ["remediate_bbb", "remediateXccc", "validate_ddd", "s1"] {
+            assert!(store.load("run1", kept).is_some(), "{kept}");
+        }
+        assert!(store.load("run2", "remediate_zzz").is_some());
+    }
+
+    #[test]
+    fn prune_stale_degrades_to_nothing_when_the_state_dir_is_gone() {
+        let (dir, store) = store();
+        std::fs::remove_dir_all(dir.path()).unwrap();
+        assert!(store.prune_stale("run1", "remediate_", &[]).is_empty());
+    }
+
+    #[test]
+    fn prune_stale_degrades_to_nothing_when_the_table_is_unusable() {
+        let (dir, store) = store();
+        Connection::open(dir.path().join("state.db"))
+            .unwrap()
+            .execute_batch("DROP TABLE checkpoints;")
+            .unwrap();
+        assert!(store.prune_stale("run1", "remediate_", &[]).is_empty());
     }
 
     #[test]

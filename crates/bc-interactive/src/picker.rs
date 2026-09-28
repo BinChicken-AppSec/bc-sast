@@ -77,7 +77,13 @@ fn build_rows(ctx: &RemediationContext<'_>, findings: &[PickerFinding]) -> Vec<R
             severity: severity_label(pf.finding.severity).to_string(),
             title: pf.finding.finding.title.clone(),
             file: pf.finding.finding.file.clone(),
-            done: checkpoint_done(ctx.checkpoint, ctx.run_id, pf.finding_index, &pf.finding),
+            done: checkpoint_done(
+                ctx.checkpoint,
+                ctx.run_id,
+                ctx.config,
+                pf.finding_index,
+                &pf.finding,
+            ),
         })
         .collect()
 }

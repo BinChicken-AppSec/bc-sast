@@ -36,6 +36,7 @@
 //! constructed default is the same leniency `bc-config`'s own coercion
 //! layer already applies elsewhere.
 
+use bc_llm_client::{OpenAiApi, ReasoningEffort};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -61,8 +62,9 @@ fn set<T: DeserializeOwned>(section: &Value, key: &str, target: &mut T) {
     }
 }
 
-/// One resolved `models.<role>` entry: the model id plus the three
-/// sampling knobs Python resolves per role in `backends/llm.py::resolve`.
+/// One resolved `models.<role>` entry: the model id, the three sampling
+/// knobs Python resolves per role in `backends/llm.py::resolve`, and the
+/// role's reasoning `effort` and `use_responses_api` transport pin.
 ///
 /// Every field is independently optional — a config may set
 /// `models.deepdive.temperature` without an `id`, and a role that isn't
@@ -77,6 +79,12 @@ pub(crate) struct ModelRole {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub seed: Option<u64>,
+    /// `models.<role>.effort`. An unparseable value reads as unset here;
+    /// [`validate_model_roles`] has already failed the run on one.
+    pub effort: Option<ReasoningEffort>,
+    /// `models.<role>.use_responses_api`: `true` pins the Responses API,
+    /// `false` Chat Completions, for this role only.
+    pub use_responses_api: Option<bool>,
 }
 
 impl ModelRole {
@@ -89,7 +97,65 @@ impl ModelRole {
             temperature: get(section, "temperature"),
             top_p: get(section, "top_p"),
             seed: get(section, "seed"),
+            effort: get::<String>(section, "effort").and_then(|s| s.parse().ok()),
+            use_responses_api: get(section, "use_responses_api"),
         }
+    }
+
+    /// The role's transport pin, in the shape a `ChatRequest` carries.
+    pub(crate) fn openai_api(&self) -> Option<OpenAiApi> {
+        self.use_responses_api
+            .map(OpenAiApi::from_use_responses_api)
+    }
+}
+
+/// Fails the run on a `models.<role>.effort` that names no tier, or a
+/// `models.<role>.use_responses_api` that is not a boolean, anywhere under
+/// `models` (one level of nesting deep, for `models.validate.<persona>`),
+/// and on a `step_validate.effort` that names no tier.
+///
+/// Stricter than the rest of this module, which leaves a wrong-typed
+/// field at its default: a typo'd effort (`hihg`) would otherwise run
+/// every call of that role at the provider's default effort without a
+/// word, which is the silent failure the Python original's lenient
+/// `EffortLevel.parse` is known for. A `null` is accepted as "unset".
+pub(crate) fn validate_model_roles(data: &Value) -> Result<(), String> {
+    let mut roles: Vec<(String, &Value)> = Vec::new();
+    if let Some(models) = data.get("models").and_then(Value::as_object) {
+        for (name, section) in models {
+            roles.push((format!("models.{name}"), section));
+            if let Some(nested) = section.as_object() {
+                for (inner, value) in nested.iter().filter(|(_, v)| v.is_object()) {
+                    roles.push((format!("models.{name}.{inner}"), value));
+                }
+            }
+        }
+    }
+    for (path, section) in roles {
+        check_effort(section.get("effort"), &format!("{path}.effort"))?;
+        match section.get("use_responses_api") {
+            None | Some(Value::Null) | Some(Value::Bool(_)) => {}
+            Some(other) => {
+                return Err(format!(
+                    "{path}.use_responses_api must be true or false, not {other}"
+                ))
+            }
+        }
+    }
+    check_effort(
+        data.get("step_validate").and_then(|s| s.get("effort")),
+        "step_validate.effort",
+    )
+}
+
+fn check_effort(value: Option<&Value>, path: &str) -> Result<(), String> {
+    match value {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(s)) => s
+            .parse::<ReasoningEffort>()
+            .map(|_| ())
+            .map_err(|e| format!("{path}: {e}")),
+        Some(other) => Err(format!("{path} must be a string tier, not {other}")),
     }
 }
 
@@ -152,7 +218,8 @@ fn nested_model_role(data: &Value, parent_role: &str, persona: &str) -> Option<S
         .map(str::to_string)
 }
 
-/// The global `--temperature`/`--top-p`/`--seed`/`--step-timeout` flags.
+/// The global `--temperature`/`--top-p`/`--seed`/`--reasoning-effort`/
+/// `--step-timeout` flags.
 ///
 /// Sampling flags are a BASE: a per-role `models.<role>.temperature` in
 /// the config file wins over them, matching how a profile is meant to be
@@ -166,17 +233,26 @@ pub struct GlobalSampling {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub seed: Option<u64>,
+    /// `--reasoning-effort`, a BASE like the sampling flags.
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub step_timeout_secs: Option<u64>,
 }
 
 /// Applies one role's sampling knobs (config) beneath the global flags
-/// (CLI) onto a stage's own three fields — see [`GlobalSampling`] for
-/// which side wins.
+/// (CLI) onto a stage's own fields; see [`GlobalSampling`] for which
+/// side wins. Effort and the transport pin fall back to whatever the
+/// stage config already holds, which is `None` everywhere except S11
+/// (its `high` default, or `step_validate.effort`).
 macro_rules! apply_sampling {
     ($cfg:expr, $role:expr, $global:expr) => {{
         $cfg.temperature = $role.temperature.or($global.temperature);
         $cfg.top_p = $role.top_p.or($global.top_p);
         $cfg.seed = $role.seed.or($global.seed);
+        $cfg.reasoning_effort = $role
+            .effort
+            .or($global.reasoning_effort)
+            .or($cfg.reasoning_effort);
+        $cfg.openai_api = $role.openai_api().or($cfg.openai_api);
         if let Some(secs) = $global.step_timeout_secs {
             $cfg.timeout_secs = Some(secs);
         }
@@ -282,6 +358,23 @@ fn apply_step0(cfg: &mut Step0Config, section: &Value, model: &str) {
 /// field doc comments. Python's `failure_mode` has no counterpart here
 /// (this port only implements the `empty` behavior; see
 /// `bc_stage_s0::llm_detect`'s module doc comment).
+/// S0's per-call fan-out cap: `step0.call_graph_max_targets`, falling
+/// back to `step1.call_graph_max_targets` so both stages share one cap when
+/// only S1's is configured (upstream v1.3 `callgraph_engine.run`). A zero
+/// or non-numeric value falls through, as upstream's `or` chain does.
+/// Before this, S0 read neither key and always ran the built-in 3.
+fn step0_call_graph_max_targets(data: &Value) -> Option<usize> {
+    let read = |stage: &str| {
+        data.get(stage)
+            .and_then(|s| s.get("call_graph_max_targets"))
+            .and_then(Value::as_u64)
+            .filter(|&n| n > 0)
+    };
+    read("step0")
+        .or_else(|| read("step1"))
+        .and_then(|n| usize::try_from(n).ok())
+}
+
 fn apply_step0_llm(cfg: &mut bc_stage_s0::Step0LlmConfig, section: &Value) {
     set(section, "max_tokens", &mut cfg.max_tokens);
     set(section, "max_candidates", &mut cfg.max_candidates);
@@ -411,6 +504,42 @@ fn apply_step2(cfg: &mut Step2Config, section: &Value) {
         "max_prompt_entry_points",
         &mut cfg.max_entry_points,
     );
+    // v1.4.0 evidence, cap and agentic keys. `0` is a legitimate value for
+    // every cap here (e.g. `max_config_rep_chars: 0` is path-only); a
+    // negative or non-numeric value fails to deserialize and keeps the
+    // default, matching upstream `_cap_int`. `allowed_tools` is validated
+    // against Read/Glob/Grep by the stage itself, which fails closed.
+    set(
+        section,
+        "max_config_rep_chars",
+        &mut cfg.max_config_rep_chars,
+    );
+    set(
+        section,
+        "max_config_rep_bodies",
+        &mut cfg.max_config_rep_bodies,
+    );
+    set(section, "max_manifest_depth", &mut cfg.max_manifest_depth);
+    set(section, "max_manifests", &mut cfg.max_manifests);
+    set(
+        section,
+        "max_manifests_per_kind",
+        &mut cfg.max_manifests_per_kind,
+    );
+    set(
+        section,
+        "max_manifest_total_chars",
+        &mut cfg.max_manifest_total_chars,
+    );
+    set(section, "max_assets", &mut cfg.max_assets);
+    set(
+        section,
+        "max_trust_boundaries",
+        &mut cfg.max_trust_boundaries,
+    );
+    set(section, "agentic", &mut cfg.agentic);
+    set(section, "allowed_tools", &mut cfg.allowed_tools);
+    set(section, "max_turns", &mut cfg.max_turns);
 }
 
 fn apply_step3(cfg: &mut Step3Config, section: &Value) {
@@ -464,6 +593,30 @@ fn apply_step3(cfg: &mut Step3Config, section: &Value) {
         "threat_fallback_max_files",
         &mut cfg.threat_fallback_max_files,
     );
+    // ── C2 coverage/decomposition keys (upstream v1.3/v1.4) ──
+    set(
+        section,
+        "catchall_deduct_lens_coverage",
+        &mut cfg.catchall_deduct_lens_coverage,
+    );
+    set(section, "max_cohesion_groups", &mut cfg.max_cohesion_groups);
+    set(
+        section,
+        "max_threat_fallback_chunks",
+        &mut cfg.max_threat_fallback_chunks,
+    );
+    set(section, "max_prompt_threats", &mut cfg.max_prompt_threats);
+    set(section, "max_prompt_assets", &mut cfg.max_prompt_assets);
+    set(
+        section,
+        "max_prompt_boundaries",
+        &mut cfg.max_prompt_boundaries,
+    );
+    set(
+        section,
+        "max_prompt_threat_context_chars",
+        &mut cfg.max_prompt_threat_context_chars,
+    );
 }
 
 fn apply_step4(cfg: &mut Step4Config, section: &Value) {
@@ -496,6 +649,7 @@ fn apply_step4(cfg: &mut Step4Config, section: &Value) {
         "frontier_max_funcs_per_file",
         &mut cfg.frontier_max_funcs_per_file,
     );
+    set(section, "shard_cache_gating", &mut cfg.shard_cache_gating);
     // NOT `taint_chunk_slice`: that key spans two sections and is
     // resolved by `step4_taint_chunk_slice` against the whole tree.
 }
@@ -533,13 +687,13 @@ fn apply_step5(cfg: &mut Step5Config, section: &Value) {
     // `step7_dedup` section (`s5_prefilter.py:219`, `getattr(s7d,
     // "pre_verify_threshold", 25)`), which is where
     // `apply_pre_verify_threshold` looks. A `step5_prefilter` spelling is
-    // still honoured, with a warning, so an existing config keeps working.
+    // still honored, with a warning, so an existing config keeps working.
 }
 
 /// `pre_verify_threshold`, from `step7_dedup` (Python's actual location,
 /// `s5_prefilter.py:219`) with a deprecated `step5_prefilter` fallback.
 ///
-/// The key controls an S5 behaviour but lives in S7's section because the
+/// The key controls an S5 behavior but lives in S7's section because the
 /// pass it gates IS S7's semantic dedup, run early. This port read it
 /// under `step5_prefilter` — the intuitive place, and the wrong one: a
 /// config written against Python set it under `step7_dedup` and got the
@@ -578,6 +732,7 @@ fn apply_step6(cfg: &mut Step6Config, section: &Value) {
         &mut cfg.max_transient_retries,
     );
     set(section, "max_context_shrinks", &mut cfg.max_context_shrinks);
+    set(section, "progress_file", &mut cfg.progress_file);
 }
 
 fn apply_step7(cfg: &mut Step7Config, section: &Value) {
@@ -677,7 +832,7 @@ pub fn apply_step10_overrides(
     global: GlobalSampling,
 ) {
     let role = model_role(data, "remediate");
-    if let Some(m) = role.id {
+    if let Some(m) = role.id.clone() {
         cfg.model = m;
     }
     apply_sampling!(cfg, role, global);
@@ -777,8 +932,20 @@ pub fn apply_step11_overrides(
     global: GlobalSampling,
 ) {
     let role = validate_role(data);
-    if let Some(m) = role.id {
+    if let Some(m) = role.id.clone() {
         cfg.model = m;
+    }
+    // Before `apply_sampling!`, which layers the flag and the role over
+    // it: `step_validate.effort` is S11's own default tier (Python's
+    // `DEFAULT_EFFORT`, shipped `high`), not a per-role override, so the
+    // global flag wins over it the way `--step-timeout` wins over a
+    // `stepN.timeout`.
+    if let Some(effort) = data
+        .get("step_validate")
+        .and_then(|s| get::<String>(s, "effort"))
+        .and_then(|s| s.parse().ok())
+    {
+        cfg.reasoning_effort = Some(effort);
     }
     apply_sampling!(cfg, role, global);
     cfg.security_architect_model = nested_model_role(data, "validate", "security_architect")
@@ -806,17 +973,24 @@ pub fn apply_step11_overrides(
         // this stays a single key even for an operator who also set an
         // explicit `allowed_tools`.
         set(section, "fact_tools", &mut cfg.fact_tools);
+        // Net-new versus Python, which flags every tie. `true` (the
+        // default, see `bc_config::step_defaults`) keeps this port's
+        // scoring of a one-step tie as SPLIT.
+        set(section, "split_ties_score", &mut cfg.split_ties_score);
     }
 }
 
 /// `step_validate.enabled`'s value, matching Python's own
 /// `cfg.step_validate.enabled` toggle — mirrors [`step2_enabled_override`].
 /// The baked-in default this overrides (see `build_remediate_settings`) is
-/// `true`, matching the shipped `default.yaml` profile ("s11 validator —
-/// ON by default, mirrors step_remediate"), not the bare
-/// `bc_config::step_defaults()` base value (`false` there, since Python's
-/// own un-profiled `_STEP_DEFAULTS` ships validation off until a profile
-/// turns it on).
+/// `true`: S11 runs whenever `--remediate` does. That is a deliberate
+/// divergence from vvaharness v1.4.0, whose `default.yaml` turned S11
+/// OFF (it was ON through v1.2.0): in this port S11's `Not Fixed`/
+/// `UNVERIFIABLE` grade is what drives the rollback of a bad patch
+/// (`bc_orchestrator::revert_if_validation_failed`), so switching it off
+/// by default would silently keep patches nobody checked. See
+/// docs/validation.md. The bare `bc_config::step_defaults()` value stays
+/// `false`, which is why `user_provided` (not the merged tree) is read.
 pub fn step_validate_enabled_override(data: &Value) -> Option<bool> {
     get(data.get("step_validate")?, "enabled")
 }
@@ -940,6 +1114,10 @@ pub fn apply_overrides(config: &mut ScanConfig, data: &Value, global: GlobalSamp
     if let Some(section) = data.get("step1") {
         apply_step1(&mut config.step1, section);
     }
+    // ── C2: S0's call-target fan-out cap (upstream v1.3) ──
+    if let Some(n) = step0_call_graph_max_targets(data) {
+        config.step0.call_graph_max_targets = n;
+    }
     if let Some(section) = data.get("step2") {
         apply_step2(&mut config.step2, section);
     }
@@ -1031,6 +1209,19 @@ pub fn llm_stream_large_responses_override(data: &Value) -> Option<bool> {
     get(data.get("llm")?, "stream_large_responses")
 }
 
+/// `scan_progress.enabled` / `scan_progress.style`: the config half of
+/// the text progress lines (see `crate::progress_lines::resolve`, which
+/// layers `BC_SCAN_PROGRESS_ENABLED` and `--progress-style` over it).
+/// Each is `None` when absent or of the wrong type; an unrecognized
+/// style string is passed through for `resolve` to fall back from, as
+/// Python's `ScanProgress.from_cfg` does.
+pub fn scan_progress_override(data: &Value) -> (Option<bool>, Option<String>) {
+    let Some(section) = data.get("scan_progress") else {
+        return (None, None);
+    };
+    (get(section, "enabled"), get(section, "style"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,6 +1230,8 @@ mod tests {
 
     fn default_scan_config() -> ScanConfig {
         ScanConfig {
+            autoexclude: Default::default(),
+            cancel: None,
             step0_enabled: true,
             step0: Step0Config::new(),
             step1: Step1Config::new("m"),
@@ -1213,6 +1406,7 @@ mod tests {
     fn model_role_reads_the_sampling_knobs_beside_the_id() {
         let data = json!({"models": {"deepdive": {
             "id": "opus", "temperature": 0.0, "top_p": 0.9, "seed": 7,
+            "effort": "High", "use_responses_api": true,
         }}});
         assert_eq!(
             model_role(&data, "deepdive"),
@@ -1221,8 +1415,13 @@ mod tests {
                 temperature: Some(0.0),
                 top_p: Some(0.9),
                 seed: Some(7),
+                effort: Some(ReasoningEffort::High),
+                use_responses_api: Some(true),
             }
         );
+        // An unparseable effort reads as unset (validation reports it).
+        let typo = json!({"models": {"deepdive": {"effort": "hihg"}}});
+        assert_eq!(model_role(&typo, "deepdive").effort, None);
     }
 
     #[test]
@@ -1290,6 +1489,7 @@ mod tests {
             temperature: Some(0.0),
             top_p: Some(0.8),
             seed: Some(42),
+            reasoning_effort: Some(ReasoningEffort::Low),
             step_timeout_secs: Some(90),
         };
         apply_overrides(&mut config, &json!({}), global);
@@ -1353,6 +1553,162 @@ mod tests {
         assert_eq!(llm.top_p, Some(0.8));
         assert_eq!(llm.seed, Some(42));
         assert_eq!(llm.timeout_secs, Some(90));
+        let low = Some(ReasoningEffort::Low);
+        for (effort, api) in [
+            (config.step1.reasoning_effort, config.step1.openai_api),
+            (config.step2.reasoning_effort, config.step2.openai_api),
+            (config.step3.reasoning_effort, config.step3.openai_api),
+            (config.step4.reasoning_effort, config.step4.openai_api),
+            (config.step6.reasoning_effort, config.step6.openai_api),
+            (config.step7.reasoning_effort, config.step7.openai_api),
+            (
+                config.step5.dedup.reasoning_effort,
+                config.step5.dedup.openai_api,
+            ),
+            (config.step8.reasoning_effort, config.step8.openai_api),
+            (llm.reasoning_effort, llm.openai_api),
+        ] {
+            assert_eq!(effort, low);
+            // No role pinned a transport, so the client's own applies.
+            assert_eq!(api, None);
+        }
+    }
+
+    #[test]
+    fn a_per_role_effort_and_transport_pin_win_over_the_global_flag() {
+        let mut config = default_scan_config();
+        config.step0.llm = Some(bc_stage_s0::Step0LlmConfig::new("m"));
+        let data = json!({"models": {
+            "graph_annotate": {"effort": "minimal"},
+            "preprocess": {"effort": "none", "use_responses_api": false},
+            "threatmodel": {"effort": "low"},
+            "decompose": {"effort": "medium"},
+            "deepdive": {"effort": "XHIGH", "use_responses_api": true},
+            "verify": {"effort": "max"},
+            "dedup": {"use_responses_api": true},
+            "chain": {"effort": "high"},
+        }});
+        apply_overrides(
+            &mut config,
+            &data,
+            GlobalSampling {
+                reasoning_effort: Some(ReasoningEffort::Medium),
+                ..GlobalSampling::default()
+            },
+        );
+        use OpenAiApi::{Chat, Responses};
+        use ReasoningEffort::*;
+        assert_eq!(config.step1.reasoning_effort, Some(None));
+        assert_eq!(config.step1.openai_api, Some(Chat));
+        assert_eq!(config.step2.reasoning_effort, Some(Low));
+        assert_eq!(config.step3.reasoning_effort, Some(Medium));
+        assert_eq!(config.step4.reasoning_effort, Some(XHigh));
+        assert_eq!(config.step4.openai_api, Some(Responses));
+        assert_eq!(config.step6.reasoning_effort, Some(Max));
+        // `dedup` pinned only the transport: effort falls to the flag.
+        assert_eq!(config.step7.reasoning_effort, Some(Medium));
+        assert_eq!(config.step7.openai_api, Some(Responses));
+        assert_eq!(config.step5.dedup.openai_api, Some(Responses));
+        assert_eq!(config.step8.reasoning_effort, Some(High));
+        assert_eq!(config.step2.openai_api, Option::None);
+        let llm = config.step0.llm.as_ref().unwrap();
+        assert_eq!(llm.reasoning_effort, Some(Minimal));
+    }
+
+    #[test]
+    fn validate_model_roles_accepts_every_tier_and_null() {
+        let data = json!({
+            "models": {
+                "deepdive": {"effort": "high", "use_responses_api": true},
+                "verify": {"effort": null, "use_responses_api": null},
+                "validate": {
+                    "orchestrator": {"effort": "max"},
+                    "security_architect": {"id": "x"},
+                    "note": "not a role",
+                },
+                "odd": "a scalar role is ignored",
+            },
+            "step_validate": {"effort": "low"},
+        });
+        assert_eq!(validate_model_roles(&data), Ok(()));
+        assert_eq!(validate_model_roles(&json!({})), Ok(()));
+    }
+
+    #[test]
+    fn validate_model_roles_names_the_bad_key() {
+        let typo = json!({"models": {"deepdive": {"effort": "hihg"}}});
+        let err = validate_model_roles(&typo).unwrap_err();
+        assert!(
+            err.starts_with("models.deepdive.effort: unknown reasoning effort"),
+            "{err}"
+        );
+
+        let nested = json!({"models": {"validate": {"orchestrator": {"effort": 3}}}});
+        let err = validate_model_roles(&nested).unwrap_err();
+        assert!(
+            err.contains("models.validate.orchestrator.effort must be a string"),
+            "{err}"
+        );
+
+        let api = json!({"models": {"verify": {"use_responses_api": "yes"}}});
+        let err = validate_model_roles(&api).unwrap_err();
+        assert!(
+            err.contains("models.verify.use_responses_api must be true or false"),
+            "{err}"
+        );
+
+        let step = json!({"step_validate": {"effort": "extreme"}});
+        let err = validate_model_roles(&step).unwrap_err();
+        assert!(err.starts_with("step_validate.effort:"), "{err}");
+    }
+
+    #[test]
+    fn s11_effort_layers_role_over_flag_over_step_key_over_default() {
+        let new = || bc_stage_s11::Step11Config::new("m");
+        let flag = GlobalSampling {
+            reasoning_effort: Some(ReasoningEffort::Low),
+            ..GlobalSampling::default()
+        };
+
+        // Nothing configured: the crate's own `high` default survives.
+        let mut cfg = new();
+        apply_step11_overrides(&mut cfg, &Value::Null, GlobalSampling::default());
+        assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::High));
+
+        // The step key replaces the default.
+        let step = json!({"step_validate": {"effort": "medium"}});
+        let mut cfg = new();
+        apply_step11_overrides(&mut cfg, &step, GlobalSampling::default());
+        assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::Medium));
+
+        // The flag wins over the step key.
+        let mut cfg = new();
+        apply_step11_overrides(&mut cfg, &step, flag);
+        assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::Low));
+
+        // The orchestrator role wins over both, and pins the transport.
+        let role = json!({
+            "step_validate": {"effort": "medium"},
+            "models": {"validate": {"orchestrator": {
+                "effort": "xhigh", "use_responses_api": true
+            }}},
+        });
+        let mut cfg = new();
+        apply_step11_overrides(&mut cfg, &role, flag);
+        assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::XHigh));
+        assert_eq!(cfg.openai_api, Some(OpenAiApi::Responses));
+    }
+
+    #[test]
+    fn s10_reads_its_role_effort_and_transport_pin() {
+        let mut cfg = bc_stage_s10::Step10Config::new("m");
+        let data = json!({"models": {"remediate": {
+            "id": "r", "effort": "high", "use_responses_api": false
+        }}});
+        apply_step10_overrides(&mut cfg, &data, GlobalSampling::default());
+        assert_eq!(cfg.model, "r");
+        assert_eq!(cfg.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(cfg.openai_api, Some(OpenAiApi::Chat));
     }
 
     #[test]
@@ -1366,6 +1722,7 @@ mod tests {
                 temperature: Some(0.0),
                 top_p: Some(0.5),
                 seed: Some(9),
+                reasoning_effort: None,
                 step_timeout_secs: None,
             },
         );
@@ -1427,6 +1784,31 @@ mod tests {
             config.step0.sinks_yaml,
             Some(std::path::PathBuf::from("/rules/sinks.yaml"))
         );
+    }
+
+    #[test]
+    fn step0_call_graph_max_targets_prefers_step0_then_falls_back_to_step1() {
+        let mut config = default_scan_config();
+        let default = config.step0.call_graph_max_targets;
+        apply_overrides(&mut config, &json!({}), GlobalSampling::default());
+        assert_eq!(config.step0.call_graph_max_targets, default);
+        let data = json!({"step1": {"call_graph_max_targets": 6}});
+        apply_overrides(&mut config, &data, GlobalSampling::default());
+        assert_eq!(config.step0.call_graph_max_targets, 6);
+        assert_eq!(config.step1.call_graph.max_targets, 6);
+        let data = json!({
+            "step0": {"call_graph_max_targets": 9},
+            "step1": {"call_graph_max_targets": 6},
+        });
+        apply_overrides(&mut config, &data, GlobalSampling::default());
+        assert_eq!(config.step0.call_graph_max_targets, 9);
+        // A zero on step0 falls through to step1, as upstream's `or` does.
+        let data = json!({
+            "step0": {"call_graph_max_targets": 0},
+            "step1": {"call_graph_max_targets": 4},
+        });
+        apply_overrides(&mut config, &data, GlobalSampling::default());
+        assert_eq!(config.step0.call_graph_max_targets, 4);
     }
 
     #[test]
@@ -1724,6 +2106,11 @@ mod tests {
                 "max_function_sites": 9, "max_graph_files": 10, "max_graph_sinks": 11,
                 "max_graph_edges": 12, "max_notes_chars": 13,
                 "max_prompt_modules": 14, "max_prompt_entry_points": 15,
+                "max_config_rep_chars": 16, "max_config_rep_bodies": 17,
+                "max_manifest_depth": 18, "max_manifests": 19,
+                "max_manifests_per_kind": 20, "max_manifest_total_chars": 21,
+                "max_assets": 22, "max_trust_boundaries": 23,
+                "agentic": true, "allowed_tools": ["Grep"], "max_turns": 24,
             }
         });
         apply_overrides(&mut config, &data, GlobalSampling::default());
@@ -1744,6 +2131,17 @@ mod tests {
         assert_eq!(s2.frontier_max_notes_chars, 13);
         assert_eq!(s2.max_modules, 14);
         assert_eq!(s2.max_entry_points, 15);
+        assert_eq!(s2.max_config_rep_chars, 16);
+        assert_eq!(s2.max_config_rep_bodies, 17);
+        assert_eq!(s2.max_manifest_depth, 18);
+        assert_eq!(s2.max_manifests, 19);
+        assert_eq!(s2.max_manifests_per_kind, 20);
+        assert_eq!(s2.max_manifest_total_chars, 21);
+        assert_eq!(s2.max_assets, 22);
+        assert_eq!(s2.max_trust_boundaries, 23);
+        assert!(s2.agentic);
+        assert_eq!(s2.allowed_tools, vec!["Grep".to_string()]);
+        assert_eq!(s2.max_turns, 24);
     }
 
     #[test]
@@ -1760,6 +2158,10 @@ mod tests {
                 "catchall_reachable_min_files": 12,
                 "max_files_per_chunk": 10, "specialists": ["crypto"], "specialist_chunk_loc": 11,
                 "threat_surface_fallbacks": false, "threat_fallback_max_files": 13,
+                "catchall_deduct_lens_coverage": true, "max_cohesion_groups": 14,
+                "max_threat_fallback_chunks": 15, "max_prompt_threats": 16,
+                "max_prompt_assets": 17, "max_prompt_boundaries": 18,
+                "max_prompt_threat_context_chars": 19,
             }
         });
         apply_overrides(&mut config, &data, GlobalSampling::default());
@@ -1785,6 +2187,13 @@ mod tests {
         assert_eq!(s3.specialist_chunk_loc, 11);
         assert!(!s3.threat_surface_fallbacks);
         assert_eq!(s3.threat_fallback_max_files, 13);
+        assert!(s3.catchall_deduct_lens_coverage);
+        assert_eq!(s3.max_cohesion_groups, 14);
+        assert_eq!(s3.max_threat_fallback_chunks, 15);
+        assert_eq!(s3.max_prompt_threats, 16);
+        assert_eq!(s3.max_prompt_assets, 17);
+        assert_eq!(s3.max_prompt_boundaries, 18);
+        assert_eq!(s3.max_prompt_threat_context_chars, 19);
     }
 
     #[test]
@@ -1813,6 +2222,7 @@ mod tests {
                 "runs": 6, "vote_threshold": 7, "specialist_runs": 8, "line_bucket": 9,
                 "taint_prompt_mode": "confirm_refute", "taint_runs": 2,
                 "frontier_max_funcs_per_file": 11,
+                "shard_cache_gating": false,
             }
         });
         apply_overrides(&mut config, &data, GlobalSampling::default());
@@ -1829,6 +2239,7 @@ mod tests {
         assert_eq!(s4.taint_prompt_mode, "confirm_refute");
         assert_eq!(s4.taint_runs, Some(2));
         assert_eq!(s4.frontier_max_funcs_per_file, 11);
+        assert!(!s4.shard_cache_gating);
     }
 
     #[test]
@@ -1925,10 +2336,12 @@ mod tests {
             "step6_verify": {
                 "parallel": 1, "min_confidence": 2, "max_turns": 3, "allowed_tools": ["Grep"],
                 "max_transient_retries": 4, "max_context_shrinks": 5,
+                "progress_file": true,
             }
         });
         apply_overrides(&mut config, &data, GlobalSampling::default());
         let s6 = &config.step6;
+        assert!(s6.progress_file);
         assert_eq!(s6.parallel, 1);
         assert_eq!(s6.min_confidence, 2);
         assert_eq!(s6.max_turns, 3);
@@ -2031,6 +2444,21 @@ mod tests {
         );
         assert_eq!(step0_enabled_override(&json!({"step0": {}})), None);
         assert_eq!(step0_enabled_override(&json!({})), None);
+    }
+
+    #[test]
+    fn scan_progress_override_reads_both_keys_leniently() {
+        assert_eq!(
+            scan_progress_override(
+                &json!({"scan_progress": {"enabled": true, "style": "stage_only"}})
+            ),
+            (Some(true), Some("stage_only".to_string()))
+        );
+        assert_eq!(
+            scan_progress_override(&json!({"scan_progress": {"enabled": "yes", "style": 3}})),
+            (None, None)
+        );
+        assert_eq!(scan_progress_override(&json!({})), (None, None));
     }
 
     #[test]
@@ -2358,6 +2786,18 @@ mod tests {
             GlobalSampling::default(),
         );
         assert!(!cfg.fact_tools);
+    }
+
+    #[test]
+    fn apply_step11_overrides_reads_the_split_ties_score_switch() {
+        let mut cfg = bc_stage_s11::Step11Config::new("m");
+        assert!(cfg.split_ties_score, "one-step ties score by default");
+        apply_step11_overrides(
+            &mut cfg,
+            &json!({"step_validate": {"split_ties_score": false}}),
+            GlobalSampling::default(),
+        );
+        assert!(!cfg.split_ties_score);
     }
 
     #[test]

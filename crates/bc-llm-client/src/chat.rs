@@ -2,7 +2,10 @@
 //! to both the OpenAI-compatible chat-completions dialect and the
 //! Anthropic-compatible Messages dialect.
 
+use crate::cache::CachePolicy;
+use crate::effort::ReasoningEffort;
 use crate::message::{ContentBlock, Message};
+use crate::openai_api::OpenAiApi;
 use crate::tool::ToolSpec;
 
 /// One model call. `thinking_budget` and `betas` are Anthropic-specific
@@ -10,7 +13,12 @@ use crate::tool::ToolSpec;
 /// accept-and-drop-if-unsupported behavior `backends/oai.py`'s `prompt()`/
 /// `agentic()` already have for `thinking_budget`/`betas`, so callers don't
 /// need to know which dialect they're talking to when building a request.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Default` exists so a caller building one with struct-literal syntax
+/// can end it with `..Default::default()` and keep compiling when a
+/// transport field is added; its empty `model` and zero `max_tokens` are
+/// placeholders every real caller overrides.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChatRequest {
     pub model: String,
     pub system: Option<String>,
@@ -57,7 +65,7 @@ pub struct ChatRequest {
     /// doesn't trip the HTTP timeout" — it only ever reads
     /// `stream.get_final_message()`, so streaming buys it nothing but
     /// the absence of one long silent socket). This port skipped it in
-    /// favour of per-call timeouts ([`Self::timeout`]), which solves the
+    /// favor of per-call timeouts ([`Self::timeout`]), which solves the
     /// same problem for a client that controls its own deadline — but
     /// not for a gateway or proxy in front of the provider that imposes
     /// its own idle timeout, which only a stream's steady trickle of
@@ -83,12 +91,46 @@ pub struct ChatRequest {
     /// keeps that client-wide default.
     ///
     /// Ported from the Python original's per-step `timeout` config keys,
-    /// which both real backends honour per call rather than per client
+    /// which both real backends honor per call rather than per client
     /// (`backends/sdk.py:274` and `backends/oai.py:278`, both
     /// `client.with_options(timeout=float(timeout))`). Without it, a
     /// stage asking for 64k output tokens over a 300 s client default
     /// fails on the clock rather than on the model.
     pub timeout: Option<std::time::Duration>,
+    /// Reasoning-effort tier for a reasoning-class model (the Python
+    /// original's `models.<role>.effort`). OpenAI dialect only: sent as
+    /// `reasoning_effort` on Chat Completions and `reasoning.effort` on
+    /// the Responses API; a model that rejects the tier is remembered and
+    /// the call retried without it. The Anthropic dialect ignores it.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Per-request OpenAI transport pin (the Python original's per-role
+    /// `use_responses_api`), overriding the OpenAI client's configured
+    /// default. A request field rather than client configuration because
+    /// one client serves every role. `None` keeps the client default;
+    /// the Anthropic dialect ignores it.
+    pub openai_api: Option<OpenAiApi>,
+    /// A large, stable leading prefix shared by many calls (S4's shared
+    /// context plus one shard's source, say), kept separate from the rest
+    /// of the first user turn so each dialect can place it where its
+    /// cache works best. The Anthropic dialect sends it as its own
+    /// leading text block, marked as a cache breakpoint when the
+    /// [`CachePolicy`] gate allows; the OpenAI dialect prepends it to the
+    /// first user text, since its implicit prefix cache needs the stable
+    /// part first. `None` sends the request byte-identical to one built
+    /// before this field existed.
+    pub cache_prefix: Option<String>,
+    /// Caller-supplied, stable routing material for OpenAI's
+    /// `prompt_cache_key` (stage and repository name, say). Never sent
+    /// raw: the OpenAI dialect SHA-256s it together with the model (and a
+    /// digest of [`Self::cache_prefix`], when present) and sends only the
+    /// hash, and only when the prompt is estimated to clear OpenAI's
+    /// 1,024-token caching floor. Must not carry secrets regardless. The
+    /// Anthropic dialect ignores it.
+    pub cache_key: Option<String>,
+    /// The operator's prompt-cache policy. Stamped on every request by
+    /// [`crate::ApplyCachePolicy`] where the client is built, like
+    /// [`Self::stream`]; stages leave it at its default.
+    pub cache: CachePolicy,
 }
 
 impl ChatRequest {
@@ -109,6 +151,11 @@ impl ChatRequest {
             json_mode: false,
             timeout: None,
             stream: false,
+            reasoning_effort: None,
+            openai_api: None,
+            cache_prefix: None,
+            cache_key: None,
+            cache: CachePolicy::default(),
         }
     }
 }
@@ -128,8 +175,27 @@ pub enum StopReason {
 /// matching `backends/oai.py`'s own comment that it normalizes OpenAI's
 /// `prompt_tokens`/`completion_tokens`/cached-tokens onto these names "so
 /// `util/tokens.py` sees one unified total across all three backends".
-/// Fields a dialect has no equivalent for (OpenAI has no separate
-/// cache-write accounting) are left at `0`.
+///
+/// **The contract every dialect honors** (and `bc-pricing` relies on):
+/// the three input fields are DISJOINT slices of one prompt, and add up
+/// to its full size.
+///
+/// - `input_tokens`: the fresh, uncached remainder, billed at the base
+///   input rate. Anthropic reports exactly this. OpenAI reports the whole
+///   prompt (`prompt_tokens` on Chat Completions, `input_tokens` on the
+///   Responses API), so its dialect subtracts both cache slices out.
+/// - `cache_read_input_tokens`: served from cache, billed at the cache
+///   read rate (Anthropic `cache_read_input_tokens`; OpenAI
+///   `prompt_tokens_details.cached_tokens` /
+///   `input_tokens_details.cached_tokens`).
+/// - `cache_creation_input_tokens`: written to cache, billed at the cache
+///   write rate. Anthropic `cache_creation_input_tokens` (the sum of both
+///   lifetimes; which lifetime was used is the [`CachePolicy::ttl`] the
+///   request carried, since every marker in one request uses the same
+///   one). OpenAI reports a write only on models that bill one
+///   (`cache_write_tokens`); everywhere else it is `0`, which is correct
+///   data, not a gap.
+/// - `output_tokens`: generated tokens, reasoning included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -196,6 +262,38 @@ mod tests {
             !req.stream,
             "streaming is opt-in — every existing caller keeps the single-response path"
         );
+        assert!(req.reasoning_effort.is_none());
+        assert!(req.openai_api.is_none());
+        assert!(req.cache_prefix.is_none());
+        assert!(req.cache_key.is_none());
+        assert_eq!(req.cache, CachePolicy::default());
+    }
+
+    #[test]
+    fn default_matches_new_apart_from_the_placeholders() {
+        let from_default = ChatRequest {
+            model: "m".to_string(),
+            max_tokens: 7,
+            ..ChatRequest::default()
+        };
+        assert_eq!(from_default, ChatRequest::new("m", Vec::new(), 7));
+    }
+
+    #[test]
+    fn text_and_tool_uses_ignore_opaque_blocks() {
+        let resp = ChatResponse {
+            content: vec![
+                ContentBlock::Opaque {
+                    dialect: crate::message::OpaqueDialect::OpenAiResponses,
+                    payload: serde_json::json!({"type": "reasoning"}),
+                },
+                ContentBlock::text("answer"),
+            ],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        };
+        assert_eq!(resp.text(), "answer");
+        assert!(resp.tool_uses().is_empty());
     }
 
     #[test]

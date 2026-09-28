@@ -40,8 +40,67 @@ static SECRET_TEXT_RX: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-fn is_secret_class(f: &Finding) -> bool {
+/// Hardcoded-credential CWEs: the committed value IS the evidence, and
+/// there is no source-to-sink flow to prove. Ported from upstream v1.3
+/// `_HARDCODED_CWES`.
+const HARDCODED_CWES: &[&str] = &[
+    "CWE-798", // Use of Hard-coded Credentials (umbrella)
+    "CWE-259", // Use of Hard-coded Password
+    "CWE-321", // Use of Hard-coded Cryptographic Key
+    "CWE-256", // Plaintext Storage of a Password
+];
+
+/// Missing-control and configuration-absence CWEs: the presence (or
+/// absence) of a code element IS the evidence, e.g. `@csrf_exempt` on a
+/// POST handler, a Set-Cookie line without HttpOnly, a login path with no
+/// rate limit or no logging. Requiring `source_ref`/`sink_ref` for these
+/// would drop every legitimate finding of the class at `require_evidence`.
+/// Ported from upstream v1.3 `_CONTROL_ABSENCE_CWES`.
+const CONTROL_ABSENCE_CWES: &[&str] = &[
+    "CWE-352",  // CSRF: missing token check
+    "CWE-1004", // Sensitive cookie without HttpOnly
+    "CWE-614",  // Sensitive cookie without Secure
+    "CWE-307",  // Excessive authentication attempts
+    "CWE-778",  // Insufficient logging
+    "CWE-311",  // Missing encryption of sensitive data
+    "CWE-312",  // Cleartext storage of sensitive information
+    "CWE-532",  // Sensitive information in a log file
+    "CWE-209",  // Error message containing sensitive information
+];
+
+/// `f.cwe` in canonical `CWE-<n>` form, tolerating the case, whitespace
+/// and bare-number spellings a model emits.
+fn canonical_cwe(f: &Finding) -> Option<String> {
+    let raw = f.cwe.as_deref()?.trim();
+    let digits = raw
+        .strip_prefix("CWE-")
+        .or_else(|| raw.strip_prefix("cwe-"))
+        .or_else(|| raw.strip_prefix("Cwe-"))
+        .unwrap_or(raw)
+        .trim();
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| format!("CWE-{digits}"))
+}
+
+/// Whether a finding is point-of-occurrence: no source-to-sink flow
+/// exists to prove, so `require_evidence` must not apply, and (the
+/// original purpose) a test-path file is still kept because it is in
+/// source control. Any one of three signals suffices (upstream v1.3):
+///
+/// 1. `vuln_class == InfoLeak`;
+/// 2. `f.cwe` is a hardcoded-credential or control-absence CWE, whatever
+///    the title says;
+/// 3. the title/description/snippet carries credential-class evidence.
+///
+/// Without (2), the `csrf`, `hardcoded-creds` and `log-injection` lenses
+/// S3 now enables would have every finding dropped here.
+pub(crate) fn is_point_of_occurrence(f: &Finding) -> bool {
     if f.vuln_class == VulnClass::InfoLeak {
+        return true;
+    }
+    if canonical_cwe(f).is_some_and(|cwe| {
+        HARDCODED_CWES.contains(&cwe.as_str()) || CONTROL_ABSENCE_CWES.contains(&cwe.as_str())
+    }) {
         return true;
     }
     let haystack = format!("{} {} {}", f.title, f.description, f.code_snippet);
@@ -96,14 +155,18 @@ pub fn repair_path(reported: &str, valid: &HashSet<&str>) -> Option<String> {
 pub struct GateResult {
     pub keep: Vec<Finding>,
     pub dropped: Vec<DroppedFinding>,
+    /// Kept findings that had no `source_ref`/`sink_ref` and passed
+    /// `require_evidence` only because they are point-of-occurrence.
+    pub evidence_exempted: usize,
 }
 
 /// Applies the deterministic gate chain, in the Python original's exact
 /// if/elif order (each finding is dropped by at most one gate — the first
-/// that matches): test/mock/example path (unless secret-class evidence),
+/// that matches): test/mock/example path (unless point-of-occurrence),
 /// file not in the repo inventory (when `valid_files` is `Some`), s4
 /// confidence below `min_confidence`, then — if `require_evidence` — a
-/// missing `source_ref`/`sink_ref`. The two net-new disk-reading gates
+/// missing `source_ref`/`sink_ref` on a finding that is not
+/// point-of-occurrence ([`is_point_of_occurrence`]). The two net-new disk-reading gates
 /// come last: the language gates (`crate::lang_gates`), then the
 /// route-guard gate (`crate::route_gates`), which needs `routes` — the
 /// framework entry points S0 established, indexed once per run.
@@ -117,6 +180,7 @@ pub fn apply_gates(
 ) -> GateResult {
     let mut keep = Vec::new();
     let mut dropped = Vec::new();
+    let mut evidence_exempted = 0;
 
     for f in findings {
         let repaired = valid_files
@@ -124,7 +188,11 @@ pub fn apply_gates(
             .map(|file| Finding { file, ..f.clone() });
         let f = repaired.as_ref().unwrap_or(f);
         let in_test_path = EXCLUDE_PATH_RE.is_match(&f.file);
-        let secret_class = in_test_path && is_secret_class(f);
+        // Evaluated unconditionally: it is both the test-path exception
+        // and the `require_evidence` bypass below.
+        let point_of_occurrence = is_point_of_occurrence(f);
+        let secret_class = in_test_path && point_of_occurrence;
+        let has_flow = has_text(f.source_ref.as_deref()) && has_text(f.sink_ref.as_deref());
 
         if in_test_path && !secret_class {
             dropped.push(drop_finding(
@@ -147,9 +215,7 @@ pub fn apply_gates(
                     f.confidence
                 ),
             ));
-        } else if require_evidence
-            && !(has_text(f.source_ref.as_deref()) && has_text(f.sink_ref.as_deref()))
-        {
+        } else if require_evidence && !point_of_occurrence && !has_flow {
             dropped.push(drop_finding(
                 f,
                 DropReason::Unconfirmed,
@@ -160,11 +226,18 @@ pub fn apply_gates(
         } else if let Some(reason) = route_gates::guarded_route(f, routes, repo_root) {
             dropped.push(drop_finding(f, DropReason::Excluded, reason));
         } else {
+            if require_evidence && !has_flow {
+                evidence_exempted += 1;
+            }
             keep.push(f.clone());
         }
     }
 
-    GateResult { keep, dropped }
+    GateResult {
+        keep,
+        dropped,
+        evidence_exempted,
+    }
 }
 
 /// The two language-aware gates, asked last in the chain because they are
@@ -396,6 +469,99 @@ mod tests {
         let findings = vec![f("app.py", 0.9, None, None)];
         let r = apply_gates(&findings, None, 0.6, false, None, &no_routes());
         assert_eq!(r.keep.len(), 1);
+        // Nothing was exempted: the gate was never asked.
+        assert_eq!(r.evidence_exempted, 0);
+    }
+
+    fn with_cwe(cwe: &str) -> Finding {
+        Finding {
+            cwe: Some(cwe.to_string()),
+            ..f("app.py", 0.9, None, None)
+        }
+    }
+
+    #[test]
+    fn point_of_occurrence_cwes_pass_require_evidence_without_a_flow() {
+        // Regression for the upstream v1.3 fix: without it, every finding
+        // from the csrf, hardcoded-creds and log-injection lenses was
+        // dropped here for lacking a source-to-sink flow it cannot have.
+        for cwe in [
+            "CWE-798", "CWE-259", "CWE-321", "CWE-256", "CWE-352", "CWE-1004", "CWE-614",
+            "CWE-307", "CWE-778", "CWE-311", "CWE-312", "CWE-532", "CWE-209",
+        ] {
+            let r = apply_gates(&[with_cwe(cwe)], None, 0.6, true, None, &no_routes());
+            assert_eq!(r.keep.len(), 1, "{cwe}");
+            assert_eq!(r.evidence_exempted, 1, "{cwe}");
+        }
+    }
+
+    #[test]
+    fn the_cwe_match_tolerates_model_spellings_but_not_other_cwes() {
+        for cwe in ["cwe-352", " CWE-352 ", "352", "Cwe-798"] {
+            let r = apply_gates(&[with_cwe(cwe)], None, 0.6, true, None, &no_routes());
+            assert_eq!(r.keep.len(), 1, "{cwe:?}");
+        }
+        for cwe in ["CWE-89", "CWE-", "CWE-35x", ""] {
+            let r = apply_gates(&[with_cwe(cwe)], None, 0.6, true, None, &no_routes());
+            assert!(r.keep.is_empty(), "{cwe:?}");
+            assert_eq!(
+                r.dropped[0].detail,
+                "missing source_ref/sink_ref — data flow unproven"
+            );
+        }
+    }
+
+    #[test]
+    fn a_point_of_occurrence_finding_still_faces_every_other_gate() {
+        // The exemption is from the flow requirement only.
+        let low = Finding {
+            confidence: 0.1,
+            ..with_cwe("CWE-352")
+        };
+        let r = apply_gates(&[low], None, 0.6, true, None, &no_routes());
+        assert!(r.keep.is_empty());
+        assert!(r.dropped[0].detail.starts_with("s4 confidence"));
+        let valid: HashSet<&str> = ["other.py"].into_iter().collect();
+        let r = apply_gates(
+            &[with_cwe("CWE-798")],
+            Some(&valid),
+            0.6,
+            true,
+            None,
+            &no_routes(),
+        );
+        assert_eq!(r.dropped[0].detail, "file not in repo inventory");
+    }
+
+    #[test]
+    fn a_control_absence_cwe_in_a_test_path_is_kept_as_upstream_does() {
+        // Upstream v1.3 uses ONE predicate for both the test-path exception
+        // and the evidence bypass, so a control-absence CWE also survives
+        // the test-path gate. Arguably only committed credentials deserve
+        // that; this pins the parity choice until upstream splits them.
+        let csrf = Finding {
+            file: "tests/views.py".to_string(),
+            ..with_cwe("CWE-352")
+        };
+        let r = apply_gates(&[csrf], None, 0.6, true, None, &no_routes());
+        assert_eq!(r.keep.len(), 1);
+    }
+
+    #[test]
+    fn a_finding_with_a_flow_is_not_counted_as_exempted() {
+        let r = apply_gates(
+            &[Finding {
+                source_ref: Some("a:1".into()),
+                sink_ref: Some("a:2".into()),
+                ..with_cwe("CWE-352")
+            }],
+            None,
+            0.6,
+            true,
+            None,
+            &no_routes(),
+        );
+        assert_eq!((r.keep.len(), r.evidence_exempted), (1, 0));
     }
 
     /// The language gates run LAST, after every cheap gate, so a finding

@@ -4,8 +4,10 @@
 //! presence of tests as evidence of behavioral coverage. Paths and recognized
 //! metadata are retained; repository file contents are not included in plans.
 
+use bc_api_spec::format::candidate_strength;
+use bc_api_spec::{ApiSurface, HttpService, NameStrength};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -23,7 +25,10 @@ pub enum ExecutionState {
     Failed,
     Blocked,
     TimedOut,
-    Cancelled,
+    /// Released in 1.0.0 as `"cancelled"`; the wire name stays so an
+    /// existing plan still reads.
+    #[serde(rename = "cancelled")]
+    Canceled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,6 +109,20 @@ pub struct TargetTestPlan {
     pub discovery_limitations: Vec<String>,
     pub entries_inspected: usize,
     pub validation: ValidationPlan,
+    /// Packages whose manifests declare an HTTP framework: the evidence
+    /// that the target serves an API a specification should describe.
+    #[serde(default)]
+    pub http_services: Vec<HttpService>,
+    /// Packages whose manifests declare a GraphQL server, a messaging
+    /// client, a JSON-RPC server or gRPC: evidence of an API described by
+    /// a standard other than OpenAPI.
+    #[serde(default)]
+    pub api_surfaces: Vec<ApiSurface>,
+    /// Files whose names nominate them as API descriptions in any supported
+    /// standard. Content has not been read; the API specification step
+    /// confirms or rejects each.
+    #[serde(default)]
+    pub api_spec_candidates: Vec<String>,
 }
 
 impl TargetTestPlan {
@@ -128,6 +147,9 @@ impl TargetTestPlan {
         projection.ci_evidence.truncate(16);
         projection.service_evidence.truncate(16);
         projection.expectation_sources.truncate(32);
+        projection.http_services.truncate(16);
+        projection.api_surfaces.truncate(16);
+        projection.api_spec_candidates.truncate(16);
         // Serialization only fails for data shapes absent from this structure.
         let mut data = serde_json::to_string(&projection).unwrap_or_default();
         while data.len() > 32_000 {
@@ -144,6 +166,15 @@ impl TargetTestPlan {
             projection
                 .expectation_sources
                 .truncate(projection.expectation_sources.len() / 2);
+            projection
+                .http_services
+                .truncate(projection.http_services.len() / 2);
+            projection
+                .api_surfaces
+                .truncate(projection.api_surfaces.len() / 2);
+            projection
+                .api_spec_candidates
+                .truncate(projection.api_spec_candidates.len() / 2);
             // Public deserializable plans may contain oversized custom prose;
             // never loop forever if dropping inventory cannot reduce the data.
             let next = serde_json::to_string(&projection).unwrap_or_default();
@@ -391,6 +422,13 @@ fn classify_test(path: &str) -> Option<(TestKind, &'static str)> {
     None
 }
 
+/// The directory holding `path`, `.` for the repository root.
+fn parent_directory(path: &str) -> String {
+    path.rsplit_once('/')
+        .map_or(".", |(parent, _)| parent)
+        .to_string()
+}
+
 fn manifest_language(path: &str) -> Option<&'static str> {
     match filename(path) {
         "Cargo.toml" => Some("Rust"),
@@ -431,10 +469,7 @@ fn lockfile_names(language: &str) -> &'static [&'static str] {
 }
 
 fn package(path: &str, language: &str, text: &str, files: &[String]) -> PackageTestEnvironment {
-    let root = path
-        .rsplit_once('/')
-        .map_or(".", |(parent, _)| parent)
-        .to_string();
+    let root = parent_directory(path);
     let prefix = if root == "." {
         String::new()
     } else {
@@ -594,14 +629,52 @@ pub fn discover(root: &Path) -> io::Result<TargetTestPlan> {
     let mut ci = Vec::new();
     let mut services = Vec::new();
     let mut expectations = Vec::new();
+    let mut http_services: BTreeMap<String, HttpService> = BTreeMap::new();
+    let mut api_surfaces: BTreeMap<String, ApiSurface> = BTreeMap::new();
+    let mut spec_candidates = Vec::new();
     for path in &files {
         let name = filename(path);
+        let mut manifest_text = None;
         if let Some(language) = manifest_language(path) {
             let text = discovery.metadata_text(path).unwrap_or_default();
             if name == "package.json" && serde_json::from_str::<serde_json::Value>(&text).is_err() {
                 discovery.limitations.insert("A package.json was unreadable or invalid; scripts/frameworks remain unresolved.".into());
             }
             packages.push(package(path, language, &text, &files));
+            manifest_text = Some(text);
+        }
+        if bc_api_spec::frameworks::is_manifest(name) {
+            // Read once: a manifest already read for its language is reused.
+            let text = match manifest_text {
+                Some(text) => text,
+                None => discovery.metadata_text(path).unwrap_or_default(),
+            };
+            let frameworks = bc_api_spec::frameworks::detect(name, &text);
+            if !frameworks.is_empty() {
+                let root = parent_directory(path);
+                let service = http_services.entry(root.clone()).or_insert(HttpService {
+                    root,
+                    manifests: Vec::new(),
+                    frameworks: BTreeSet::new(),
+                });
+                service.manifests.push(path.clone());
+                service.frameworks.extend(frameworks);
+            }
+            let libraries = bc_api_spec::libraries::detect(name, &text);
+            if !libraries.is_empty() {
+                let root = parent_directory(path);
+                let surface = api_surfaces.entry(root.clone()).or_insert(ApiSurface {
+                    root,
+                    manifests: Vec::new(),
+                    libraries: BTreeSet::new(),
+                });
+                surface.manifests.push(path.clone());
+                surface.libraries.extend(libraries);
+            }
+        }
+        let spec_name = candidate_strength(path);
+        if spec_name.is_some() {
+            spec_candidates.push(path.clone());
         }
         if let Some((kind, basis)) = classify_test(path) {
             artifacts.push(TestArtifact {
@@ -645,6 +718,7 @@ pub fn discover(root: &Path) -> io::Result<TargetTestPlan> {
                 "contract.md" | "architecture.md" | "requirements.md"
             )
             || path.ends_with(".proto")
+            || spec_name == Some(NameStrength::Strong)
         {
             expectations.push(path.clone());
         }
@@ -681,6 +755,8 @@ pub fn discover(root: &Path) -> io::Result<TargetTestPlan> {
         service_evidence: services, expectation_sources: expectations,
         coverage_obligations: obligations, coverage_gaps: gaps,
         discovery_limitations: discovery.limitations.into_iter().collect(), entries_inspected: discovery.entries,
+        http_services: http_services.into_values().collect(), api_surfaces: api_surfaces.into_values().collect(),
+        api_spec_candidates: spec_candidates,
         validation: ValidationPlan {
             existing_test_baseline: ExecutionState::NotRun, legitimate_behavior_baseline: ExecutionState::NotRun,
             security_reproduction_before_patch: ExecutionState::NotRun, security_regression_after_patch: ExecutionState::NotRun,
@@ -828,6 +904,14 @@ mod tests {
         assert_eq!(plan.packages.len(), 1);
         assert_eq!(plan.packages[0].root, "nested");
         assert!(plan.packages[0].lockfiles.is_empty());
+    }
+
+    #[test]
+    fn the_canceled_state_keeps_its_released_wire_name() {
+        let wire = serde_json::to_string(&ExecutionState::Canceled).unwrap();
+        assert_eq!(wire, "\"cancelled\"");
+        let back: ExecutionState = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, ExecutionState::Canceled);
     }
 
     #[test]
@@ -1044,22 +1128,64 @@ mod tests {
         );
     }
 
+    /// Moves the directory `staged` (built at a short path) to a new
+    /// location whose own path is 100 bytes short of Linux's `PATH_MAX`,
+    /// and returns it. An entry inside it with a name of 100 bytes or more
+    /// is then listed by `read_dir`, but its full path is refused with
+    /// ENAMETOOLONG before any permission check, so no user, root
+    /// included, can open or list it through that path.
+    #[cfg(target_os = "linux")]
+    fn bury_near_path_max(staged: &Path) -> PathBuf {
+        const TARGET: usize = 4096 - 100;
+        let mut deep = staged.parent().unwrap().canonicalize().unwrap();
+        while TARGET.saturating_sub(deep.as_os_str().len() + 1) > 255 {
+            deep.push("d".repeat(200));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        let buried = deep.join("r".repeat(TARGET - deep.as_os_str().len() - 1));
+        fs::rename(staged, &buried).unwrap();
+        buried
+    }
+
+    /// Whether permission bits actually deny this process, probed with a
+    /// mode 000 file. They do not for root (CAP_DAC_OVERRIDE), so a test
+    /// whose scenario only a permission denial can produce runs that part
+    /// only when this is true, and otherwise says on stderr that it was
+    /// skipped. Branch-free, so it is fully covered for every user.
     #[cfg(unix)]
+    fn permissions_enforced(test: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        fs::write(&probe, "x").unwrap();
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o000)).unwrap();
+        let enforced = fs::read(&probe).is_err();
+        let notes = [
+            format!("SKIPPED (permissions not enforced for this user): {test}\n"),
+            String::new(),
+        ];
+        eprint!("{}", notes[usize::from(enforced)]);
+        enforced
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_directory_that_cannot_be_inspected_is_reported_rather_than_skipped_silently() {
-        use std::os::unix::fs::PermissionsExt;
+        // The directory is listed, but its full path is longer than
+        // `PATH_MAX`, so opening it fails for every user. In the field
+        // this is a directory without read permission, which cannot stop
+        // root.
+        let base = tempfile::tempdir().unwrap();
+        let staged = base.path().join("staged");
+        write(
+            &staged,
+            &format!("{}/pyproject.toml", "l".repeat(200)),
+            "pytest",
+        );
+        let root = bury_near_path_max(&staged);
 
-        let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "locked/pyproject.toml", "pytest");
-        let locked = dir.path().join("locked");
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let plan = discover(&root).unwrap();
 
-        let plan = discover(dir.path());
-
-        // Restore before asserting so the temporary directory can be
-        // cleaned up even if an assertion below fails.
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-        let plan = plan.unwrap();
         assert!(plan
             .discovery_limitations
             .iter()
@@ -1141,6 +1267,15 @@ mod tests {
     fn a_manifest_that_cannot_be_opened_is_reported_and_hints_nothing() {
         use std::os::unix::fs::PermissionsExt;
 
+        // Only a permission bit can make a manifest inside a discovered
+        // tree unopenable, and root ignores it, so this runs only where
+        // permissions are enforced. The branch itself is covered for root
+        // too, by `metadata_text_reports_a_regular_file_that_cannot_be_opened`.
+        // Kept on one line (hence the skip) so the early return adds no
+        // line that goes unexecuted where permissions ARE enforced, as in
+        // CI, whose coverage gate for this crate is 100%.
+        #[rustfmt::skip]
+        let true = permissions_enforced("a_manifest_that_cannot_be_opened_is_reported_and_hints_nothing") else { return };
         let dir = tempfile::tempdir().unwrap();
         write(
             dir.path(),
@@ -1163,6 +1298,24 @@ mod tests {
         assert_eq!(plan.packages.len(), 1);
         assert!(plan.packages[0].framework_hints.is_empty());
         assert!(plan.packages[0].command_suggestions.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn metadata_text_reports_a_regular_file_that_cannot_be_opened() {
+        // `drop_caches` is a regular file nobody can open for reading. The
+        // kernel checks a sysctl's mode bits itself, without the
+        // CAP_DAC_OVERRIDE bypass a chmod 000 file gets, so this reaches
+        // the open failure for root as well. Its directory stands in for
+        // the discovery root; every component re-check passes first.
+        let mut discovery = discovery_at(Path::new("/proc/sys/vm"));
+
+        assert_eq!(discovery.metadata_text("drop_caches"), None);
+
+        assert_eq!(
+            discovery.limitations.iter().collect::<Vec<_>>(),
+            ["A metadata file could not be read within limits."]
+        );
     }
 
     #[test]
@@ -1221,6 +1374,151 @@ mod tests {
         assert!(environment.framework_hints.is_empty());
         assert!(environment.command_suggestions.is_empty());
         assert!(!environment.workspace_evidence);
+    }
+
+    #[test]
+    fn http_services_and_specification_candidates_are_recorded() {
+        use bc_api_spec::WebFramework;
+        let dir = tempfile::tempdir().unwrap();
+        for (path, content) in [
+            (
+                "pom.xml",
+                "<artifactId>spring-boot-starter-web</artifactId>",
+            ),
+            (
+                "build.gradle",
+                "implementation 'org.springframework.boot:spring-boot-starter-webflux'",
+            ),
+            ("ruby/Gemfile", "gem 'rails'"),
+            (
+                "php/composer.json",
+                r#"{"require":{"laravel/framework":"^11"}}"#,
+            ),
+            ("tools/requirements.txt", "requests==2.0"),
+            ("openapi.yaml", "openapi: 3.1.0"),
+            ("php/storage/api-docs/api-docs.json", "{}"),
+            ("docs/petstore.openapi.json", "{}"),
+        ] {
+            write(dir.path(), path, content);
+        }
+        let plan = discover(dir.path()).unwrap();
+        let services: Vec<_> = plan
+            .http_services
+            .iter()
+            .map(|service| {
+                (
+                    service.root.as_str(),
+                    service.manifests.len(),
+                    service.frameworks.iter().copied().collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            services,
+            [
+                (".", 2, vec![WebFramework::SpringBoot]),
+                ("php", 1, vec![WebFramework::Laravel]),
+                ("ruby", 1, vec![WebFramework::Rails]),
+            ]
+        );
+        assert_eq!(
+            plan.api_spec_candidates,
+            [
+                "docs/petstore.openapi.json",
+                "openapi.yaml",
+                "php/storage/api-docs/api-docs.json"
+            ]
+        );
+        // Strong names are contracts too; weak ones wait for confirmation.
+        assert_eq!(
+            plan.expectation_sources,
+            ["docs/petstore.openapi.json", "openapi.yaml"]
+        );
+        // Older plans without these fields still deserialize.
+        let mut json = serde_json::to_value(&plan).unwrap();
+        json.as_object_mut().unwrap().remove("http_services");
+        json.as_object_mut().unwrap().remove("api_surfaces");
+        json.as_object_mut().unwrap().remove("api_spec_candidates");
+        let old: TargetTestPlan = serde_json::from_value(json).unwrap();
+        assert!(old.http_services.is_empty() && old.api_spec_candidates.is_empty());
+        assert!(old.api_surfaces.is_empty());
+    }
+
+    #[test]
+    fn non_http_api_libraries_are_recorded_as_surfaces() {
+        use bc_api_spec::ApiLibrary;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "events/package.json",
+            r#"{"dependencies":{"kafkajs":"2","@apollo/server":"4"}}"#,
+        );
+        write(
+            dir.path(),
+            "rpc/go.mod",
+            "require google.golang.org/grpc v1",
+        );
+        write(dir.path(), "web/Gemfile", "gem 'rails'");
+        let plan = discover(dir.path()).unwrap();
+        let surfaces: Vec<_> = plan
+            .api_surfaces
+            .iter()
+            .map(|surface| {
+                (
+                    surface.root.as_str(),
+                    surface.libraries.iter().copied().collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            surfaces,
+            [
+                ("events", vec![ApiLibrary::ApolloServer, ApiLibrary::Kafka]),
+                ("rpc", vec![ApiLibrary::Grpc]),
+            ]
+        );
+        assert_eq!(plan.http_services.len(), 1);
+        assert!(plan.render_prompt_context().contains("\"api_surfaces\""));
+    }
+
+    #[test]
+    fn every_standards_documents_are_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in [
+            "schema.graphql",
+            "client/me.graphql",
+            "src/main/resources/graphql/users.graphqls",
+            "asyncapi.yaml",
+            "docs/openrpc.json",
+            "api/proto/orders.proto",
+            "api/pets.raml",
+            "docs/pets.apib",
+            "notes.txt",
+        ] {
+            write(dir.path(), path, "");
+        }
+        let plan = discover(dir.path()).unwrap();
+        assert_eq!(
+            plan.api_spec_candidates,
+            [
+                "api/pets.raml",
+                "api/proto/orders.proto",
+                "asyncapi.yaml",
+                "client/me.graphql",
+                "docs/openrpc.json",
+                "docs/pets.apib",
+                "schema.graphql",
+                "src/main/resources/graphql/users.graphqls",
+            ]
+        );
+        // Strongly named documents are contracts; a weakly named query
+        // file waits for its content to be confirmed.
+        assert!(!plan
+            .expectation_sources
+            .contains(&"client/me.graphql".to_string()));
+        assert!(plan
+            .expectation_sources
+            .contains(&"schema.graphql".to_string()));
     }
 
     #[test]

@@ -1,0 +1,17 @@
+[package]
+name = "bc-api-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bc-redact = { path = "../bc-redact" }
+bc-xml = { path = "../bc-xml" }
+bc-yaml = { path = "../bc-yaml" }
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true

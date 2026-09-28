@@ -1,5 +1,34 @@
 {
   "generate": true,
   "level": "comprehensive",
-  "allowed_support_paths": []
+  "allowed_support_paths": [],
+  "api_spec": {
+    "max_spec_bytes": 1048576,
+    "max_repair_rounds": 2,
+    "max_documents": 8,
+    "reference_files": [
+      "*.md",
+      "*.rst",
+      "*.adoc",
+      "application.yml",
+      "application.yaml",
+      "application.properties",
+      "application-*.yml",
+      "application-*.yaml",
+      "application-*.properties",
+      "appsettings.json",
+      "appsettings.*.json"
+    ],
+    "formats": {
+      "openapi": {"max_documents": 4},
+      "graphql": {"max_documents": 2},
+      "asyncapi": {"max_documents": 2},
+      "openrpc": {"max_documents": 2},
+      "protobuf": {"max_documents": 32},
+      "raml": {"max_documents": 8},
+      "api_blueprint": {"max_documents": 8},
+      "wsdl": {"max_documents": 4},
+      "odata": {"max_documents": 4}
+    }
+  }
 }

@@ -3,7 +3,16 @@
 `bc-sast` is a Rust port of
 [`visa-vulnerability-agentic-harness`](https://github.com/visa/visa-vulnerability-agentic-harness)
 ("VVAH"). This document is the head-to-head measurement between the two,
-taken on 2026-09-06 and 2026-09-07.
+taken on 2026-09-06 and 2026-09-07 against **VVAH v1.2.0**, which was the
+current upstream release on those dates.
+
+> **The baseline is two releases old.** Upstream has since published v1.3.0
+> and v1.4.0, and this port has taken the substance of both (see the
+> changelog). The numbers below have not been re-measured against either,
+> because doing so spends real API budget on both sides; they are reported
+> as what was observed, not as a current standing. Item 7 under
+> [Limitations](#limitations-of-this-comparison) says which findings this
+> most likely affects.
 
 The short version: **detection is a tie, and that is the expected result.**
 Both scanners drive the same model with the same prompt lineage, so both
@@ -63,6 +72,9 @@ plane, which `default.yaml` enables.
 ### Held equal
 
 - **Same model:** `gpt-4o`, `temperature 0`, same OpenAI endpoint.
+  (`gpt-4o` was `bc-sast`'s default `--model` when these runs were made;
+  the default is now the reasoning model `gpt-5.6-luna`, so a rerun must
+  pass `--model gpt-4o` to reproduce them.)
 - **Same targets:** the same checkouts, at the same commits.
 - **Same scope:** the same `step1` exclude list on both sides. Supplying it
   on the Python side also disables the profile's AI auto-exclude survey, so
@@ -691,6 +703,30 @@ rules-based seed.
 sink rules), so `step0.enabled: true` produces real rule content out of the
 box.
 
+### 8. What Ctrl-C does
+
+**Python** has real cooperative cancellation inside S4 and S6: an abort
+flag plus a hard kill of every live verifier subprocess tree, because
+`KeyboardInterrupt` only fires on the main thread while worker threads
+keep dequeuing tasks. The interrupt then propagates: the run ends and no
+report is written.
+
+**The Rust port** stops the way a budget stops (`bc_pipeline_core::
+CancelToken`, `crates/bc-cli/src/cancel.rs`). The first Ctrl-C trips a
+run-wide token every stage gate consults: S4 and S6 start no new chunk or
+session, the calls in flight finish, every stage not yet started is
+recorded as skipped, S8 builds the report without a model call, and the
+partial report, SARIF, CSV and run manifest are still written, marked
+`CANCELED` in Scan Health and `"canceled": true` in the manifest.
+Nothing is published, posted or remediated from a canceled run. Mid-S10,
+the running agent's next model call is refused (its own error path rolls
+the partial patch back) and the `verify_command` is killed as a whole
+process group. A second Ctrl-C exits at once. Both exit with code 130.
+The port differs from Python in writing the partial report at all, and in
+not killing an in-flight model call on the first press: there is no
+subprocess to kill, only an HTTP request that is left to finish or time
+out.
+
 ---
 
 ## Deliberately not ported
@@ -719,17 +755,6 @@ is **removed**, not "carried but dead". `--max-tokens` and
 `--max-scan-seconds` are the functional replacement, and unlike a USD figure
 they are enforceable without a price table.
 
-**Ctrl-C mid-stage abort.** Python has real cooperative cancellation: an
-abort flag plus a hard kill of every live subprocess tree, called from both
-S4 and S6, because `KeyboardInterrupt` only fires on the main thread while
-worker threads keep dequeuing tasks and spawning fresh subprocesses. The
-Rust port has no `SIGINT` handling in the scan path at all. The only
-Ctrl-C mapping in the workspace is inside the interactive remediation TUI's
-key decoder. This is the one item on this list that is a **gap rather than a
-considered subtraction**: it is a cross-stage, process-lifetime concern that
-belongs to a cancellation token threaded through every stage, and that does
-not exist yet.
-
 **`--group-by-app`.** Python's version stages every repository sharing an
 application id into one directory and scans the combined tree as a single
 repo, so cross-repo call-graph edges become visible. That is a change to
@@ -737,13 +762,29 @@ repo, so cross-repo call-graph edges become visible. That is a change to
 separate per-repo reports afterwards would silently misrepresent what the
 flag does, so it is left unimplemented rather than faked.
 
+**`scan_progress.style: llm_debug`.** Python's progress tracker
+(`util/scan_progress.py`) has a style that prints every model call's full
+system and user prompt to stderr. The other four styles are ported
+(`--progress-style`, `crates/bc-cli/src/progress_lines.rs`); this one is
+not, because prompts carry the target's source code, and a debug switch
+that copies source into a CI log is how source ends up in a CI log.
+
 ---
 
 ## Limitations of this comparison
 
 Read these before quoting any number above.
 
-1. **Single runs of a stochastic system.** One sample per app per scanner.
+1. **The upstream baseline is v1.2.0, two releases behind.** Everything
+   here was measured against the release current on the measurement dates.
+   Upstream has since shipped v1.3.0 and v1.4.0. Two measured axes are the
+   ones to distrust first: v1.3.0 rewrote the taint walk this port also
+   adopted, which moves what both sides feed their deep-dive stage, and
+   v1.4.0 added the coverage and grounding work that several
+   "what each one does better" rows below turn on. Read every number as a
+   v1.2.0 comparison, and see item 7 for the rest.
+
+2. **Single runs of a stochastic system.** One sample per app per scanner.
    The `c-cli` 2/4-then-4/4 result on identical inputs shows the noise floor
    is at least one finding per app. No confidence intervals are offered
    because none can be honestly computed from n=1.

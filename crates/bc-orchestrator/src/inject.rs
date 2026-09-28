@@ -347,7 +347,7 @@ mod tests {
         let p = write(
             &d,
             "f.json",
-            // Three flavours of bad record: one with no `id` at all, one
+            // Three flavors of bad record: one with no `id` at all, one
             // that isn't an object, and one that HAS an id but a
             // wrong-typed field — Python names the id in its per-item
             // skip log when it can find one, so both spellings of the

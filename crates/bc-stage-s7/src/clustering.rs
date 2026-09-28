@@ -196,7 +196,7 @@ pub fn attach_duplicates(
         // Two findings can now cluster on an equal CWE alone, with
         // different `vuln_class` strings (see
         // `bc_dedup_core::collapse_trivial`). When the survivor is the
-        // one the model labelled with the generic fallback and the
+        // one the model labeled with the generic fallback and the
         // duplicate carries a specific class, adopt the specific one:
         // the cluster's class is the best label any member had, not
         // whichever member happened to sort first. Without this, the

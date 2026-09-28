@@ -21,7 +21,17 @@ the binary and selected with `--scan-framework <NAME>` and
 `--target-tests [LEVEL]` (alias `--testing-level`). Testing levels are
 `discover`, `unit`, `integration` and `comprehensive`; a bare flag, `e2e` or
 `generate` selects comprehensive scope. They are not loaded from this
-stage-configuration file. Shipped levels do not authorize target execution. To change their content, edit the embedded source and rebuild; see
+stage-configuration file. Shipped levels do not authorize target execution.
+The API specification step and its allowances (a 1 MiB specification cap,
+two repair rounds, at most eight generator sessions per run, the
+standards it may assess (OpenAPI, GraphQL, AsyncAPI, OpenRPC, Protocol
+Buffers, RAML, API Blueprint, WSDL and OData CSDL) with a per-standard
+document cap, and the
+documentation and framework-configuration file patterns a relocation may
+update) are part of the same compiled profiles; `--api-spec off` can
+switch the step off, `--api-spec-formats` can narrow it to some
+standards, and nothing in this file can switch it on or widen it. To change profile content, edit the
+embedded source and rebuild; see
 [Built-in policies and rule sources](built-in-policies.md).
 
 Delivery is selected separately with `--remediation-delivery patch|branch|zip`.
@@ -58,13 +68,14 @@ order:
 3. **If a sibling `config.local.yaml` exists next to your `--config` file**
    (same directory, literal filename `config.local.yaml`), deep-merge it
    **on top** of the result, unless `BC_NO_LOCAL_CONFIG` is set to a
-   non-empty value, in which case it's skipped entirely (present-but-empty
-   does **not** count as set; only a empty/unset env var counts).
-   Meant for a local, gitignored override (e.g. a developer's own
-   `min_confidence` while iterating) layered on top of a checked-in
-   `config.yaml`.
+   non-empty value, in which case it's skipped entirely (an empty value
+   does **not** count as set). Meant for a local, gitignored override
+   (e.g. a developer's own `min_confidence` while iterating) layered on
+   top of a checked-in `config.yaml`. The overlay must pass a trust check
+   first and its merge is announced on stderr; see
+   [`config.local.yaml`: local overlay](#configlocalyaml-local-overlay).
 4. **Expand `${VAR}`/`${VAR:-default}` placeholders** across the *entire*
-   already-merged tree (see below).
+   already-merged tree, refusing a secret-named variable (see below).
 
 The merge primitive throughout is `deep_merge`
 (`crates/bc-config/src/merge.rs`): two nested objects present on both sides
@@ -146,32 +157,82 @@ rule as `BC_NO_LOCAL_CONFIG`).
 
 ## `models.<role>`: per-stage model overrides
 
-A top-level `models:` block picks a different model id (and the sampling
-knobs) per pipeline role. There is no per-role `via:`/`provider:` backend
-selection in this port: `--dialect` is a single global flag, so those two
-keys are read by nothing.
+A top-level `models:` block picks a different model id (and the sampling,
+effort and transport knobs) per pipeline role. There is no per-role
+`via:`/`provider:` backend selection in this port: `--dialect` is a single
+global flag, so those two keys are read by nothing.
 
 ```yaml
 models:
   deepdive:
     id: claude-opus-4-6
-    temperature: 0.0     # optional
-    top_p: 0.9           # optional
-    seed: 42             # optional
+    temperature: 0.0          # optional
+    top_p: 0.9                # optional
+    seed: 42                  # optional
+    effort: high              # optional
+    use_responses_api: true   # optional, OpenAI dialect only
 ```
 
 | Per-role key | Type | Wired to |
 |---|---|---|
 | `id` | string | that stage's `model` |
-| `temperature` | float | `ChatRequest.temperature`. Unset sends none, leaving the provider default, which is `1.0` on both dialects. |
-| `top_p` | float | `ChatRequest.top_p`. The Anthropic dialect drops it whenever `temperature` is also set (the Messages API rejects the pair). |
-| `seed` | integer | `ChatRequest.seed`. **OpenAI dialect only**. The Anthropic Messages API has no seed parameter, so it is silently inert under `--dialect anthropic`. |
+| `temperature` | float | `ChatRequest.temperature`. Unset sends none, leaving the provider default, which is `1.0` on both dialects. Not sent (with a once-per-model warning) to a model that rejects it: GPT-5.x unless its effort is `none`, the o-series, Claude Opus 4.7 and later, and any Claude request with extended thinking on. See [`llm-transport.md`](llm-transport.md#model-capabilities). |
+| `top_p` | float | `ChatRequest.top_p`. The Anthropic dialect drops it whenever `temperature` is also set (the Messages API rejects the pair), and it is dropped for the same models as `temperature`. |
+| `seed` | integer | `ChatRequest.seed`. **OpenAI Chat Completions only**. The Anthropic Messages API and the OpenAI Responses API have no seed parameter, so it is inert there; it is also dropped for the OpenAI models that reject sampling. |
+| `effort` | string | `ChatRequest.reasoning_effort` (and `AgenticConfig.reasoning_effort` on the agentic stages): `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, case-insensitive. Unset sends none, leaving the provider's default tier (S11 excepted, see `step_validate.effort`). A tier the model does not support is clamped to the nearest one it does, and a model that takes no effort gets none. **A value that names no tier fails the run at startup**, where the Python original silently ran the role at the provider default. See [`llm-transport.md`](llm-transport.md#reasoning-effort). |
+| `use_responses_api` | bool | `ChatRequest.openai_api`, the Python original's per-role transport pin: `true` sends this role's calls to the OpenAI Responses API, `false` to Chat Completions, whatever `--openai-api` says, and neither falls back. Absent leaves the role on the client-wide `--openai-api` / `llm.openai_api`. Ignored on the Anthropic dialect. A non-boolean value fails the run at startup. |
 
-The CLI's `--temperature`/`--top-p`/`--seed` apply the same value to
-*every* role; a per-role key here **wins** over them. `--step-timeout` is
-the exception. It OVERRIDES every `stepN.timeout` rather than deferring
-to it, because it exists for an operator whose gateway is slower than the
-profile's author assumed.
+The CLI's `--temperature`/`--top-p`/`--seed`/`--reasoning-effort` apply
+the same value to *every* role; a per-role key here **wins** over them.
+`--step-timeout` is the exception. It OVERRIDES every `stepN.timeout`
+rather than deferring to it, because it exists for an operator whose
+gateway is slower than the profile's author assumed.
+
+**Reasoning models drop sampling.** On GPT-5.x (including the default
+`--model`, `gpt-5.6-luna`) `temperature`, `top_p` and `seed` are accepted
+only at effort `none`; at any other effort, including the model's own
+default when no effort is set, they are dropped with a once-per-model
+warning rather than sent to be rejected. The o-series and Claude Opus 4.7
+and later never take them, and a Claude request that thinks drops
+`temperature`/`top_p` too. So on those models `effort` is the knob, not
+`temperature`.
+
+**Which roles an effort reaches.** Every role in the table below,
+including `models.autoexclude` (which inherits S1's resolved effort and
+transport pin when it sets none of its own) and
+`models.validate.orchestrator` (panel-wide: the S11 personas read `.id`
+only, as for sampling). The target-testing agents started by
+`--target-tests` are the one exception: they run at the provider's
+default effort on the client-wide transport.
+
+### Model lifecycle gate
+
+Before any token is spent (the preflight probe included), every
+configured model, meaning `--model` and each `models.<role>.id` (the S11
+personas included), is looked up in the capability table
+(`bc_llm_client::capabilities`, see
+[`llm-transport.md`](llm-transport.md#model-capabilities)):
+
+- **Retired** (no longer served: every `claude-2*` and `claude-3*`
+  model, `o1-preview`, `o1-mini`, `gpt-4.5`, and any deprecated model
+  whose retirement date has passed, such as `claude-opus-4-1` after
+  2026-08-05): the run stops with an error naming the model and a
+  suggested replacement. `--allow-unsupported-model` turns the error
+  into a warning, for a private gateway that serves its own model under
+  a retired name.
+- **Deprecated or legacy** (for example `gpt-4o`, `gpt-4.1`, the original
+  `gpt-4` and `gpt-3.5` until they retire on 2026-10-23, `o1`, `o3`,
+  `o4-mini`, the original `gpt-5`, Claude Opus and Sonnet 4.0 and 4.5):
+  one warning per model on stderr, and the run continues. The table in
+  `crates/bc-llm-client/src/capabilities.rs` is the authoritative
+  list.
+- **Current, or a name the table does not know** (a gateway alias): no
+  output at all. An unknown name is never refused.
+
+The gate applies to a scan, a `--repo-file` batch and
+`--remediate-from`. `--doctor` and `--setup` show the same verdict as a
+check instead (a retired model is a blocking check), and `--doctor` also
+prints each model's full capability row.
 
 ### Role to stage map
 
@@ -239,9 +300,10 @@ models:
 
 A persona without its own nested entry inherits the shared/default role
 (or the global `--model` if that's absent too). Only `.id` is read on a
-*persona*: `temperature`/`top_p`/`seed` are panel-wide and come from the
-shared role, matching Python, where `via`/`provider` are likewise read from
-`orchestrator` only ("ONE VENDOR PER PANEL", `default.yaml`).
+*persona*: `temperature`/`top_p`/`seed`/`effort`/`use_responses_api` are
+panel-wide and come from the shared role, matching Python, where
+`via`/`provider` are likewise read from `orchestrator` only ("ONE VENDOR
+PER PANEL", `default.yaml`).
 
 **Two accepted spellings for the shared role.** Python's is the nested
 `models.validate.orchestrator` shown above (`validation/cli/_model.py:39-47`;
@@ -254,7 +316,9 @@ keeps working. If both are present the nested one wins.
 Two consecutive scans of the same commit will not produce identical reports
 out of the box: every request goes out at the provider's default
 temperature of `1.0`. This is the profile to start from when you need a
-diffable report for a PR gate, a baseline comparison, or a parity harness:
+diffable report for a PR gate, a baseline comparison, or a parity harness,
+**on a model that accepts sampling** (see the reasoning-model note
+below):
 
 ```yaml
 models:
@@ -271,6 +335,17 @@ step4:
 ```
 
 or, for a single run without a config file, `--temperature 0`.
+
+**On a reasoning model this profile does nothing unless effort is
+`none`.** GPT-5.x (the default `--model` included) rejects `temperature`,
+`top_p` and `seed` at any effort but `none`, so the scanner drops them
+with a once-per-model warning rather than sending them. To use the
+profile there, add `effort: none` to each role (or pass
+`--reasoning-effort none`), which gives up the model's reasoning; the
+o-series and Claude Opus 4.7 and later reject sampling at every effort,
+so on them the only stability levers are a fixed effort and S4's voting.
+Pick a model that accepts sampling (a `*-chat-latest` alias, `gpt-4.1`)
+if reproducibility matters more than reasoning.
 
 **S1/S2/S3/S7/S8 want `temperature: 0` unconditionally.** They each make
 one call whose output is structural (a repo map, a threat list, a chunk
@@ -336,14 +411,96 @@ For example, picking a model id from an env var with a fallback:
 ```yaml
 models:
   deepdive:
-    id: ${BC_DEEPDIVE_MODEL:-gpt-4o}
+    id: ${BC_DEEPDIVE_MODEL:-gpt-5.6-luna}
 ```
 
 (Note: the gateway credential itself is supplied via `--gateway-api-key`/its
 `BC_GATEWAY_API_KEY` env binding directly on the CLI. There is no
 `config.yaml` section for it; `${VAR}` expansion here is a general-purpose
 string-substitution pass over the merged tree, useful for anything you put in
-the file, not a credentials-specific mechanism.)
+the file, not a credentials-specific mechanism. The same goes for the TLS
+material: `--ca-cert`, and the mutual-TLS client identity
+`--client-cert`/`--client-key` (env `BC_GATEWAY_CLIENT_CERT` /
+`BC_GATEWAY_CLIENT_KEY`), are CLI-only. See
+[Gateway TLS and credentials](#gateway-tls-and-credentials) below.)
+
+### Secret-named variables are refused
+
+A variable whose **name** looks like a secret may not be interpolated
+into the config at all (`crates/bc-config/src/policy.rs`, ported from
+upstream v1.3.0). A name counts as secret-bearing when, uppercased, it
+contains `API_KEY`, `APIKEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
+`CREDENTIAL` or `PRIVATE_KEY`, or when any `_`-separated segment ends in
+`AUTH` (so `GH_OAUTH` and `X_AUTH_HEADER` count, `AUTHOR_NAME` does not).
+
+```yaml
+step_remediate:
+  verify_command: make test GH=${GITHUB_TOKEN}   # refused
+```
+
+fails the load with:
+
+```
+config key 'step_remediate.verify_command' interpolates environment
+variable 'GITHUB_TOKEN', whose name matches a secret pattern; ...
+```
+
+The reason is where the value would end up. `verify_command` is a shell
+command line, so a token expanded into it lands in process listings and
+in any log that echoes the command. The check is on the name alone,
+whether or not the variable is set and whether or not it has a
+`:-default`, so a shared profile fails the same way on every machine
+instead of only on the ones that happen to hold the secret. The message
+names the key and the variable, never the value. It is a hard error like
+a YAML parse error: `bc-sast` exits non-zero before any stage runs, and
+`--doctor` reports it on its `--config` line.
+
+Python allows a secret-named variable into four credential keys
+(`sdk.api_key`, `openai.api_key`, `batch.git_token`,
+`output.ingest_token`). This port reads **no** credential from
+`config.yaml`: the gateway key comes from `--gateway-api-key` (or
+`BC_GATEWAY_API_KEY`) and the git token from `--git-token`, and none of
+those four keys is read by anything. So the allowed set is empty and a
+secret-named variable is refused in every key, including those four. A
+profile copied from the Python harness that still carries
+`api_key: ${ANTHROPIC_SDK_API_KEY}` needs that line deleted; it never did
+anything here. To keep a non-secret value that merely has an unlucky
+name, rename the variable or write the value literally.
+
+The same rule applies to the `--step1-config` overlay
+(`apply_step1_overlay`), where each key is checked at its final
+`step1.<key>` path.
+
+## Gateway TLS and credentials
+
+These are CLI flags, not `config.yaml` keys, because they are properties
+of the one gateway connection every stage shares.
+
+| Flag | Env | Notes |
+|---|---|---|
+| `--ca-cert <PEM>` | | Trust this CA bundle instead of the system store. A missing or malformed file stops the run. |
+| `--client-cert <PEM>` | `BC_GATEWAY_CLIENT_CERT` | Present this client certificate for mutual TLS. The file may also hold the private key. |
+| `--client-key <PEM>` | `BC_GATEWAY_CLIENT_KEY` | The private key, when it is a separate file. Refused without `--client-cert`. |
+
+**mTLS fails closed.** A client certificate or key that is missing,
+unreadable, on a network (UNC) path, not a certificate plus private key,
+or a key that does not match its certificate stops the run at startup
+(and blocks `--doctor`/`--setup` and the preflight gate) instead of
+connecting without it. This deliberately differs from the Python
+original, which warns and falls back to server-authenticated TLS: an
+operator who configured mTLS expects the gateway to see a certificate,
+and a silent fall-back either fails later with a harder-to-read
+handshake error or, worse, succeeds against an endpoint that was meant
+to demand one. `--doctor` shows an `mTLS client certificate` line naming
+the file(s) whenever either flag is set.
+
+**Anthropic OAuth tokens.** With `--dialect anthropic`, a
+`--gateway-api-key` that starts with `sk-ant-oat` is an Anthropic OAuth
+token, not an API key. It is sent as `Authorization: Bearer <token>`
+with `anthropic-beta: oauth-2025-04-20` added to any other betas the
+request carries, instead of as `x-api-key` (which the API rejects for a
+token). Any other key is sent as `x-api-key`, as before. Surrounding
+whitespace is trimmed from the key either way.
 
 ## Full key reference
 
@@ -377,9 +534,10 @@ The lower-level schema retains those keys for library compatibility.
 | Key | Default | Notes |
 |---|---|---|
 | `enabled` | `true` (Python: `false`) | Sets BOTH `ScanConfig.step0_enabled` (whether S0 runs at all) and `Step0Config.enabled` (S0's own internal gate) from the same key. |
-| `callgraph_detection` | `"rules"` | `rules` (deterministic, zero-token) or `llm`. An unrecognised value **warns and keeps the default** rather than resolving to `rules`. A typo must not silently buy a cheaper scan. |
+| `callgraph_detection` | `"rules"` | `rules` (deterministic, zero-token) or `llm`. An unrecognized value **warns and keeps the default** rather than resolving to `rules`. A typo must not silently buy a cheaper scan. |
 | `sources_yaml` | `null` | Legacy schema field; non-null values are rejected by the CLI. Edit the embedded source corpus and rebuild. |
 | `sinks_yaml` | `null` | Legacy schema field; non-null values are rejected by the CLI. Edit the embedded sink corpus and rebuild. |
+| `call_graph_max_targets` | *(falls back to `step1.call_graph_max_targets`, `3`)* | Cap on how many same-named definitions one call may resolve to in S0's graph. A zero or absent value falls back to `step1`'s, so both stages share one cap unless you set this. Before upstream v1.3 S0 read neither key here. |
 | `languages` | `null` | Language allowlist; absent/empty means no filter. Recognized entries are `python`, `java`, `javascript`, `typescript`, `go`, `csharp`, `php`, `ruby`, `kotlin`, `rust` and `c-cpp` (plus the usual aliases: `py`/`python3`, `js`/`node`, `ts`, `golang`, `c#`/`cs`/`dotnet`, `rb`, `kt`, `rs`, and `c`/`cpp`/`c++`/`cxx` for the shared C/C++ key). See `bc_callgraph::families::lang_alias`. |
 
 `callgraph.llm.*` (nested under `step0`) configures the annotator used by
@@ -398,7 +556,8 @@ any subset of the keys overrides them:
 | `min_sources` | `1` | Below this, the whole LLM result is discarded and `rules` runs instead. |
 | `min_sinks` | `1` | Same. |
 | `max_heuristic_specs` | `10` | Cap on the supplement above. |
-| `failure_mode` | *(not ported)* | Python's `empty`/`fail`. This port only implements `empty`. Any call failure degrades to `rules` rather than aborting the scan. Both shipped Python profiles set `empty`. |
+| `failure_mode` | *(not ported)* | Python's `empty`/`fail`. This port only implements `empty`. A failed classification batch is skipped and the other batches' specs are kept (upstream v1.3); a quota or guardrail failure stops the remaining batches. If nothing survives, detection degrades to `rules` rather than aborting the scan. Both shipped Python profiles set `empty`. |
+| `self_consistency` | *(not ported)* | Upstream v1.3's majority vote over N samples per batch. Opt-in upstream (default 1, a single pass, which is what this port runs). |
 
 The model for that call comes from `models.graph_annotate` (or its legacy
 alias `models.callgraph_creation`), falling back to `models.preprocess`
@@ -427,7 +586,7 @@ into this repo. Coverage today:
 - **Argument predicates**: a rule can require a shape at one named
   argument, and a rule naming two of them requires both.
   `requires_dynamic_arg`/`dynamic_arg_index` asks whether an argument is
-  something other than a static string literal (a parameterised query is
+  something other than a static string literal (a parameterized query is
   not an injection sink), `requires_any_arg` whether the call passes any
   argument at all, `requires_arithmetic_arg`/`arithmetic_arg_index`
   whether it is a `*`/`+` expression rather than a bare name, literal or
@@ -480,7 +639,7 @@ something a source rule normally spells, and it is the only kind
 markers act on: on any other kind, `reachable_from_unauth` is a free field
 nothing set from evidence, so it is ignored.
 
-**Anything unrecognised becomes `other`, silently, and `other` is not
+**Anything unrecognized becomes `other`, silently, and `other` is not
 inert.** S3's specialist gating reads these kinds
 (`crates/bc-stage-s3/src/specialist.rs`): `has_batch_surface` keeps the
 `batch-etl` lens for a `file` or `cli` entry point, and
@@ -524,7 +683,7 @@ so an invented sink kind loses pairs rather than admitting them.
 |---|---|---|
 | `max_budget_usd` | *(not shipped)* | **Removed.** In Python this is forwarded to the Claude CLI and Claude Agent SDK backends, which enforce it themselves; the two backends this port's dialects correspond to ignore it. Neither of the enforcing backends is ported, so the key is no longer shipped as a default. Setting it warns. |
 | `max_turns` | `40` | Agentic turn cap. Agrees with `Step1Config::new()` (no drift). |
-| `mode` | `"full"` | `full` always runs S1's own agentic exploration; `gap_fill` skips it when the S0 seed is already strong enough. An unrecognised value warns and keeps the default. |
+| `mode` | `"full"` | `full` always runs S1's own agentic exploration; `gap_fill` skips it when the S0 seed is already strong enough. An unrecognized value warns and keeps the default. |
 | `call_graph` | `"regex"` | Which call-graph backend S1 uses: `regex` (Python's shipped default) or `tree_sitter`. **This port defaults to `tree_sitter`** when you don't set the key, deliberately: it yields real `def_spans` and exact end lines, which several downstream stages in this port were built against. Set `regex` explicitly for Python's backend. |
 | `auto_exclude` | `false` | Run the AI survey pass that proposes extra step1 exclusions before S1. `--auto-step1` forces it on; `--no-auto-step1` forces it off and wins over both. |
 | `auto_exclude_max_tokens` | `8000` | Caps that survey's prompt. |
@@ -555,6 +714,32 @@ so an invented sink kind loses pairs rather than admitting them.
 | `promote_on_insecure_value` | `true` |
 | `max_file_kb` | `512` |
 
+**The auto-exclude overlay is model-authored, so it is guarded**
+(upstream v1.3). The survey model reads repository content, and a model
+must not be able to silently remove a whole language, or the whole
+repository, from a security scan:
+
+- Any proposed `exclude_exts` or `exclude_globs` entry that would erase an
+  entire scanner-known language (`.pug`, `*.hbs`, `**/*.py`) is vetoed.
+  Compound suffixes (`.pb.go`, `.min.js`) and path-scoped globs
+  (`gen/**`) pass. Only the model's overlay is policed: an operator can
+  still exclude a language in `step1` directly.
+- The overlay's effect is then measured with the same walk S1 runs,
+  including `max_file_kb`. An overlay that would leave zero files in a
+  non-empty scope is discarded (its `config_dedup` tuning is kept), and
+  the scan runs as with `--no-auto-step1`. One that keeps under 10% of
+  the files is applied but logged as aggressive.
+
+`bc_stage_s1::run_autoexclude_with_diagnostics` returns both decisions
+(`AutoExcludeDiagnostics`: vetoed entries, files before and after,
+discarded, aggressive).
+
+**The call-graph supplement has a backstop.** When the agent produced no
+seeds at all (no call graph, entry points or sinks, for example a refusal
+parsed down to an empty map), the regex supplement now seeds from the
+function definitions found on disk instead of doing nothing, so the scan
+still gets a call graph. `CallGraphReport.backstop_seeds` records it.
+
 ### `step2`: threat modeling
 
 | Key | Default | Notes |
@@ -568,7 +753,76 @@ so an invented sink kind loses pairs rather than admitting them.
 | `max_config_reps` | `80` | |
 | `max_api_artefacts` | `100` | |
 | `max_function_sites` | `80` | Truncation cap on `Evidence::function_sites`. |
+| `max_config_rep_chars` | `2000` | Per-body cap on representative configuration contents, applied after the whole file is redacted. `0` lists every representative by path only. |
+| `max_config_rep_bodies` | `12` | How many representatives carry a body (security-relevant names such as `web.xml` or `application.yml` first); the rest are listed by path only. |
+| `max_manifest_depth` | `3` | How many directories below the root the manifest search descends. |
+| `max_manifests` | `12` | Cap on manifests packed, across all kinds. |
+| `max_manifests_per_kind` | `2` | Cap on manifests of any one kind (floored at `1`), so twelve `package.json` files cannot crowd out a lone `pom.xml`. |
+| `max_manifest_total_chars` | `24000` | Aggregate cap across the whole manifests block, after each file's own `max_manifest_chars`. |
+| `max_assets` | `40` | Assets kept, most sensitive first (name as the tiebreak). |
+| `max_trust_boundaries` | `60` | Trust boundaries kept, widest asset reach first (entry point as the tiebreak). |
+| `agentic` | `false` | Swap the single-shot call for a read-only tool session. Needs the orchestrator to hand S2 a tool executor (`Stage2::with_tools`); without one the stage warns and stays single-shot. |
+| `allowed_tools` | `["Read", "Glob", "Grep"]` | Tools the agentic session may use. Anything outside those three fails the stage closed. |
+| `max_turns` | `12` | Turn bound for the agentic session, its only real bound. |
 | `timeout` | *(none)* | No Python `step2.timeout` key; readable here, and overridden by `--step-timeout`. |
+
+Every cap here treats `0` as a real value ("emit none of this"), not as
+"use the default". A negative or non-numeric value keeps the default.
+
+**Evidence, v1.4.0.** Ported from upstream `s2_threatmodel.py`
+(`crates/bc-stage-s2/src/{docs,manifests,config_reps,repo_read}.rs`):
+
+- *Two views of the repository.* Blocks about the call graph (modules,
+  entry points, function sites, call edges) read the AST frontier. Blocks
+  about repository shape (language breakdown, components, configuration
+  representatives, API artifacts, design documents) read the full
+  in-scope file list, so a 220-file frontier no longer hides most of a
+  monorepo's configuration.
+- *Contained reads.* Every read goes through `bc_pathjail::confine`, so a
+  committed symlink that resolves outside the repository (a
+  `README.md` pointing at a host file, say) is never read into the prompt.
+  Reads are also bounded to `4 * cap + 4` bytes; the truncation notice
+  then reports the file's byte length (for ASCII, its character count).
+- *Documents.* `THREAT_MODEL.md`, `SECURITY.md` and `ARCHITECTURE.md` come
+  before the READMEs and the changelog. Each present document first gets
+  a third of what remains of `max_doc_chars`; a second pass grows the
+  truncated ones with what is left, so one large README cannot starve the
+  threat model and a lone README still gets the whole budget.
+- *Manifests.* A walk up to `max_manifest_depth` deep, skipping the
+  default excluded directories (`node_modules`, `vendor`, tests, ...) and
+  never descending a symlink, keeping `max_manifests_per_kind` per kind
+  and taking kinds round-robin up to `max_manifests`. `package.json` and
+  `composer.json` keep only their name, version, dependency and script
+  keys. `pyproject.toml` keeps its `[project]` name, version and
+  dependency keys and the `[project.optional-dependencies]` and
+  `[tool.poetry.dependencies]` tables, extracted line by line (upstream
+  parses with `tomllib`; no TOML parser is a dependency here, and the
+  kept lines stay TOML rather than becoming JSON).
+- *Configuration representatives.* One per immediate parent directory per
+  round, breadth-first, security-relevant names first, and selectable even
+  when the extension (`.xml`, `.config`, `.plist`) is not a config
+  extension. The first `max_config_rep_bodies` carry their contents,
+  **redacted in full with `bc_redact` before being capped**: capping first
+  could cut a secret in half so that neither half matches a redaction
+  pattern. A file over 500,000 characters goes path-only rather than being
+  cut before redaction.
+
+**Reply handling, v1.4.0.** A reply that fails to extract or validate
+(most often a bare string where an asset object is required) gets one
+repair call with the same budget, since it must re-emit the whole model.
+A second failure fails the stage, and the orchestrator continues with no
+threat model. A non-empty object sharing no key with the schema is refused
+rather than read as an empty model. Threats are then ranked
+deterministically (impact, the sensitivity of the asset threatened,
+likelihood, actor reach, uncontrolled before controlled, id) and capped at
+`max_threats`; a dropped threat that was the only one covering a trust
+boundary is promoted back in place of the lowest-ranked threat whose
+removal uncovers nothing. The baseline checklist items now carry ids
+(`BL-WEB-A01`, `BL-NAT-416`, ...) and the prompt requires a disposition
+for each: a threat whose `evidence` starts `baseline: <ID>`, or an
+`open_questions` entry starting `<ID>:`. Items disposed of neither way are
+logged (audited before the cap) and reported in
+`ThreatModelDiagnostics.baseline_undisposed` from `Stage2::run_detailed`.
 
 **The nine narrowing caps.** S2 narrows twice: once to build the AST
 *frontier* it reasons over (`ctx.ast_context_view(...)`), and again to
@@ -614,14 +868,121 @@ which never apply because `_STEP_DEFAULTS` always supplies the key) to
 | `catchall_enabled` | `true` | |
 | `catchall_chunk_loc` | `4000` | |
 | `catchall_max_files` | `100` | |
+| `catchall_mode` | `"all"` | `all` or `reachable_only`. See "Catch-all coverage" below; upstream's `default.yaml` ships `reachable_only`, this port deliberately does not. |
+| `catchall_reachable_min_ratio` | `0.0` | Under `reachable_only`, fall back to `all` when fewer than this fraction of eligible files are reachable. `0` disables the check. |
+| `catchall_reachable_min_files` | `0` | The same fail-open guard as an absolute reachable-file floor. |
+| `catchall_deduct_lens_coverage` | `false` | Run catch-all last, and do not count a specialist lens's claim on a file as coverage. See below. |
+| `max_cohesion_groups` | `64` | Cap on directory-fallback cohesion groups; past it the smallest directory folds into its parent. `0` means the default. |
 | `max_files_per_chunk` | `80` | |
 | `specialist_chunk_loc` | `10000` | |
-| `specialists` | *(structural)* | List; falls back to `["crypto", "logic-bug", "access-control", "batch-etl", "iac"]`. |
+| `specialists` | *(structural)* | List; falls back to the eleven lenses listed under "Specialist lenses" below. |
+| `threat_surface_fallbacks` | `true` | Give every threat no other chunk cites a deterministic fallback chunk. |
+| `threat_fallback_max_files` | `12` | Candidate-file cap per fallback chunk. `0` means the default. |
+| `max_threat_fallback_chunks` | `50` | Ceiling on fallback chunks. Suppressed candidates are counted in the S3 diagnostics. `0` means the default. |
+| `max_prompt_threats` | `50` | Ranked threats the strategist prompt carries. `0` means the default. |
+| `max_prompt_assets` | `20` | Threat-model assets in the strategist prompt. `0` means the default. |
+| `max_prompt_boundaries` | `30` | Trust boundaries in the strategist prompt. `0` means the default. |
+| `max_prompt_threat_context_chars` | `2500` | Characters of threat-model system context in the strategist prompt. `0` means the default. |
 | `taint_chunk_slice` | `"file"` | **Read by S4, not S3**. See the `step4` table below. It is declared here because that is where every shipped Python profile sets it. |
 
 Every non-structural key here agrees with `Step3Config::new()`, except
 `taint_chunk_slice`, which has no `Step3Config` field at all: it is
 resolved at config load onto `Step4Config::taint_chunk_slice`.
+
+Unlike S2, where a `0` cap means "emit none of this block", the S3 caps
+marked above read `0` as "use the default", as upstream's `_cap` does.
+`risk_chunk_loc: 0` is the exception: it switches oversize splitting and
+the threat-fallback LOC trim off.
+
+#### The strategist's file inventory
+
+The decompose prompt opens with a FILE INVENTORY that gives every file,
+entry point and sink in the (frontier-narrowed) context a deterministic
+id (`F001`, `E001`, `K001`, numbered in sorted order so the prompt is
+byte-identical across runs), and the system prompt tells the model to
+cite ids only. Ids are resolved against that same inventory, so an
+unknown id is simply dropped and no model-authored path can name a file
+outside the repository. A model that sends paths anyway gets them
+suffix-matched at a `/` boundary against the ground truth: a unique match
+is kept (`core/utils.py` for `app/core/utils.py`), anything else is
+dropped. A chunk left with no files is dropped rather than sent to S4, and
+one off-schema chunk no longer discards the rest of the ranking. When S2
+produced no ranked threats, a variant system prompt without the
+must-cite-a-threat rule is used, so the model neither refuses nor invents
+threat ids.
+
+#### Catch-all coverage
+
+Catch-all sweeps every eligible file no risk, taint or threat-fallback
+chunk claimed. Two modes:
+
+- `all` (this port's default) sweeps every eligible file.
+- `reachable_only` drops eligible *source* files that are neither
+  forward-reachable from an entry point nor backward-reachable to a sink
+  on the file-level call graph, and lists them on
+  `TaskManifest.unreachable_files`. Non-source files (`.env`, `Makefile`,
+  `conf/app.conf`) it would drop are re-added instead, since no specialist
+  lens reviews a non-source file, and counted as forced coverage in the S3
+  diagnostics. A file in a language the call graph has no node for at all
+  is treated as reachable, and that coverage check reads only call-graph
+  files, never entry-point or sink files, so one entry point in a
+  language the graph engine cannot parse no longer strips the fail-safe
+  from every other file in it. The sparsity guards measure over every
+  eligible file in the repository, not just the ones still uncovered.
+
+Upstream's `default.yaml` runs `reachable_only` with
+`catchall_reachable_min_ratio: 0.5`. This port keeps `all`: it is a
+superset of what `reachable_only` reviews, and a security scan should not
+make coverage depend on a call graph that is blind to reflection and
+dependency injection. Set both keys to reproduce upstream.
+
+`catchall_deduct_lens_coverage: true` (upstream's `sdk`, `full` and
+`taint` profiles) runs catch-all after the specialists and the threat
+fallback, and does not count a specialist's claim as coverage: a lens is
+scoped guidance, not a generic review, so every source file still gets an
+unscoped pass unless a risk, taint or threat-fallback chunk claimed it.
+
+#### Specialist lenses
+
+The default list mirrors upstream v1.4's `default.yaml`: `crypto`,
+`logic-bug`, `access-control`, `batch-etl`, `iac`, `deserialization`,
+`csrf`, `sensitive-data`, `hardcoded-creds`, `log-injection` and
+`injection`. Every lens is gated on evidence that its surface exists, so a
+lens with nothing to review costs nothing:
+
+| Lens | Runs when |
+|---|---|
+| `access-control` | an authorization surface exists: externally facing app profile, a network/IPC or unauthenticated entry point, an auth design control, or a remote-actor threat |
+| `crypto`, `deserialization` | a source file mentions a crypto or deserializer API |
+| `batch-etl` | a file/CLI entry point, COBOL or JCL, or a batch-I/O pattern in source |
+| `iac` | any IaC file exists (it reviews only IaC files) |
+| `hardcoded-creds` | a literal credential assignment, comparison or dict key appears (a `${...}` placeholder does not count) |
+| `csrf` | an authorization surface exists, or a CSRF marker or state-changing route annotation appears |
+| `injection` | any injection-family sink appears (SQL/NoSQL, command, LDAP/XPath/XML, HTTP client, file path or archive, template, redirect or header, regex compile) |
+| `sensitive-data`, `log-injection` | the repository has entry points |
+| `logic-bug` | always |
+
+The content gates read each source file once for all lenses. Lenses that
+share the default source buckets are emitted shard-major (every lens for
+shard 1, then shard 2), each chunk stamped with `Chunk.shard_id`
+(`shard-NN`, or `iac-shard-NN` for the IaC buckets), so consecutive S4
+calls for one shard send the same source prefix and can reuse a provider
+prompt cache. S4 injects every lens body, the five newest from
+`bc_stage_s4::lens_hints`; the `csrf`, `hardcoded-creds`,
+`sensitive-data` and `log-injection` findings they produce survive S5's
+`require_evidence` gate through its point-of-occurrence exemption (see
+`step5_prefilter`).
+
+#### Cohesion groups
+
+Files with no module membership and no call-graph edge are grouped by
+their immediate parent directory (upstream v1.3; earlier builds used the
+first two path segments, which lumped whole subtrees together). When that
+yields more than `max_cohesion_groups` groups, the smallest directory
+folds into its parent, one level at a time, until the count fits. Oversize
+LLM chunks are split with the same grouping, but `taint-` chunks are never
+split: their source, sink and path metadata name one entry-to-sink pair,
+and S4's own loaders handle their size.
 
 #### `pack_merge_underfilled`: pack by code volume, not by group count
 
@@ -644,7 +1005,9 @@ group's name and records how many more folded in, for example
 `cg:handlers (+7 more groups)`.
 
 Measured on two real trees with no call graph available, so grouping
-falls back to depth 2 directories:
+fell back to directories (these figures predate the move from depth 2 to
+immediate-parent grouping, which yields more, smaller groups before
+coalescing):
 
 | Target | Pass | Buckets before | Buckets after |
 |---|---|---|---|
@@ -676,9 +1039,69 @@ front of a single call.
 | `taint_runs` | *(none)* | Per-kind run override for taint chunks; falls back to `runs`. |
 | `taint_chunk_slice` | *(none, falls back to `step3`'s `"file"`)* | `file` or `function`. Optional override of `step3.taint_chunk_slice`; no shipped Python profile sets this half. See below. |
 | `frontier_max_funcs_per_file` | `24` | Per-file cap on def-spans the `function`-mode graph slice may take before shipping that file whole instead. Only consulted when slicing is on. |
+| `shard_cache_gating` | `true` | Hold each specialist lens on a shard until the shard's first lens (its leader) has returned, so the rest read the shard's cached prompt prefix instead of each writing it again. See "Shard cache gating" below. |
 
 `runs > 1` at `temperature: 0` is clamped to `runs: 1, vote_threshold: 1`
 with a warning. See "Reproducible runs" above.
+
+**Reply handling with no key of its own** (ported from upstream v1.4.0):
+
+- *Shape check and one repair.* A reply must carry a findings list: an
+  object whose `findings` is an array (`{"findings": []}` is the
+  legitimate "found nothing"), or a non-empty bare array. `{}`, `[]`,
+  `{"findings": null}` and a misspelled key are refused rather than read
+  as zero findings (`crates/bc-stage-s4/src/findings_shape.rs`). A
+  refused or unparseable reply gets exactly one repair call, worded for
+  the failure (restore the `findings` key for a shape error, fix the
+  syntax only for a syntax error) and capped at
+  `min(max_tokens, 12000)` output tokens. If the repaired reply still
+  fails, that run fails, so the coverage loss is recorded instead of
+  hidden.
+- *Vote threshold follows the runs that succeeded.* With `runs: 3` and
+  `vote_threshold: 2`, two failed runs used to leave every surviving
+  finding one vote short, and the chunk completed with nothing. The
+  threshold is now `min(vote_threshold, runs that succeeded)`.
+- *Empty chunks are skipped.* A chunk with no files is recorded as
+  `skipped` before any model call, never as `completed`.
+- *Binary and data-URI elision.* Before redaction, a file whose first
+  8192 characters contain a NUL or more than 10% U+FFFD collapses to a
+  one-line `[binary content elided: <path> is not text]` marker, and
+  every `data:<type>;base64,...` URI is replaced in place (no line
+  shifts) with `[data-uri <type> elided: N chars]`. A gateway was seen
+  rejecting whole requests over an embedded data-URI.
+- *Findings cut by `max_findings_per_run`* are counted, not silently
+  dropped. The counts (`json_repairs_attempted`,
+  `json_repairs_succeeded`, `findings_truncated`,
+  `vote_threshold_clamped`, `empty_chunks_skipped`) land in
+  `DeepdiveOutput.diagnostics`.
+
+#### Shard cache gating
+
+Every deep-dive call carries a scan-constant context block (CMDB profile,
+compact threat model, entry-point inventory, trust rule) as its cache
+prefix, and every specialist lens on one S3 shard adds that shard's
+source to it, byte-identical across the lenses (see "Prompt caching" in
+[`llm-transport.md`](llm-transport.md)). A cache entry becomes readable
+only when the call that writes it returns, so lenses dispatched back to
+back would each write the same prefix at the cache-write rate. With
+`shard_cache_gating: true` (upstream v1.4.0's `_shard_gates`) the first
+lens of each shard runs at once and the others wait for its call to
+return:
+
+- A waiting lens gives its `parallel` slot back while it waits, so other
+  chunks keep running and `parallel: 1` cannot stall. The cost is
+  latency for the waiting lenses, never throughput.
+- The waits are bounded: 15 s for the leader to start, 240 s for it to
+  finish. Past either, the lens runs anyway and the prefix may be written
+  twice. A leader that fails, is stopped by the budget or is aborted
+  releases its lenses at once.
+- Confirm/refute taint chunks carry no prefix and are never held.
+- The counters `leader_start_cap_expired`, `gate_cap_expired` and
+  `sibling_parked_ms` land in `DeepdiveOutput.diagnostics`.
+
+Set it `false` when the provider or gateway has no prompt cache, where
+waiting buys nothing. Upstream switches it off itself on such a route;
+S4 cannot see the route here, so it is an operator choice.
 
 #### `taint_chunk_slice`: ship the path, not the files
 
@@ -725,6 +1148,19 @@ works and `step4` wins.
 | `min_pre_confidence` | `0.6` | |
 | `require_evidence` | `true` | |
 | `ast_backfill_evidence` | `true` | Whether the AST/call-graph pass backfills missing source/sink refs on surviving findings. Was unread; now wired to `Step5Config.ast_backfill`. |
+
+**`require_evidence` exempts point-of-occurrence findings** (upstream
+v1.3). A finding is exempt when its `vuln_class` is information leak, its
+CWE is a hardcoded-credential class (798, 259, 321, 256) or a
+missing-control class (352, 1004, 614, 307, 778, 311, 312, 532, 209), or
+its text carries credential evidence. For these the committed value, the
+missing decorator or the log call IS the evidence; there is no
+source-to-sink flow to cite, so requiring one silently dropped every CSRF,
+hardcoded-credential and log-injection finding. The exemption is from the
+flow requirement only: every other gate still applies. The same predicate
+keeps such a finding when it sits under a test or fixture path, as
+upstream does. Exempted findings are counted in
+`PrefilterDiagnostics::evidence_exempted`.
 
 **S4's prompt names `min_pre_confidence`'s number as a floor of its own.**
 When the deep-dive sees a handler with no visible authentication or
@@ -795,7 +1231,7 @@ back to the model's own `code_snippet`, or to no source at all, when a file
 cannot be read. All three claims are also in the S4 hints and the S6
 verifier prompt, which is what catches the cases the gates deliberately
 leave alone, along with six more language facts the gates have no
-mechanical half for (parameterised SQL, Rust's safe-code memory guarantees,
+mechanical half for (parameterized SQL, Rust's safe-code memory guarantees,
 Go's real goroutine parallelism, Java atomicity, bounded vs unbounded C
 copies, and what the Python/Ruby GIL does *not* prevent). See
 [architecture.md: Language knowledge in the prompts](architecture.md#language-knowledge-in-the-prompts).
@@ -810,6 +1246,25 @@ copies, and what the Python/Ruby GIL does *not* prevent). See
 | `max_turns` | `30` | |
 | `allowed_tools` | *(structural)* | List; falls back to `["Read", "Glob", "Grep"]`. |
 | `timeout` | *(none)* | Per-turn deadline in seconds; no Python key. `--step-timeout` overrides it. |
+| `progress_file` | `false` | Keep `<state-dir>/s6_progress/<run_id>/s6_progress.json` up to date while S6 verifies (status, total, completed, remaining, a count per outcome, `updated_at`), rewritten atomically after each finding. `--s6-progress-file` turns it on too. Ported from Python's `_S6Progress`; see `docs/outputs.md`. |
+
+**One verdict-format repair, no key.** A verifier reply with no parseable
+`VERDICT:` line used to become `VERIFY_ERROR` straight away. Now, when
+the reply still names `TRUE_POSITIVE` or `FALSE_POSITIVE` somewhere, S6
+makes exactly one repair call asking the model to restate (not
+reconsider) its conclusion in the two-line format
+(`crates/bc-stage-s6/src/repair.rs`, ported from upstream v1.4.0). The
+restated verdict is adopted only if it agrees with the one token the
+first reply named, or if the first reply named both. Otherwise, and
+whenever the repair call fails or the budget gate has tripped, the
+finding stays `VERIFY_ERROR`, and the unparseable text is logged
+redacted in full before being cut to 200 characters. A reply naming
+neither token gets no repair call, since there is nothing to restate and
+the model would have to invent a verdict. A failed repair never counts
+toward the guardrail-abort gate. Unlike upstream, the repair session is
+offered no tools: it must not reopen the analysis. The counts land in
+`VerifyOutput.diagnostics` (`verdict_repairs_attempted`,
+`verdict_repairs_adopted`).
 
 ### `step7_dedup`: semantic finding dedup
 
@@ -834,6 +1289,48 @@ Setting any of these under `step7_dedup` applies identically to
 | `max_tokens` | `64000` | |
 | `timeout` | `3600` | Per-call deadline in seconds, mapped to `ChatRequest.timeout`. Was dead; now wired. `--step-timeout` overrides it. |
 
+S8 never fails the run; it degrades (see `crates/bc-stage-s8/src/
+degrade.rs`). Three behaviors ported from upstream v1.4.0:
+
+- A scan with no findings **and** `total_files_in_scope == 0` gets the
+  summary "0 files analyzed: no conclusion can be drawn about this
+  repository..." with `degraded: true`, rather than the clean "No
+  findings survived adversarial verification." Reading nothing and
+  finding nothing are opposite claims.
+- Provider, parse and hydration error text embedded in the delivered
+  summary is redacted in full with `bc_redact` and only then capped at
+  400 characters, so a secret straddling the cap cannot survive half
+  redacted. The unparseable-reply log excerpts (first 500, last 200
+  characters) follow the same order.
+- When a parseable reply ranks fewer findings than it was given (every
+  entry discarded as a string index, out of range or a repeat), S8 logs a
+  warning naming how many findings ship unranked at their CVSS band. A
+  salvaged top-level chains array, which has no ranked entries by
+  design, does not warn.
+### `scan_progress`: text progress lines
+
+Not a stage: the plain-text `[progress]` lines `bc-sast` prints to
+stderr for logs nothing redraws in place (CI, `tee`, a container's
+captured output), ported from the Python original's `scan_progress`
+section.
+
+| Key | Default | Notes |
+|---|---|---|
+| `enabled` | `false` | Print the lines, and switch the terminal progress bar off (both write to stderr). `BC_SCAN_PROGRESS_ENABLED=1` (or `true`/`yes`) and `--progress-style` also turn them on; any one of the three is enough. |
+| `style` | `compact` | `compact` (stage start/done lines with their counters, S4 chunk progress, the S4 summary), `verbose` (compact plus running findings counts and per-stage tokens and cost), `summary_only` (the S4 summary alone) or `stage_only` (numbered `▶`/`✓` stage lines only). An unrecognized value falls back to `compact`, as in Python. `--progress-style` wins over it. |
+
+The Python default profiles ship `enabled: true`; this port keeps the
+bar as its default on a terminal and leaves the lines off unless asked
+for. Python's `llm_debug` style, which prints every prompt's text, is
+deliberately not ported: prompts carry source code that does not belong
+in a CI log. See `USER_GUIDE.md` §7 for sample output.
+
+```yaml
+scan_progress:
+  enabled: true
+  style: stage_only
+```
+
 ### `llm`: transport-level model-call settings
 
 Not a stage: a top-level section for settings that belong to the HTTP
@@ -842,6 +1339,10 @@ versus Python, which has no `llm:` section at all.
 
 | Key | Default | Notes |
 |---|---|---|
+| `openai_api` | `"auto"` | Which OpenAI API shape the OpenAI dialect speaks: `chat` (Chat Completions), `responses` (the Responses API) or `auto` (Responses first for known reasoning models, Chat Completions for everything else, learning per model). `--openai-api` and `BC_OPENAI_API` win over it. The per-role pin is `models.<role>.use_responses_api`. Ignored on the Anthropic dialect. A value that is none of the three fails the run. See [`llm-transport.md`](llm-transport.md#openai-chat-completions-or-the-responses-api). |
+| `cache_markers` | `true` | The prompt-cache kill switch (Python's top-level `cache_markers: "on"`/`"off"`). `false` sends no Anthropic `cache_control` and no OpenAI `prompt_cache_key`. `--no-cache-markers` can only turn it off. |
+| `cache_min_block_tokens` | `null` | Force the Anthropic minimum cacheable prefix, in tokens, instead of the per-model table (Python's top-level `cache_min_block_tokens`). A positive whole number or `null`. |
+| `cache_ttl` | `"5m"` | Anthropic cache lifetime: `5m` or `1h`. One-hour writes cost twice the base input rate instead of 1.25x and pay off only when the same prefix is re-read after more than five minutes; the run's cost report prices them at that rate. Inert on the OpenAI dialect. |
 | `stream_large_responses` | `false` | Send any model call asking for at least **21,333** output tokens as a server-sent-event stream instead of one JSON response body. `--stream-large-responses` is the CLI equivalent; the flag can only turn it ON (a bare boolean flag has no "explicitly off" spelling), so a config that already enabled it always wins over the flag's absence. |
 
 **What it changes, and what it does not.** The streamed pieces are
@@ -851,7 +1352,11 @@ the tool calls, the token usage and the stop reason are identical either
 way, and no stage can tell which mode ran. Per-call timeouts
 (`stepN.timeout` / `--step-timeout`) still bound the whole stream, not
 just its first byte, and the same-call parameter corrections
-(`temperature` drop, `max_tokens` rename/clamp) still apply.
+(`temperature` drop, `max_tokens` rename/clamp, and the rest listed in
+[`llm-transport.md`](llm-transport.md#quirk-memory-learned-rejections))
+still apply. Those corrections are now remembered per model for the
+life of the process, so a rejection is paid once per model rather than
+once per call.
 
 **When to turn it on.** A 64,000-token generation sends nothing at all
 until it finishes, which a gateway or proxy with its own idle timeout in
@@ -875,7 +1380,35 @@ by `AgenticConfig`'s own 16,000-token ceiling, and `step6_verify` has no
 ```yaml
 llm:
   stream_large_responses: true
+  openai_api: auto        # chat | responses | auto
+  cache_markers: true
+  cache_min_block_tokens: null
+  cache_ttl: 5m           # 5m | 1h
 ```
+
+Every `llm.*` key is validated when the client is built: an unknown
+`openai_api` or `cache_ttl`, a non-boolean `cache_markers` or a
+non-positive `cache_min_block_tokens` fails the run rather than falling
+back to a default, since each one changes what reaches the wire or what
+the run costs. **Divergence from Python:** the two cache keys live under
+`llm:` here, where Python reads them at the top level; a Python profile's
+top-level `cache_markers: "off"` is not read by this port, so move it to
+`llm.cache_markers: false`.
+
+**Truncated replies (VVAH-E005).** Not a key, but transport behavior
+every stage shares. A reply that stops because it hit its `max_tokens`
+budget (OpenAI `finish_reason: length`, Anthropic `stop_reason:
+max_tokens`) is sent once more at double the budget. If that reply is
+cut off too, or the provider refuses the doubled budget with a 400
+naming `max_tokens`, the call fails with a `[VVAH-E005] truncated LLM
+response` error that carries the partial reply, rather than handing a
+half-written JSON document to the parsers. It is not retried further and
+does not stop the scan: the one chunk or session fails and is reported
+as such. The doubled budget is uncapped on the single-shot stages (the
+provider's own 400 marks the cap, as on the Python original's OpenAI
+route); an agentic session can cap it with
+`AgenticConfig::max_tokens_ceiling`, which has no config key yet. Before
+this, the port passed a truncated reply through as if it were complete.
 
 ### `inject`: external context feeds
 
@@ -932,14 +1465,15 @@ Python counterpart. S10's rollback gates are a Rust-side addition. See
 
 | Key | Default | Notes |
 |---|---|---|
-| `enabled` | `false` in `step_defaults.rs`, but effectively **`true`** unless *your own file* explicitly sets it. See the dedicated callout above. | |
-| `effort` | `"high"` | **Dead**. `bc-stage-s11`'s module doc comment states explicitly there's no reasoning-effort dial in this port's `AgenticConfig` to apply it to. |
+| `enabled` | `false` in `step_defaults.rs`, but effectively **`true`** unless *your own file* explicitly sets it. See the dedicated callout above. | `--validate`/`--no-validate` win over it. Deliberately ON by default although vvaharness v1.4.0 ships it off: S11 is what rolls back a patch it grades `Not Fixed`/`UNVERIFIABLE`. See `docs/validation.md`. |
+| `effort` | `"high"` | **Wired**: the S11 panel's reasoning-effort tier (Python's `DEFAULT_EFFORT`, also `high` with no `--config`). `--reasoning-effort` overrides it, as `--step-timeout` overrides a `stepN.timeout`, and `models.validate.orchestrator.effort` overrides both. A value that names no tier fails the run at startup. |
 | `max_turns` | `50` | Agrees with `Step11Config::new()` (no drift). |
 | `max_budget_usd` | *(not shipped)* | **Removed.** Same reasoning as S6 and S10. Setting it warns. |
 | `max_findings` | `20` | **Wired** (this doc previously said "Dead"): caps in-scan validation to the top-N validatable findings by CVSS, via `Step11Config::max_findings` and `bc_orchestrator::remediate`. `0`/absent validates every validatable finding. |
 | `cross_repo_analyzer` | *(none)* | Opt in to the third validator persona. See the section above. |
 | `timeout` | *(none)* | Per-turn LLM deadline in seconds; no Python key. |
 | `allowed_tools` | *(structural)* | List; falls back to `["Read", "Glob", "Grep", "DiffTouched", "ChangedLines", "DiffImpactMap", "PatternScan", "TestInventory"]`, the three readers plus the five deterministic fact tools, matching Python's `DEFAULT_FACT_TOOLS`. Read-only by construction: S11 is never given `Edit`/`Write`/`Bash`. Setting this **replaces** the list, it does not merge. |
+| `split_ties_score` | `true` | Whether a two-way persona tie one step apart (`pass`/`partial`, `partial`/`fail`) is scored as `SPLIT`, the conservative status standing (`true`, this port's behavior), or flagged so the whole fix is `UNVERIFIABLE`, as vvaharness does for every tie (`false`). Part of the S11 `--resume` checkpoint key. See `docs/validation.md` § Synthesis. |
 | `fact_tools` | `true` | Whether the five deterministic fact tools are offered at all. No Python counterpart (Python hardwires them on); this is an escape hatch for a model that handles an 8-tool schema badly. Setting it `false` also strips the five names back out of `allowed_tools` before the panel runs, so it stays a one-key change. See `docs/validation.md`. |
 
 `models.validate.orchestrator` (or the flat `models.validate`) sets S11's
@@ -949,15 +1483,70 @@ model and panel-wide sampling; see the roles table above.
 
 Place a `config.local.yaml` next to your `--config` file (same directory,
 exact filename) to layer developer-local overrides on top without editing
-the checked-in file, for example a looser `min_confidence` while
-iterating, or a personal `${VAR}`-free API key for local testing. It's
-picked up automatically; there's no separate flag to point at it. Set
-`BC_NO_LOCAL_CONFIG` (non-empty) to ignore it for one run. This is useful
-for CI, where a stray local file shouldn't silently change behavior.
+the checked-in file, for example a looser `min_confidence` or a different
+`models.deepdive.id` while iterating. It's picked up automatically;
+there's no separate flag to point at it. Set `BC_NO_LOCAL_CONFIG`
+(non-empty) to ignore it for one run. This is useful for CI, where a
+stray local file shouldn't silently change behavior.
 
 Remember `deep_merge` replaces arrays and non-object scalars outright: a list
 key set in both `config.yaml` and `config.local.yaml` ends up as whichever
 one `config.local.yaml` set, not their union.
+
+### Trust check
+
+Because the overlay is implicit and can change security-relevant keys
+(model routing, `allowed_tools`, `step_remediate.verify_command`), it is
+merged only when it could not have been planted by someone else
+(`crates/bc-config/src/overlay.rs`, ported from upstream v1.3.0). On
+Linux and macOS it must be:
+
+- a **regular file**, not a symbolic link (a link could point at a file
+  another user controls; Python follows links, this port refuses them),
+- **owned by the invoking user** (the effective uid) **or root**, and
+- **not group- or world-writable** (`chmod go-w config.local.yaml`).
+
+Anything else fails the load with `config overlay ... is not trusted:
+<reason>`, the same kind of hard error as a YAML parse error. The trust
+facts are read from the open file handle that is then read, and checked
+against the directory entry, so the file cannot be swapped between the
+check and the read. `BC_NO_LOCAL_CONFIG` is honored *before* the check,
+so it always gets you past an overlay you cannot fix right now. Watch
+for a `umask` of `002` (common on distributions with per-user groups):
+it creates files group-writable, which this check refuses.
+
+On Windows there are no POSIX owner and mode bits to check. The overlay
+is merged unchecked, as in Python, and the banner below says `ownership
+unverified`.
+
+### The overlay banner
+
+When an overlay is merged, `bc-sast` prints one line to stderr naming it
+and every leaf key it overrides, once per overlay file per run however
+many times `--config` is re-read (a batch run announces it once, not per
+repository):
+
+```
+  [config] config overlay: /cfg/config.local.yaml applied (overrides:
+  models.deepdive.id=claude-opus-4-6, step1.max_turns,
+  step_remediate.verify_command (set))
+```
+
+How much of each value appears depends on what the key could hold:
+
+| Key | Shown as |
+|---|---|
+| a credential-like name (`*api_key*`, `*token*`, `*password*`, `*auth`, ...) or a `*command` key such as `step_remediate.verify_command` | `key (set)` or `key (unset)` only |
+| a URL value, or a key ending in `url`/`endpoint` | `key -> host[:port]`: never the userinfo, path or query, and `(no host)` when the URL is ambiguous |
+| `models.<role>.id` (or a flat `models.<role>: <id>`), `pricing.provider`, `step_remediate.enforce_policy`, any `allowed_tools`, and the TLS keys `verify_ssl`/`ca_cert`/`client_cert`/`no_proxy`/`cache_route` | `key=value` (cut at 120 characters) |
+| everything else | the key name only, as in Python |
+
+Python shows only the key name for its model and tool keys; this port
+shows their values because the point of the banner is to make a changed
+model or tool permission visible. A skipped overlay is announced too
+(`present but SKIPPED (BC_NO_LOCAL_CONFIG set)`). The line is printed with
+`eprintln!` rather than through `tracing`, like the other pre-scan config
+notices, so it appears on an interactive terminal without `--log-stderr`.
 
 ## Minimal worked example
 
@@ -985,7 +1574,7 @@ step6_verify:
 Run it with:
 
 ```
-bc-sast --repo ./target --config ./config.yaml --model gpt-4o \
+bc-sast --repo ./target --config ./config.yaml --model gpt-5.6-luna \
   --gateway-base-url "$BC_GATEWAY_BASE_URL" --gateway-api-key "$BC_GATEWAY_API_KEY"
 ```
 

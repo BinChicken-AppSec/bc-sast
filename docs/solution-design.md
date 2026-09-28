@@ -108,6 +108,15 @@ diff) is treated as adversary-influenced. See
 [`compliance/THREAT_MODEL_ATLAS.md`](compliance/THREAT_MODEL_ATLAS.md) for
 what that means concretely per pipeline stage.
 
+Config loading holds that line in three places (`bc-config`, see
+[`configuration.md`](configuration.md)): a `--config` inside `--repo` is
+refused unless `BC_ALLOW_CWD_CONFIG` is set; the implicit
+`config.local.yaml` overlay is merged only when it is a regular file
+owned by the invoking user or root and not group/world-writable; and a
+secret-named `${VAR}` may not be interpolated into any config key, so a
+shared profile cannot copy a token into a shell command such as
+`step_remediate.verify_command`.
+
 ## Component view: crate tiers
 
 `bc-sast` is a ~40-crate Cargo workspace, layered so each crate depends

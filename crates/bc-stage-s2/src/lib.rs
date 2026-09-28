@@ -1,29 +1,51 @@
-//! S2 — Threat model: a single-shot (non-agentic) LLM call over
-//! deterministically-gathered evidence (S1's mapped modules/entry points,
-//! on-disk docs/manifests, API-contract artefacts) produces an
-//! application-level `ThreatModel`. Ported from
+//! S2 — Threat model: an LLM call over deterministically-gathered
+//! evidence (S1's mapped modules/entry points, on-disk docs/manifests,
+//! redacted representative configuration, API-contract artifacts)
+//! produces an application-level `ThreatModel`. Ported from v1.4.0
 //! `vvaharness/pipeline/stages/s2_threatmodel.py::run`.
 //!
-//! Unlike S1/S3/S8, this stage has **no internal degrade policy** — a
-//! malformed LLM response or an `extract_json`/`ThreatModel`-shape
-//! failure propagates uncaught out of the Python original's `run()`, and
-//! it's the *orchestrator* that catches it and falls back to no threat
-//! model at all (`threat_model = None`). This crate mirrors that
-//! precisely: every failure path here is `Err(StageError)`, never
-//! `StageOutcome::Degraded` — the eventual orchestrator crate owns the
-//! None-fallback, matching the Python call site exactly.
+//! The call is single-shot by default. With `step2.agentic: true` and a
+//! tool executor supplied through [`Stage2::with_tools`], it becomes a
+//! read-only agentic session (`allowed_tools` must be a subset of
+//! Read/Glob/Grep, bounded by `max_turns`) so the model can open the
+//! configuration files the evidence lists by path.
+//!
+//! A reply that fails to extract or validate gets exactly one repair
+//! re-ask (single-shot, same budget: the repair must re-emit the whole
+//! model, so a smaller budget would turn a shape slip into truncation).
+//! After that, like the Python original, the stage has **no internal
+//! degrade policy**: a second failure is `Err(StageError)`, and the
+//! orchestrator falls back to no threat model at all, which every later
+//! stage handles. An unparseable reply is not the same thing as a model
+//! that found nothing.
+//!
+//! On success the threats are ranked deterministically and capped with
+//! each trust boundary's sole cover preserved ([`rank`]), assets and
+//! boundaries are capped, and the baseline checklist is audited (before
+//! the cap) for items the model disposed of neither way.
 
 mod baseline;
+mod config_reps;
+mod docs;
 mod evidence;
+mod manifests;
+mod parse;
 mod prompts;
+pub mod rank;
+mod repo_read;
 mod wire;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bc_llm_client::{ChatRequest, LlmClient, Message};
+use bc_llm_client::{ChatRequest, LlmClient, Message, ToolExecutor};
 use bc_model::{AppProfile, ContextPackage, Control, Cve, ThreatModel};
 use bc_pipeline_core::{PipelineStage, StageError, StageOutcome};
+
+/// The only tools an agentic threat-model session may be given. Anything
+/// else in `step2.allowed_tools` fails the stage closed rather than being
+/// silently dropped or, worse, honored.
+pub const READ_ONLY_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
 
 pub struct Step2Config {
     pub model: String,
@@ -89,11 +111,50 @@ pub struct Step2Config {
     /// that field). `None` (the default) sends no seed. Net-new versus
     /// Python.
     pub seed: Option<u64>,
+    /// Reasoning-effort tier for this stage's calls (the Python
+    /// original's `models.<role>.effort`, else `--reasoning-effort`),
+    /// forwarded to [`bc_llm_client::ChatRequest::reasoning_effort`].
+    /// `None` (the default) sends none, leaving the provider's default.
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+    /// Per-role OpenAI transport pin (Python's
+    /// `models.<role>.use_responses_api`), forwarded to
+    /// [`bc_llm_client::ChatRequest::openai_api`]. `None` (the default)
+    /// keeps the client-wide `--openai-api` choice.
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
     /// Per-call wall-clock deadline in seconds, overriding the shared
     /// gateway client's own 300 s default. `None` (the default) keeps
     /// that default — matching Python's `_STEP_DEFAULTS`, which has no
     /// `step2.timeout` key.
     pub timeout_secs: Option<u64>,
+    /// Per-body character cap for representative configuration contents,
+    /// applied AFTER redaction of the whole file. `0` means path-only.
+    pub max_config_rep_chars: usize,
+    /// How many representatives carry a body (security-relevant names
+    /// first); the rest are listed by path only.
+    pub max_config_rep_bodies: usize,
+    /// How many directories below the root the manifest search descends.
+    pub max_manifest_depth: usize,
+    /// Cap on manifests packed, across all kinds.
+    pub max_manifests: usize,
+    /// Cap on manifests of any one kind (floored at 1), so one ecosystem
+    /// cannot crowd out another in a polyglot repo.
+    pub max_manifests_per_kind: usize,
+    /// Aggregate character cap across the whole manifests block.
+    pub max_manifest_total_chars: usize,
+    /// Cap on assets kept, most sensitive first.
+    pub max_assets: usize,
+    /// Cap on trust boundaries kept, widest reach first.
+    pub max_trust_boundaries: usize,
+    /// Swap the single-shot call for a read-only agentic session. Takes
+    /// effect only when a tool executor was supplied via
+    /// [`Stage2::with_tools`]; otherwise the stage warns and stays
+    /// single-shot.
+    pub agentic: bool,
+    /// Tools the agentic session may use; must be a subset of
+    /// [`READ_ONLY_TOOLS`].
+    pub allowed_tools: Vec<String>,
+    /// Turn bound for the agentic session (the only real bound on it).
+    pub max_turns: u32,
 }
 
 impl Step2Config {
@@ -129,9 +190,43 @@ impl Step2Config {
             temperature: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
+            openai_api: None,
             timeout_secs: None,
+            max_config_rep_chars: 2000,
+            max_config_rep_bodies: 12,
+            max_manifest_depth: 3,
+            max_manifests: 12,
+            max_manifests_per_kind: 2,
+            max_manifest_total_chars: 24_000,
+            max_assets: 40,
+            max_trust_boundaries: 60,
+            agentic: false,
+            allowed_tools: READ_ONLY_TOOLS.iter().map(|t| t.to_string()).collect(),
+            max_turns: 12,
         }
     }
+}
+
+/// Typed per-run counters from S2, for pipeline diagnostics. Returned by
+/// [`Stage2::run_detailed`]; [`PipelineStage::run`] keeps its
+/// `ThreatModel` output and drops them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ThreatModelDiagnostics {
+    /// The first reply failed to parse and the repair re-ask was made.
+    pub parse_repair_attempted: bool,
+    /// The repair re-ask produced a valid threat model.
+    pub parse_repair_recovered: bool,
+    /// Threat ranking and capping counts, see [`rank::CapStats`].
+    pub threats: rank::CapStats,
+    /// Repo kinds the baseline checklist was chosen for (empty with
+    /// `baseline: none`).
+    pub repo_kinds: Vec<String>,
+    /// Baseline ids the model disposed of neither as a threat nor as an
+    /// open question (audited before the cap).
+    pub baseline_undisposed: Vec<String>,
+    /// Whether the agentic session ran (rather than the single-shot call).
+    pub agentic: bool,
 }
 
 pub struct Step2Input {
@@ -146,20 +241,153 @@ pub struct Step2Input {
 pub struct Stage2 {
     client: Arc<dyn LlmClient>,
     config: Step2Config,
+    tools: Option<Arc<dyn ToolExecutor>>,
 }
 
 impl Stage2 {
     pub fn new(client: Arc<dyn LlmClient>, config: Step2Config) -> Self {
-        Stage2 { client, config }
+        Stage2 {
+            client,
+            config,
+            tools: None,
+        }
     }
-}
 
-impl PipelineStage for Stage2 {
-    type Input = Step2Input;
-    type Output = ThreatModel;
-    const NAME: &'static str = "s2-threatmodel";
+    /// Supplies the read-only tool executor `step2.agentic` needs (the
+    /// same repo-jailed executor S1 and S6 are given). Without it the
+    /// stage is always single-shot.
+    pub fn with_tools(mut self, tools: Arc<dyn ToolExecutor>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
 
-    async fn run(&self, input: Step2Input) -> Result<StageOutcome<ThreatModel>, StageError> {
+    fn request(&self, system: &str, user: String) -> ChatRequest {
+        ChatRequest {
+            model: self.config.model.clone(),
+            system: Some(system.to_string()),
+            messages: vec![Message::user_text(user)],
+            tools: Vec::new(),
+            max_tokens: self.config.max_tokens,
+            temperature: self.config.temperature,
+            top_p: self.config.top_p,
+            seed: self.config.seed,
+            reasoning_effort: self.config.reasoning_effort,
+            openai_api: self.config.openai_api,
+            thinking_budget: None,
+            betas: Vec::new(),
+            json_mode: false,
+            timeout: self.config.timeout_secs.map(std::time::Duration::from_secs),
+            stream: false,
+            cache_key: Some("s2".to_string()),
+            ..ChatRequest::default()
+        }
+    }
+
+    async fn single_shot(&self, system: &str, user: String) -> Result<String, StageError> {
+        let response = bc_llm_agentic::salvage_truncated(
+            bc_llm_agentic::chat_with_retry(
+                self.client.as_ref(),
+                &self.request(system, user),
+                self.config.max_transient_retries,
+                self.config.retry_backoff_base,
+            )
+            .await,
+            "s2",
+        )
+        .map_err(|e| StageError::new(Self::NAME, format!("threat-model call failed: {e}")))?;
+        Ok(response.text())
+    }
+
+    /// The primary call: agentic when configured and wired, else
+    /// single-shot. Returns the reply text and whether it was agentic.
+    async fn primary_call(&self, user: String) -> Result<(String, bool), StageError> {
+        let tools = match (self.config.agentic, &self.tools) {
+            (true, Some(tools)) => tools,
+            (true, None) => {
+                tracing::warn!(
+                    "[s2] step2.agentic is set but no tool executor was wired; \
+                     running the single-shot threat model"
+                );
+                return Ok((self.single_shot(prompts::SYSTEM, user).await?, false));
+            }
+            (false, _) => return Ok((self.single_shot(prompts::SYSTEM, user).await?, false)),
+        };
+        if let Some(bad) = self
+            .config
+            .allowed_tools
+            .iter()
+            .find(|t| !READ_ONLY_TOOLS.contains(&t.as_str()))
+        {
+            return Err(StageError::new(
+                Self::NAME,
+                format!(
+                    "step2.allowed_tools may only name read-only tools {READ_ONLY_TOOLS:?}; \
+                     refusing {bad:?}"
+                ),
+            ));
+        }
+        let mut cfg = bc_llm_agentic::AgenticConfig::new(self.config.model.clone());
+        cfg.system_prompt = Some(format!(
+            "{}{}",
+            prompts::SYSTEM,
+            prompts::AGENTIC_SYSTEM_LINE
+        ));
+        cfg.allowed_tools = self.config.allowed_tools.clone();
+        cfg.max_turns = self.config.max_turns;
+        cfg.max_transient_retries = self.config.max_transient_retries;
+        cfg.retry_backoff_base = self.config.retry_backoff_base;
+        cfg.temperature = self.config.temperature;
+        cfg.top_p = self.config.top_p;
+        cfg.seed = self.config.seed;
+        cfg.reasoning_effort = self.config.reasoning_effort;
+        cfg.openai_api = self.config.openai_api;
+        cfg.timeout_secs = self.config.timeout_secs;
+        cfg.cache_key = Some("s2".to_string());
+        let outcome =
+            bc_llm_agentic::run_agentic(self.client.as_ref(), tools.as_ref(), &user, &cfg)
+                .await
+                .map_err(|e| {
+                    StageError::new(Self::NAME, format!("threat-model call failed: {e}"))
+                })?;
+        Ok((outcome.final_text, true))
+    }
+
+    /// Parse `raw`, spending one single-shot repair re-ask on failure.
+    async fn parse_or_repair(
+        &self,
+        raw: &str,
+        diag: &mut ThreatModelDiagnostics,
+    ) -> Result<ThreatModel, StageError> {
+        let first_err = match parse::parse_threat_model(raw) {
+            Ok(tm) => return Ok(tm),
+            Err(e) => e,
+        };
+        diag.parse_repair_attempted = true;
+        tracing::warn!("[s2] threat-model response did not parse, retrying repair: {first_err}");
+        let repaired = self
+            .single_shot(
+                prompts::SYSTEM,
+                prompts::repair_json_prompt(raw, &first_err),
+            )
+            .await
+            .inspect_err(|_| log_unparsed(raw))?;
+        let tm = parse::parse_threat_model(&repaired).map_err(|e| {
+            log_unparsed(&repaired);
+            StageError::new(
+                Self::NAME,
+                format!("threat-model response did not parse after one repair retry: {e}"),
+            )
+        })?;
+        diag.parse_repair_recovered = true;
+        Ok(tm)
+    }
+
+    /// The full stage, returning the diagnostics [`PipelineStage::run`]
+    /// drops. The orchestrator can call this instead to surface them.
+    pub async fn run_detailed(
+        &self,
+        input: Step2Input,
+    ) -> Result<(ThreatModel, ThreatModelDiagnostics), StageError> {
         let frontier_config = bc_repo_analysis::FrontierConfig {
             max_files: self.config.frontier_max_files,
             max_entry_points: self.config.frontier_max_entry_points,
@@ -169,12 +397,16 @@ impl PipelineStage for Stage2 {
             max_notes_chars: self.config.frontier_max_notes_chars,
         };
         let frontier = bc_repo_analysis::ast_context_view(&input.ctx, &frontier_config);
-        let mut ev = evidence::gather_evidence(&input.repo_root, &self.config, &frontier);
+        let mut ev = evidence::gather_evidence(
+            &input.repo_root,
+            &self.config,
+            &frontier,
+            &input.ctx.all_files,
+        );
         ev.original_file_count = input.ctx.all_files.len();
-        let (_, baseline) =
+        let (kinds, baseline) =
             baseline::baseline_block(&ev, &input.ctx.all_files, &self.config.baseline);
         let user_prompt = prompts::build_user_prompt(
-            &input.repo_root.to_string_lossy(),
             &input.repo_name,
             &ev,
             &input.known_cves,
@@ -183,44 +415,47 @@ impl PipelineStage for Stage2 {
             &baseline,
         );
 
-        let request = ChatRequest {
-            model: self.config.model.clone(),
-            system: Some(prompts::SYSTEM.to_string()),
-            messages: vec![Message::user_text(&user_prompt)],
-            tools: Vec::new(),
-            max_tokens: self.config.max_tokens,
-            temperature: self.config.temperature,
-            top_p: self.config.top_p,
-            seed: self.config.seed,
-            thinking_budget: None,
-            betas: Vec::new(),
-            json_mode: false,
-            timeout: self.config.timeout_secs.map(std::time::Duration::from_secs),
-            stream: false,
+        let mut diag = ThreatModelDiagnostics {
+            repo_kinds: kinds.iter().cloned().collect(),
+            ..ThreatModelDiagnostics::default()
         };
-        let response = bc_llm_agentic::chat_with_retry(
-            self.client.as_ref(),
-            &request,
-            self.config.max_transient_retries,
-            self.config.retry_backoff_base,
-        )
-        .await
-        .map_err(|e| StageError::new(Self::NAME, format!("threat-model call failed: {e}")))?;
+        let (raw, agentic) = self.primary_call(user_prompt).await?;
+        diag.agentic = agentic;
+        let mut tm = self.parse_or_repair(&raw, &mut diag).await?;
 
-        let data = bc_json_repair::extract_json(&response.text()).map_err(|e| {
-            StageError::new(
-                Self::NAME,
-                format!("threat-model response not parseable: {e}"),
-            )
-        })?;
-        let mut tm: ThreatModel = serde_json::from_value(data).map_err(|e| {
-            StageError::new(Self::NAME, format!("ThreatModel assembly failed: {e}"))
-        })?;
-
-        if tm.threats.len() > self.config.max_threats {
-            tm.threats.truncate(self.config.max_threats);
+        if tm.threats.is_empty() {
+            tracing::warn!(
+                "[s2] zero threats: downstream threat attribution, the threat-surface \
+                 fallback and the access-control specialist force-on are all disabled"
+            );
         }
+        let undisposed = baseline::baseline_audit(&tm, &kinds);
+        diag.threats = rank::cap_threats(&mut tm, self.config.max_threats);
+        rank::cap_assets(&mut tm, self.config.max_assets);
+        rank::cap_boundaries(&mut tm, self.config.max_trust_boundaries);
+        if !undisposed.is_empty() {
+            let ids: Vec<&String> = undisposed.iter().collect();
+            tracing::warn!("[s2] baseline item(s) undisposed: {ids:?}");
+        }
+        diag.baseline_undisposed = undisposed.into_iter().collect();
+        Ok((tm, diag))
+    }
+}
 
+/// Log the head of a reply that could not be parsed, redacted in FULL
+/// before the cut so a bisected secret cannot survive half-masked.
+fn log_unparsed(raw: &str) {
+    let head: String = bc_redact::redact(raw).chars().take(500).collect();
+    tracing::warn!("[s2] unparseable threat-model reply, raw[:500]={head:?}");
+}
+
+impl PipelineStage for Stage2 {
+    type Input = Step2Input;
+    type Output = ThreatModel;
+    const NAME: &'static str = "s2-threatmodel";
+
+    async fn run(&self, input: Step2Input) -> Result<StageOutcome<ThreatModel>, StageError> {
+        let (tm, _) = self.run_detailed(input).await?;
         Ok(StageOutcome::Ok(tm))
     }
 }
@@ -378,7 +613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_response_is_a_fatal_error_not_a_degrade() {
+    async fn malformed_response_twice_is_a_fatal_error_not_a_degrade() {
         let stage = Stage2::new(
             Arc::new(ScriptedClient {
                 reply: "not json".to_string(),
@@ -386,29 +621,234 @@ mod tests {
             Step2Config::new("test-model"),
         );
         let result = stage.run(input()).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not parseable"));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("did not parse after one repair retry"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
-    async fn well_formed_json_with_wrong_shape_is_a_fatal_error() {
+    async fn well_formed_json_with_wrong_shape_twice_is_a_fatal_error() {
         // Valid JSON, but `threats` has the wrong type (`ThreatModel` requires
-        // every field to default when absent, so only a genuine type mismatch —
-        // not a missing field — trips deserialization). Exercises the
-        // `ThreatModel assembly failed` branch (extract_json succeeds,
-        // serde_json::from_value::<ThreatModel> does not).
+        // every field to default when absent, so only a genuine type mismatch,
+        // not a missing field, trips deserialization).
         let stage = Stage2::new(
             Arc::new(ScriptedClient {
                 reply: r#"{"threats":"not-an-array"}"#.to_string(),
             }),
             Step2Config::new("test-model"),
         );
-        let result = stage.run(input()).await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("ThreatModel assembly failed"));
+        let err = stage.run(input()).await.unwrap_err().to_string();
+        assert!(err.contains("ThreatModel validation failed"), "{err}");
+    }
+
+    /// Replays `replies` in order, recording each request's user text,
+    /// system prompt and tool count.
+    struct SeqClient {
+        replies: std::sync::Mutex<std::collections::VecDeque<Result<String, LlmError>>>,
+        seen: std::sync::Mutex<Vec<(String, String, usize)>>,
+    }
+
+    impl SeqClient {
+        fn new(replies: Vec<Result<&str, LlmError>>) -> Arc<Self> {
+            Arc::new(SeqClient {
+                replies: std::sync::Mutex::new(
+                    replies.into_iter().map(|r| r.map(str::to_string)).collect(),
+                ),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn seen(&self) -> Vec<(String, String, usize)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for SeqClient {
+        async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            // Debug form of the content: no never-taken non-text arm.
+            let user = format!("{:?}", request.messages[0].content);
+            let system = request.system.clone().unwrap_or_default();
+            self.seen
+                .lock()
+                .unwrap()
+                .push((user, system, request.tools.len()));
+            let text = self.replies.lock().unwrap().pop_front().unwrap()?;
+            Ok(ChatResponse {
+                content: vec![ContentBlock::Text(text)],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    const GOOD: &str = r#"{"system_context":"ctx","assets":[],"trust_boundaries":[],"threats":[],"open_questions":[]}"#;
+
+    fn quick() -> Step2Config {
+        let mut cfg = Step2Config::new("test-model");
+        cfg.retry_backoff_base = std::time::Duration::ZERO;
+        cfg.baseline = "none".to_string();
+        cfg
+    }
+
+    #[test]
+    fn the_single_shot_request_carries_the_role_effort_and_transport_pin() {
+        let mut cfg = quick();
+        cfg.reasoning_effort = Some(bc_llm_client::ReasoningEffort::Medium);
+        cfg.openai_api = Some(bc_llm_client::OpenAiApi::Chat);
+        let stage = Stage2::new(Arc::new(FailingClient), cfg);
+        let request = stage.request("sys", "user".to_string());
+        assert_eq!(
+            request.reasoning_effort,
+            Some(bc_llm_client::ReasoningEffort::Medium)
+        );
+        assert_eq!(request.openai_api, Some(bc_llm_client::OpenAiApi::Chat));
+    }
+
+    #[tokio::test]
+    async fn a_shape_slip_is_repaired_once_and_recorded() {
+        let client = SeqClient::new(vec![Ok(r#"{"assets": ["customer data"]}"#), Ok(GOOD)]);
+        let stage = Stage2::new(client.clone(), quick());
+        let (tm, diag) = stage.run_detailed(input()).await.unwrap();
+        assert_eq!(tm.system_context, "ctx");
+        assert!(diag.parse_repair_attempted && diag.parse_repair_recovered);
+        let seen = client.seen();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[1].0.starts_with("[Text(\"REPAIR TASK:"));
+        assert!(seen[1].0.contains("customer data"));
+        assert_eq!(seen[1].1, prompts::SYSTEM);
+    }
+
+    #[tokio::test]
+    async fn a_failing_repair_call_is_fatal() {
+        let client = SeqClient::new(vec![
+            Ok("not json"),
+            Err(LlmError::InvalidRequest {
+                message: "rejected".into(),
+            }),
+        ]);
+        let stage = Stage2::new(client, quick());
+        let err = stage.run(input()).await.unwrap_err().to_string();
+        assert!(err.contains("threat-model call failed"), "{err}");
+    }
+
+    /// Advertises the read-only tools and answers every call with nothing.
+    /// The scripted replies never call a tool, so `execute` is exercised
+    /// directly by `read_only_tools_fixture_answers_with_nothing`.
+    struct ReadOnlyTools;
+
+    #[test]
+    fn read_only_tools_fixture_answers_with_nothing() {
+        assert_eq!(ReadOnlyTools.execute("Read", &serde_json::json!({})), "");
+    }
+
+    impl ToolExecutor for ReadOnlyTools {
+        fn available_tools(&self) -> Vec<bc_llm_client::ToolSpec> {
+            READ_ONLY_TOOLS
+                .iter()
+                .map(|name| bc_llm_client::ToolSpec {
+                    name: name.to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                })
+                .collect()
+        }
+
+        fn execute(&self, _name: &str, _args: &serde_json::Value) -> String {
+            String::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_with_tools_runs_a_tool_session_with_the_extra_system_line() {
+        let client = SeqClient::new(vec![Ok(GOOD)]);
+        let mut cfg = quick();
+        cfg.agentic = true;
+        let stage = Stage2::new(client.clone(), cfg).with_tools(Arc::new(ReadOnlyTools));
+        let (_, diag) = stage.run_detailed(input()).await.unwrap();
+        assert!(diag.agentic);
+        let seen = client.seen();
+        assert!(seen[0].1.ends_with(prompts::AGENTIC_SYSTEM_LINE));
+        assert_eq!(seen[0].2, 3, "Read, Glob and Grep are offered");
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_without_tools_stays_single_shot() {
+        let client = SeqClient::new(vec![Ok(GOOD)]);
+        let mut cfg = quick();
+        cfg.agentic = true;
+        let (_, diag) = Stage2::new(client.clone(), cfg)
+            .run_detailed(input())
+            .await
+            .unwrap();
+        assert!(!diag.agentic);
+        assert_eq!(client.seen()[0].1, prompts::SYSTEM);
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_refuses_a_non_read_only_tool() {
+        let client = SeqClient::new(vec![Ok(GOOD)]);
+        let mut cfg = quick();
+        cfg.agentic = true;
+        cfg.allowed_tools = vec!["Read".into(), "Bash".into()];
+        let stage = Stage2::new(client.clone(), cfg).with_tools(Arc::new(ReadOnlyTools));
+        let err = stage.run(input()).await.unwrap_err().to_string();
+        assert!(err.contains("refusing \"Bash\""), "{err}");
+        assert!(client.seen().is_empty(), "no call is made");
+    }
+
+    #[tokio::test]
+    async fn an_agentic_call_failure_is_fatal() {
+        let client = SeqClient::new(vec![Err(LlmError::InvalidRequest {
+            message: "nope".into(),
+        })]);
+        let mut cfg = quick();
+        cfg.agentic = true;
+        let stage = Stage2::new(client, cfg).with_tools(Arc::new(ReadOnlyTools));
+        let err = stage.run(input()).await.unwrap_err().to_string();
+        assert!(err.contains("threat-model call failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn baseline_ids_are_audited_before_the_cap_and_threats_are_ranked() {
+        // Library repo: four baseline ids. The model disposes of two as
+        // threats and one as an open question; BL-LIB-REDOS is undisposed.
+        let reply = serde_json::json!({
+            "system_context": "",
+            "assets": [{"name": "db", "sensitivity": "critical"}, {"name": "logs", "sensitivity": "low"}],
+            "trust_boundaries": [{"entry_point": "api", "crossing": "net"}],
+            "threats": [
+                {"id": "T1", "threat": "t", "actor": "remote_unauth", "surface": "api", "asset": "logs",
+                 "impact": "low", "likelihood": "rare", "controls": "none", "evidence": "baseline: BL-LIB-INJ"},
+                {"id": "T2", "threat": "t", "actor": "remote_unauth", "surface": "x", "asset": "db",
+                 "impact": "high", "likelihood": "likely", "controls": "none", "evidence": "baseline: BL-LIB-PATH"},
+            ],
+            "open_questions": ["BL-LIB-DESER: no deserialization"],
+        })
+        .to_string();
+        let client = SeqClient::new(vec![Ok(&reply)]);
+        let mut cfg = quick();
+        cfg.baseline = "auto".to_string();
+        cfg.max_threats = 1;
+        cfg.max_assets = 1;
+        cfg.max_trust_boundaries = 0;
+        let (tm, diag) = Stage2::new(client.clone(), cfg)
+            .run_detailed(input())
+            .await
+            .unwrap();
+        // T1 is the sole cover of "api" but boundaries are capped after
+        // threats, so promotion still keeps it.
+        assert_eq!(tm.threats.len(), 1);
+        assert_eq!(tm.threats[0].id, "T1");
+        assert_eq!(diag.threats.promoted, 1);
+        assert_eq!(tm.assets.len(), 1);
+        assert_eq!(tm.assets[0].name, "db");
+        assert!(tm.trust_boundaries.is_empty());
+        assert_eq!(diag.repo_kinds, vec!["library".to_string()]);
+        assert_eq!(diag.baseline_undisposed, vec!["BL-LIB-REDOS".to_string()]);
+        assert!(client.seen()[0].0.contains("[BL-LIB-INJ]"));
     }
 
     #[tokio::test]
@@ -504,6 +944,7 @@ mod tests {
             json_mode: false,
             timeout: None,
             stream: false,
+            ..ChatRequest::default()
         };
         client.chat(&request).await.unwrap();
         assert_eq!(client.captured.lock().unwrap().as_deref(), Some("hello"));
@@ -545,6 +986,10 @@ mod tests {
 
         let sent = client.captured.lock().unwrap().clone().unwrap();
         assert!(sent.contains("a.py::kept_handler"));
+        assert!(
+            !sent.contains("/repo"),
+            "the absolute root is never rendered"
+        );
         assert!(!sent.contains("b.py::dropped_handler"));
     }
 

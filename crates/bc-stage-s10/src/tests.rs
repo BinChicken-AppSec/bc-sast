@@ -511,6 +511,35 @@ async fn remediate_finding_without_a_policy_context_runs_the_agent_directly() {
 }
 
 #[tokio::test]
+async fn the_role_effort_and_transport_pin_reach_every_agent_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "print('hi')\n").unwrap();
+    let client = ScriptedClient::new(vec![verdict_json("Fixed")]);
+    let tools = SandboxTools::new_with_write(dir.path());
+    let f = ranked(finding("SQLi", "app.py", Some("CWE-89")));
+    let mut cfg = config();
+    cfg.reasoning_effort = Some(bc_llm_client::ReasoningEffort::Low);
+    cfg.openai_api = Some(bc_llm_client::OpenAiApi::Responses);
+
+    remediate_finding(&client, &tools, dir.path(), &f, 1, &cfg, None)
+        .await
+        .unwrap();
+
+    let requests = client.requests.lock().unwrap();
+    assert!(!requests.is_empty());
+    for request in requests.iter() {
+        assert_eq!(
+            request.reasoning_effort,
+            Some(bc_llm_client::ReasoningEffort::Low)
+        );
+        assert_eq!(
+            request.openai_api,
+            Some(bc_llm_client::OpenAiApi::Responses)
+        );
+    }
+}
+
+#[tokio::test]
 async fn remediate_finding_without_a_policy_context_captures_a_diff_of_a_real_change() {
     // Confirms diff capture is unconditional — no `PolicyContext` is
     // passed here at all, unlike the post-gate-only diff capture this
@@ -1034,7 +1063,7 @@ async fn a_finding_with_no_playbook_entry_still_runs_the_full_agent_on_the_plain
 }
 
 #[tokio::test]
-async fn a_target_test_context_is_appended_to_the_prompt_and_labelled_untrusted() {
+async fn a_target_test_context_is_appended_to_the_prompt_and_labeled_untrusted() {
     // The plan text is repository-derived. It is evidence for the agent,
     // never instructions to it, so it must arrive fenced by both the
     // "untrusted repository evidence" heading and the trailing rule that
@@ -1249,14 +1278,14 @@ fn checkpoint_store() -> (tempfile::TempDir, SqliteCheckpointStore) {
 #[test]
 fn checkpoint_done_is_false_without_a_checkpoint_store() {
     let f = ranked(finding("A", "a.py", Some("CWE-89")));
-    assert!(!checkpoint_done(None, "run1", 1, &f));
+    assert!(!checkpoint_done(None, "run1", &config(), 1, &f));
 }
 
 #[test]
 fn checkpoint_done_is_false_when_no_checkpoint_exists_yet() {
     let (_dir, store) = checkpoint_store();
     let f = ranked(finding("A", "a.py", Some("CWE-89")));
-    assert!(!checkpoint_done(Some(&store), "run1", 1, &f));
+    assert!(!checkpoint_done(Some(&store), "run1", &config(), 1, &f));
 }
 
 #[tokio::test]
@@ -1282,7 +1311,7 @@ async fn checkpoint_done_is_true_after_a_matching_finding_is_processed() {
     )
     .await;
 
-    assert!(checkpoint_done(Some(&store), "run1", 1, &f));
+    assert!(checkpoint_done(Some(&store), "run1", &config(), 1, &f));
 }
 
 #[tokio::test]
@@ -1309,7 +1338,13 @@ async fn checkpoint_done_is_false_when_the_finding_no_longer_matches_the_checkpo
     .await;
 
     let renamed = ranked(finding("A-renamed", "a.py", Some("CWE-89")));
-    assert!(!checkpoint_done(Some(&store), "run1", 1, &renamed));
+    assert!(!checkpoint_done(
+        Some(&store),
+        "run1",
+        &config(),
+        1,
+        &renamed
+    ));
 }
 
 #[tokio::test]
@@ -1481,7 +1516,12 @@ async fn run_remediation_saves_a_checkpoint_even_when_resume_is_false() {
     )
     .await;
 
-    assert!(bc_checkpoint::CheckpointStore::load(&store, "run1", "remediate_1").is_some());
+    assert!(bc_checkpoint::CheckpointStore::load(
+        &store,
+        "run1",
+        &remediation_step_key(&config(), 1, &findings[0].1)
+    )
+    .is_some());
 }
 
 #[tokio::test]
@@ -1505,7 +1545,12 @@ async fn run_remediation_with_a_failed_finding_does_not_save_a_checkpoint() {
     )
     .await;
 
-    assert!(bc_checkpoint::CheckpointStore::load(&store, "run1", "remediate_1").is_none());
+    assert!(bc_checkpoint::CheckpointStore::load(
+        &store,
+        "run1",
+        &remediation_step_key(&config(), 1, &findings[0].1)
+    )
+    .is_none());
 }
 
 #[tokio::test]
@@ -1568,18 +1613,6 @@ fn worktree_forbidden_matches_finds_files_under_a_matching_directory() {
 fn worktree_forbidden_matches_on_a_nonexistent_root_is_empty() {
     let hits = worktree_forbidden_matches(Path::new("/does/not/exist"), &["*".to_string()]);
     assert!(hits.is_empty());
-}
-
-#[test]
-fn worktree_forbidden_matches_capped_stops_scanning_once_the_cap_is_exceeded() {
-    let dir = tempfile::tempdir().unwrap();
-    for name in ["a.py", "b.py", "c.py"] {
-        std::fs::write(dir.path().join(name), "x").unwrap();
-    }
-    // A cap of 1 means only the first entry is examined at all; whatever
-    // the scan order, at most one file could ever be reported.
-    let hits = worktree_forbidden_matches_capped(dir.path(), &["*".to_string()], 1);
-    assert!(hits.len() <= 1);
 }
 
 #[test]
@@ -2295,7 +2328,7 @@ async fn a_verify_command_that_overruns_its_timeout_rolls_back() {
 
 #[tokio::test]
 async fn a_verify_command_that_cannot_be_started_is_reported_as_a_failure() {
-    let err = run_verify_command(Path::new("/does/not/exist"), "true", 60)
+    let err = run_verify_command(Path::new("/does/not/exist"), "true", 60, None)
         .await
         .unwrap_err();
     assert!(
@@ -2400,8 +2433,13 @@ async fn a_rolled_back_finding_is_never_checkpointed() {
     .await;
 
     assert!(matches!(outcome, RemediationOutcome::Processed(_)));
-    assert!(bc_checkpoint::CheckpointStore::load(&store, "run1", "remediate_1").is_none());
-    assert!(!checkpoint_done(Some(&store), "run1", 1, &f));
+    assert!(bc_checkpoint::CheckpointStore::load(
+        &store,
+        "run1",
+        &remediation_step_key(&config(), 1, &f)
+    )
+    .is_none());
+    assert!(!checkpoint_done(Some(&store), "run1", &config(), 1, &f));
 }
 
 #[test]
@@ -2742,7 +2780,7 @@ async fn the_retry_is_not_attempted_when_the_config_turns_it_off() {
         .await
         .unwrap();
 
-    // Exactly today's behaviour: one session, the downgrade, nothing on
+    // Exactly today's behavior: one session, the downgrade, nothing on
     // disk.
     assert_eq!(client.turns(), 1);
     assert_eq!(record.verdict.verdict, Verdict::NeedsReview);
@@ -3130,6 +3168,7 @@ async fn a_verify_command_with_no_shell_on_the_system_fails_closed() {
         "definitely-not-a-shell-on-this-system",
         "true",
         60,
+        None,
     )
     .await
     .unwrap_err();
@@ -3546,7 +3585,13 @@ async fn a_resumed_checkpoint_cannot_reintroduce_an_out_of_scope_fix() {
         true,
     )
     .await;
-    assert!(checkpoint_done(Some(&store), "run1", 1, &findings[0].1));
+    assert!(checkpoint_done(
+        Some(&store),
+        "run1",
+        &config(),
+        1,
+        &findings[0].1
+    ));
 
     // Run 2: the same finding, now out of scope. The cached "Fixed"
     // record must not be served.
@@ -3595,5 +3640,425 @@ async fn a_scope_refusal_is_not_saved_as_a_completed_checkpoint() {
     )
     .await;
 
-    assert!(!checkpoint_done(Some(&store), "run1", 1, &findings[0].1));
+    assert!(!checkpoint_done(
+        Some(&store),
+        "run1",
+        &config(),
+        1,
+        &findings[0].1
+    ));
+}
+
+// ---- the reusable-workflow pin gate ------------------------------------
+
+const PIN_WORKFLOW: &str = ".github/workflows/ci.yml";
+
+fn pinned_workflow(reference: &str) -> String {
+    format!("name: CI\njobs:\n  sec:\n    uses: org/shared/.github/workflows/sec.yml@{reference}\n")
+}
+
+#[tokio::test]
+async fn an_invented_workflow_pin_is_rolled_back_as_not_fixed_and_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = pinned_workflow("develop");
+    std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+    std::fs::write(dir.path().join(PIN_WORKFLOW), &original).unwrap();
+    let client = WriteThenVerdictClient::new(
+        PIN_WORKFLOW,
+        &pinned_workflow(&"0".repeat(40)),
+        verdict_with_changes("Fixed", &[PIN_WORKFLOW]),
+    );
+    let (tools, cfg) = journaled(dir.path());
+    let f = ranked(finding(
+        "Mutable workflow ref",
+        PIN_WORKFLOW,
+        Some("CWE-829"),
+    ));
+
+    // No policy context at all: the pin gate is not a policy feature.
+    let record = remediate_finding(&client, &tools, dir.path(), &f, 1, &cfg, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(PIN_WORKFLOW)).unwrap(),
+        original
+    );
+    assert_eq!(record.verdict.verdict, Verdict::NotFixed);
+    assert_eq!(record.final_verdict.as_deref(), Some("REJECT"));
+    assert_eq!(
+        record.policy_reason.as_deref(),
+        Some(UNSAFE_WORKFLOW_REFERENCE)
+    );
+    assert_eq!(record.policy_reverted, vec![PIN_WORKFLOW.to_string()]);
+    assert!(record.diff.is_none());
+    assert!(record.verdict.changes.is_empty());
+    assert!(was_reverted(&record));
+    assert!(revert_reason(&record)
+        .unwrap()
+        .contains("placeholder commit SHA"));
+}
+
+#[tokio::test]
+async fn a_workflow_pin_the_repository_already_trusts_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let sha = "8f14e45fceea167a5a36dedd4bea2543c1f2b9d0";
+    std::fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+    std::fs::write(dir.path().join(PIN_WORKFLOW), pinned_workflow("develop")).unwrap();
+    std::fs::write(
+        dir.path().join(".github/workflows/locked.yml"),
+        pinned_workflow(sha),
+    )
+    .unwrap();
+    let client = WriteThenVerdictClient::new(
+        PIN_WORKFLOW,
+        &pinned_workflow(sha),
+        verdict_with_changes("Fixed", &[PIN_WORKFLOW]),
+    );
+    let (tools, cfg) = journaled(dir.path());
+    let f = ranked(finding(
+        "Mutable workflow ref",
+        PIN_WORKFLOW,
+        Some("CWE-829"),
+    ));
+    let policy = policy_ctx(allow_all_policy(), empty_playbook());
+
+    let record = remediate_finding(&client, &tools, dir.path(), &f, 1, &cfg, Some(&policy))
+        .await
+        .unwrap();
+
+    assert_eq!(record.verdict.verdict, Verdict::Fixed);
+    assert_eq!(record.final_verdict.as_deref(), Some("ACCEPT"));
+    assert!(record.diff.unwrap().contains(sha));
+}
+
+// ---- engine-keyed checkpoints -----------------------------------------
+
+#[test]
+fn the_step_key_changes_with_the_model_dialect_and_host() {
+    let f = ranked(finding("A", "a.py", Some("CWE-89")));
+    let base = remediation_step_key(&config(), 1, &f);
+    assert!(base.starts_with(REMEDIATE_STEP_PREFIX));
+    let mut other_model = config();
+    other_model.model = "another-model".to_string();
+    let mut other_dialect = config();
+    other_dialect.dialect = "anthropic".to_string();
+    let mut other_host = config();
+    other_host.base_host = "gateway.example".to_string();
+    for cfg in [other_model, other_dialect, other_host] {
+        assert_ne!(remediation_step_key(&cfg, 1, &f), base);
+    }
+    assert_eq!(config().engine_key().engine_id, "bc-sast.s10");
+    assert_eq!(
+        config().engine_key().engine_version,
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+#[tokio::test]
+async fn a_checkpoint_from_another_model_is_not_reused_on_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.py"), "1\n").unwrap();
+    let tools = SandboxTools::new_with_write(dir.path());
+    let findings = vec![(1i64, ranked(finding("A", "a.py", Some("CWE-89"))))];
+    let (_ckpt_dir, store) = checkpoint_store();
+
+    let first = ScriptedClient::new(vec![verdict_json("Not Fixed")]);
+    run_remediation(
+        &first,
+        &tools,
+        dir.path(),
+        &findings,
+        &config(),
+        None,
+        Some(&store),
+        "run1",
+        false,
+    )
+    .await;
+    assert!(checkpoint_done(
+        Some(&store),
+        "run1",
+        &config(),
+        1,
+        &findings[0].1
+    ));
+
+    let mut switched = config();
+    switched.model = "another-model".to_string();
+    assert!(!checkpoint_done(
+        Some(&store),
+        "run1",
+        &switched,
+        1,
+        &findings[0].1
+    ));
+    let second = ScriptedClient::new(vec![verdict_json("Needs Review")]);
+    let run = run_remediation(
+        &second,
+        &tools,
+        dir.path(),
+        &findings,
+        &switched,
+        None,
+        Some(&store),
+        "run1",
+        true,
+    )
+    .await;
+    match &run.outcomes[0] {
+        RemediationOutcome::Processed(record) => {
+            assert_eq!(record.verdict.verdict, Verdict::NeedsReview)
+        }
+        other => panic!("expected Processed, got {other:?}"),
+    }
+    // The resumed run under the new model pruned the old model's row.
+    assert!(!checkpoint_done(
+        Some(&store),
+        "run1",
+        &config(),
+        1,
+        &findings[0].1
+    ));
+    assert!(checkpoint_done(
+        Some(&store),
+        "run1",
+        &switched,
+        1,
+        &findings[0].1
+    ));
+}
+
+#[test]
+fn a_payload_without_an_engine_is_refused() {
+    let (_ckpt_dir, store) = checkpoint_store();
+    let f = ranked(finding("A", "a.py", Some("CWE-89")));
+    let step = remediation_step_key(&config(), 1, &f);
+    let record = RemediationRecord {
+        finding_index: 1,
+        finding_id: "id".to_string(),
+        verdict: RemediationVerdict::denied(1, "x"),
+        policy_action: None,
+        policy_reason: None,
+        final_verdict: None,
+        policy_reverted: Vec::new(),
+        policy_matched_globs: Vec::new(),
+        diff: None,
+    };
+    let legacy = json!({"finding_id": finding_identity(1, &f), "record": record});
+    bc_checkpoint::CheckpointStore::save(&store, "run1", &step, legacy.to_string().as_bytes())
+        .unwrap();
+    assert!(!checkpoint_done(Some(&store), "run1", &config(), 1, &f));
+}
+
+#[tokio::test]
+async fn a_checkpointed_diff_is_stored_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "password = \"hunter2hunter2\"\n").unwrap();
+    let client = WriteThenVerdictClient::new(
+        "app.py",
+        "password = os.environ[\"DB_PASSWORD\"]\n",
+        verdict_with_changes("Fixed", &["app.py"]),
+    );
+    let (tools, cfg) = journaled(dir.path());
+    let f = ranked(finding("Hardcoded secret", "app.py", Some("CWE-798")));
+    let (_ckpt_dir, store) = checkpoint_store();
+
+    let (outcome, _) = remediate_one_checkpointed(
+        &client,
+        &tools,
+        dir.path(),
+        1,
+        &f,
+        &cfg,
+        None,
+        Some(&store),
+        "run1",
+        false,
+    )
+    .await;
+    let RemediationOutcome::Processed(live) = outcome else {
+        panic!("expected Processed");
+    };
+    assert!(live.diff.as_deref().unwrap().contains("hunter2"));
+
+    let step = remediation_step_key(&cfg, 1, &f);
+    let saved = bc_checkpoint::CheckpointStore::load(&store, "run1", &step).unwrap();
+    let saved = String::from_utf8(saved).unwrap();
+    assert!(!saved.contains("hunter2"), "{saved}");
+    assert!(saved.contains("DB_PASSWORD"), "{saved}");
+}
+
+// ---- the post-gate ACCEPT needs a real, kept fix -----------------------
+
+#[tokio::test]
+async fn a_no_op_not_fixed_answer_with_passing_gates_is_not_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "print('hi')\n").unwrap();
+    let client = ScriptedClient::new(vec![verdict_json("Not Fixed")]);
+    let tools = SandboxTools::new_with_write(dir.path());
+    let f = ranked(finding("SQLi", "app.py", Some("CWE-89")));
+    let policy = policy_ctx(allow_all_policy(), empty_playbook());
+
+    let record = remediate_finding(&client, &tools, dir.path(), &f, 1, &config(), Some(&policy))
+        .await
+        .unwrap();
+
+    assert_eq!(record.final_verdict.as_deref(), Some("REJECT"));
+    assert!(record.diff.is_none());
+}
+
+#[tokio::test]
+async fn a_provisional_accept_whose_patch_is_rolled_back_becomes_no_diff_captured() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "print('hi')\n").unwrap();
+    // Partially Fixed passes the post-gate (a real diff, a claimed fix,
+    // three passing gates), then gate 6 rolls it back.
+    let client = WriteThenVerdictClient::new(
+        "app.py",
+        "print('half')\n",
+        verdict_with_changes("Partially Fixed", &["app.py"]),
+    );
+    let (tools, cfg) = journaled(dir.path());
+    let f = ranked(finding("SQLi", "app.py", Some("CWE-89")));
+    let policy = policy_ctx(allow_all_policy(), empty_playbook());
+
+    let record = remediate_finding(&client, &tools, dir.path(), &f, 1, &cfg, Some(&policy))
+        .await
+        .unwrap();
+
+    assert!(was_reverted(&record));
+    assert!(record.diff.is_none());
+    assert_eq!(record.final_verdict.as_deref(), Some("REJECT"));
+    assert_eq!(record.policy_reason.as_deref(), Some(NO_DIFF_CAPTURED));
+}
+
+// ---- run outcome counts --------------------------------------------------
+
+fn counted_record(verdict: Verdict, diff: Option<&str>, reverted: bool) -> RemediationOutcome {
+    let mut v = RemediationVerdict::denied(1, "x");
+    v.verdict = verdict;
+    if reverted {
+        note_revert(&mut v, "test");
+    }
+    RemediationOutcome::Processed(Box::new(RemediationRecord {
+        finding_index: 1,
+        finding_id: "id".to_string(),
+        verdict: v,
+        policy_action: None,
+        policy_reason: None,
+        final_verdict: None,
+        policy_reverted: Vec::new(),
+        policy_matched_globs: Vec::new(),
+        diff: diff.map(str::to_string),
+    }))
+}
+
+#[test]
+fn remediation_counts_only_call_a_kept_fixed_diff_fixed() {
+    let outcomes = vec![
+        counted_record(Verdict::Fixed, Some("+x\n"), false),
+        counted_record(Verdict::Fixed, Some("  \n"), false),
+        counted_record(Verdict::Fixed, None, false),
+        counted_record(Verdict::Fixed, Some("+x\n"), true),
+        counted_record(Verdict::PartiallyFixed, Some("+x\n"), false),
+        RemediationOutcome::Failed {
+            finding_index: 9,
+            error: "boom".to_string(),
+        },
+    ];
+    assert_eq!(
+        RemediationCounts::from_outcomes(&outcomes),
+        RemediationCounts {
+            attempted: 6,
+            fixed: 1,
+            not_fixed: 4,
+            failed: 1,
+        }
+    );
+    assert_eq!(
+        RemediationCounts::from_outcomes(&[]),
+        RemediationCounts::default()
+    );
+}
+
+#[tokio::test]
+async fn a_canceled_run_starts_no_finding_and_records_each_as_not_attempted() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.py"), "1\n").unwrap();
+    let tools = SandboxTools::new_with_write(dir.path());
+    let findings = vec![
+        (1i64, ranked(finding("A", "a.py", Some("CWE-89")))),
+        (2i64, ranked(finding("B", "a.py", Some("CWE-79")))),
+    ];
+    let mut cfg = config();
+    let token = bc_pipeline_core::CancelToken::new_ref();
+    token.cancel(bc_pipeline_core::USER_CANCEL_REASON);
+    cfg.cancel = Some(token);
+    // `PanicClient`: any model call at all would fail the test.
+    let run = run_remediation(
+        &PanicClient,
+        &tools,
+        dir.path(),
+        &findings,
+        &cfg,
+        None,
+        None,
+        "run1",
+        false,
+    )
+    .await;
+    assert_eq!(run.outcomes.len(), 2);
+    assert_eq!(run.baselines.len(), 2);
+    for outcome in &run.outcomes {
+        assert!(
+            matches!(outcome, RemediationOutcome::Failed { error, .. }
+                if error == "not attempted: canceled by user (Ctrl-C)"),
+            "{outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cancellation_stops_the_verify_command_and_rolls_the_patch_back() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.py"), "print('hi')\n").unwrap();
+    let client = WriteThenVerdictClient::new(
+        "app.py",
+        "print('fixed')\n",
+        verdict_with_changes("Fixed", &["app.py"]),
+    );
+    let (tools, mut cfg) = journaled(dir.path());
+    // The command itself trips nothing; the canceller below does, once the
+    // command is demonstrably running.
+    let started = dir.path().join("started");
+    cfg.verify_command = Some(format!("touch {}; sleep 30", started.display()));
+    let token = bc_pipeline_core::CancelToken::new_ref();
+    cfg.cancel = Some(token.clone());
+    let canceller = tokio::spawn(async move {
+        while !started.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        token.cancel(bc_pipeline_core::USER_CANCEL_REASON);
+    });
+    let f = ranked(finding("SQLi", "app.py", Some("CWE-89")));
+
+    let record = remediate_finding(&client, &tools, dir.path(), &f, 1, &cfg, None)
+        .await
+        .unwrap();
+    canceller.await.unwrap();
+
+    assert_eq!(record.verdict.verdict, Verdict::NeedsReview);
+    assert!(
+        record
+            .verdict
+            .summary
+            .contains("stopped (canceled by user (Ctrl-C)) and killed"),
+        "{}",
+        record.verdict.summary
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("app.py")).unwrap(),
+        "print('hi')\n"
+    );
 }

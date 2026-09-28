@@ -311,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn a_relabelled_finding_still_votes_for_the_same_bug() {
+    fn a_relabeled_finding_still_votes_for_the_same_bug() {
         // Two runs of the same chunk, same bug, same CWE — but the model
         // called it `injection` once and `other` the next time. Keyed on
         // the class alone that is one vote each, so at
@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn a_zero_line_bucket_still_merges_an_exact_line_match() {
-        // `runs = 1` / `line_bucket = 0` behaviour is unchanged from the
+        // `runs = 1` / `line_bucket = 0` behavior is unchanged from the
         // exact-line-equality it had under `canonical_key`.
         let a = finding("a.py", 10, VulnClass::Injection, 0.5);
         let b = finding("a.py", 10, VulnClass::Injection, 0.9);

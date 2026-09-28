@@ -13,6 +13,8 @@ use bc_llm_client::{
 
 use crate::config::AgenticConfig;
 use crate::pure::{cap_tool_result, shrink_history};
+use crate::retry::RetryLadder;
+use crate::truncation::{TruncationGuard, Verdict};
 
 /// Send one request, retrying on a retryable transient [`LlmError`]
 /// (backoff, capped at `max_transient_retries`) — the single-shot-call
@@ -23,95 +25,85 @@ use crate::pure::{cap_tool_result, shrink_history};
 /// applies. A non-retryable error (including `ContextOverflow`, which
 /// single-shot callers have no history to evict from) always propagates
 /// immediately.
+///
+/// Two narrower ladders ride alongside the transient one, both ported
+/// from the Python original's `prompt()` loops:
+///
+/// * [`LlmError::Authentication`] is retried three times, after 2, 4 and
+///   8 s (see `crate::retry`), then propagated, so a credential that is
+///   mid-rotation survives and a wrong one halts the scan quickly.
+/// * A reply cut off by its output budget (`StopReason::MaxTokens`) is
+///   sent once more at double the budget. If that is cut off too, or the
+///   provider refuses the doubled budget as over its cap, the result is
+///   [`LlmError::Truncated`] (VVAH-E005) carrying the partial reply, and
+///   the client's [`LlmClient::note_truncated_reply`] hook is told. The
+///   doubled budget is uncapped here, as on Python's OpenAI route; see
+///   [`chat_with_retry_capped`] for a ceiling.
 pub async fn chat_with_retry(
     client: &dyn LlmClient,
     request: &ChatRequest,
     max_transient_retries: u32,
     retry_backoff_base: Duration,
 ) -> Result<ChatResponse, LlmError> {
-    let mut attempts = 0u32;
+    chat_with_retry_capped(
+        client,
+        request,
+        max_transient_retries,
+        retry_backoff_base,
+        None,
+    )
+    .await
+}
+
+/// [`chat_with_retry`] with a ceiling on the truncation retry's doubled
+/// output budget (Python's `truncation_retry_max(requested, cap=...)`,
+/// which its Anthropic route passes the model's output cap). A request
+/// already at the ceiling is not retried at all.
+pub async fn chat_with_retry_capped(
+    client: &dyn LlmClient,
+    request: &ChatRequest,
+    max_transient_retries: u32,
+    retry_backoff_base: Duration,
+    max_tokens_ceiling: Option<u32>,
+) -> Result<ChatResponse, LlmError> {
+    let mut ladder = RetryLadder::new(max_transient_retries, retry_backoff_base);
+    let mut truncation = TruncationGuard::new(request.max_tokens, max_tokens_ceiling);
+    // Cloned only once a truncation retry actually needs a larger
+    // budget; every other attempt resends the caller's own request.
+    let mut enlarged: Option<ChatRequest> = None;
     loop {
-        match client.chat(request).await {
-            Ok(response) => return Ok(response),
-            Err(e) if e.is_retryable() && attempts < max_transient_retries => {
-                attempts += 1;
-                let delay = backoff_duration(&e, attempts, retry_backoff_base);
-                // The only trace a stalled scan leaves. A 2026-09 CI run
-                // spent 80 minutes retrying a provider error and emitted
-                // nothing at all, so the first question ("is it working
-                // or is it stuck?") had no answer anywhere. `WARN` is the
-                // default level for both destinations precisely so this
-                // line lands without anyone having to ask for it: see
-                // `bc_cli::logging`, which streams to stderr whenever
-                // stderr is not a terminal and so nothing is redrawing
-                // there.
-                // Bound outside the macro, not inline as a field value:
-                // `tracing` only evaluates field expressions when a
-                // subscriber is listening, so an inline call would be
-                // dead code in every test (and this crate's coverage gate
-                // is 100 %).
-                let delay_secs = delay.as_secs_f64();
-                tracing::warn!(
-                    error = %e,
-                    attempt = attempts,
-                    max = max_transient_retries,
-                    delay_secs,
-                    "transient LLM error; retrying after backoff"
-                );
+        let attempt = enlarged.as_ref().unwrap_or(request);
+        match client.chat(attempt).await {
+            Ok(response) => match truncation.on_response(response) {
+                Verdict::Done(response) => return Ok(response),
+                Verdict::Retry => {
+                    let mut larger = request.clone();
+                    larger.max_tokens = truncation.max_tokens();
+                    enlarged = Some(larger);
+                }
+                Verdict::GiveUp(truncated) => return Err(give_up(client, truncated)),
+            },
+            Err(e) => {
+                if let Some(truncated) = truncation.cap_rejection(&e) {
+                    return Err(give_up(client, truncated));
+                }
+                let Some(delay) = ladder.delay_for(&e, "single-shot call") else {
+                    return Err(e);
+                };
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
-                continue;
             }
-            Err(e) => return Err(e),
         }
     }
 }
 
-/// The delay before retry attempt `attempt` (1-indexed) after `err`.
-/// `base == Duration::ZERO` is this codebase's established "disable all
-/// real sleeping" switch (used pervasively in tests) and always wins,
-/// short-circuiting before either the header check or the syscall
-/// jitter needs — real callers always pass a non-zero base. Otherwise, a
-/// [`LlmError::RateLimited`] carrying a real `Retry-After` value wins
-/// outright (the provider's own stated wait time, un-jittered — jittering
-/// it down risks re-triggering the same rate limit). Absent that, falls
-/// back to `base * attempt` (linear backoff) with up to ±25% jitter, so
-/// concurrent callers hitting the same transient failure at once (e.g.
-/// S6's per-finding fan-out) don't all wake and retry in lockstep — the
-/// thundering-herd risk a fixed schedule invites under real concurrency.
-fn backoff_duration(err: &LlmError, attempt: u32, base: Duration) -> Duration {
-    if base.is_zero() {
-        return Duration::ZERO;
-    }
-    let scheduled = base.saturating_mul(attempt).mul_f64(jitter_factor());
-    if let LlmError::RateLimited {
-        retry_after_secs: Some(secs),
-    } = err
-    {
-        // The server's hint is a MINIMUM, not a schedule. Honouring a 1 s
-        // `Retry-After` verbatim on every attempt burns the whole retry
-        // budget in a few seconds under sustained saturation: a live
-        // 2026-09-06 scan lost 24 of 235 verifications to "rate limited
-        // (retry after 1s)" that way, with five verifiers in flight.
-        // Waiting at least as long as the growing schedule is always
-        // allowed and is what actually lets the window recover.
-        return Duration::from_secs(*secs).max(scheduled);
-    }
-    scheduled
-}
-
-/// A multiplier in `[0.75, 1.25)`, seeded from the low bits of the
-/// current time — no RNG dependency needed for this purpose (avoiding
-/// synchronized retries, not cryptographic unpredictability): concurrent
-/// callers each read the clock at very slightly different instants, so
-/// their jitter naturally decorrelates.
-fn jitter_factor() -> f64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    0.75 + (nanos % 1000) as f64 / 1000.0 * 0.5
+/// Report a confirmed truncation (VVAH-E005) to the client's metrics hook
+/// and log it, then hand the error back for the caller to return.
+fn give_up(client: &dyn LlmClient, truncated: LlmError) -> LlmError {
+    client.note_truncated_reply();
+    tracing::warn!(error = %truncated, "LLM reply still truncated; giving up on it");
+    truncated
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,47 +203,57 @@ pub async fn run_agentic(
 /// (evict the oldest oversized tool result from `messages` and retry,
 /// capped at `max_context_shrinks`). Shrinks mutate `messages` in place so
 /// they persist for every later turn, not just this retry.
+///
+/// Authentication failures and truncated replies get the same narrower
+/// ladders [`chat_with_retry`] gives them. A truncated turn used to be
+/// read as the model finishing (it is not `StopReason::ToolUse`), so a
+/// half-written final answer came back as the session's result; it is
+/// now retried once at double the budget (capped by
+/// `AgenticConfig::max_tokens_ceiling`) and otherwise fails the session
+/// with [`LlmError::Truncated`]. The larger budget applies to this turn
+/// only.
 async fn send_turn(
     client: &dyn LlmClient,
     config: &AgenticConfig,
     messages: &mut [Message],
     tools: &[ToolSpec],
 ) -> Result<ChatResponse, LlmError> {
-    let mut transient_attempts = 0u32;
+    let mut ladder = RetryLadder::new(config.max_transient_retries, config.retry_backoff_base);
+    let mut truncation = TruncationGuard::new(config.max_tokens, config.max_tokens_ceiling);
     let mut shrink_attempts = 0u32;
 
     loop {
-        let request = build_request(config, messages, tools);
+        let mut request = build_request(config, messages, tools);
+        request.max_tokens = truncation.max_tokens();
         match client.chat(&request).await {
-            Ok(response) => return Ok(response),
-            Err(LlmError::ContextOverflow { message })
-                if shrink_attempts < config.max_context_shrinks =>
-            {
-                if shrink_history(messages) {
-                    shrink_attempts += 1;
-                    continue;
+            Ok(response) => match truncation.on_response(response) {
+                Verdict::Done(response) => return Ok(response),
+                Verdict::Retry => continue,
+                Verdict::GiveUp(truncated) => return Err(give_up(client, truncated)),
+            },
+            Err(e) => {
+                // Checked before the context-overflow arm: an overflow
+                // that names the doubled budget is the cap, not history
+                // to evict.
+                if let Some(truncated) = truncation.cap_rejection(&e) {
+                    return Err(give_up(client, truncated));
                 }
-                return Err(LlmError::ContextOverflow { message });
-            }
-            Err(e) if e.is_retryable() && transient_attempts < config.max_transient_retries => {
-                transient_attempts += 1;
-                let delay = backoff_duration(&e, transient_attempts, config.retry_backoff_base);
-                // See `chat_with_retry`'s own note: an agentic session
-                // retrying silently is indistinguishable from a hung one.
-                let delay_secs = delay.as_secs_f64();
-                tracing::warn!(
-                    error = %e,
-                    attempt = transient_attempts,
-                    max = config.max_transient_retries,
-                    delay_secs,
-                    "transient LLM error in agentic turn; retrying after backoff"
-                );
+                if let LlmError::ContextOverflow { .. } = e {
+                    if shrink_attempts < config.max_context_shrinks {
+                        if !shrink_history(messages) {
+                            return Err(e);
+                        }
+                        shrink_attempts += 1;
+                        continue;
+                    }
+                }
+                let Some(delay) = ladder.delay_for(&e, "agentic turn") else {
+                    return Err(e);
+                };
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
-                continue;
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -271,6 +273,13 @@ fn build_request(config: &AgenticConfig, messages: &[Message], tools: &[ToolSpec
         json_mode: config.json_mode,
         timeout: config.timeout_secs.map(Duration::from_secs),
         stream: false,
+        reasoning_effort: config.reasoning_effort,
+        openai_api: config.openai_api,
+        cache_prefix: config.cache_prefix.clone(),
+        cache_key: config.cache_key.clone(),
+        // Stamped by `bc_llm_client::ApplyCachePolicy` where the client
+        // is built; a session has no view on it.
+        cache: bc_llm_client::CachePolicy::default(),
     }
 }
 
@@ -295,6 +304,9 @@ mod tests {
     struct ScriptedClient {
         responses: Mutex<Vec<Result<ChatResponse, LlmError>>>,
         calls: Mutex<u32>,
+        /// Every request's `max_tokens`, in send order.
+        budgets: Mutex<Vec<u32>>,
+        truncation_notes: Mutex<u32>,
     }
 
     impl ScriptedClient {
@@ -306,23 +318,38 @@ mod tests {
             ScriptedClient {
                 responses: Mutex::new(responses),
                 calls: Mutex::new(0),
+                budgets: Mutex::new(Vec::new()),
+                truncation_notes: Mutex::new(0),
             }
         }
 
         fn call_count(&self) -> u32 {
             *self.calls.lock().unwrap()
         }
+
+        fn budgets(&self) -> Vec<u32> {
+            self.budgets.lock().unwrap().clone()
+        }
+
+        fn truncation_notes(&self) -> u32 {
+            *self.truncation_notes.lock().unwrap()
+        }
     }
 
     #[async_trait]
     impl LlmClient for ScriptedClient {
-        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
             *self.calls.lock().unwrap() += 1;
+            self.budgets.lock().unwrap().push(request.max_tokens);
             self.responses
                 .lock()
                 .unwrap()
                 .pop()
                 .expect("ScriptedClient ran out of scripted responses")
+        }
+
+        fn note_truncated_reply(&self) {
+            *self.truncation_notes.lock().unwrap() += 1;
         }
     }
 
@@ -625,6 +652,7 @@ mod tests {
             json_mode: false,
             timeout: None,
             stream: false,
+            ..ChatRequest::default()
         }
     }
 
@@ -701,74 +729,6 @@ mod tests {
         assert_eq!(response.text(), "recovered");
     }
 
-    // ── backoff_duration / jitter_factor ────────────────────────────────
-
-    #[test]
-    fn backoff_duration_is_zero_when_the_base_is_zero_even_for_a_real_retry_after() {
-        let err = LlmError::RateLimited {
-            retry_after_secs: Some(30),
-        };
-        assert_eq!(backoff_duration(&err, 1, Duration::ZERO), Duration::ZERO);
-    }
-
-    #[test]
-    fn backoff_duration_honors_a_real_retry_after_value_unjittered() {
-        let err = LlmError::RateLimited {
-            retry_after_secs: Some(30),
-        };
-        // attempt 2 -> linear = 20s, jittered to within [15s, 25s), so the
-        // 30s server hint dominates for every jitter value. Picking an
-        // attempt whose jittered schedule could exceed the hint would make
-        // this assertion pass only about half the time.
-        assert_eq!(
-            backoff_duration(&err, 2, Duration::from_secs(10)),
-            Duration::from_secs(30)
-        );
-    }
-
-    #[test]
-    fn backoff_duration_waits_the_schedule_out_when_it_exceeds_retry_after() {
-        // The 1s hint is the live case the schedule exists to defend
-        // against: honoring it verbatim burns the retry budget in seconds.
-        let err = LlmError::RateLimited {
-            retry_after_secs: Some(1),
-        };
-        let got = backoff_duration(&err, 3, Duration::from_secs(10));
-        // attempt 3 -> linear = 30s, jittered to within [22.5s, 37.5s),
-        // every value of which outlasts the hint.
-        assert!(got >= Duration::from_millis(22_500) && got < Duration::from_millis(37_500));
-    }
-
-    #[test]
-    fn backoff_duration_falls_back_to_jittered_linear_backoff_without_a_retry_after_value() {
-        let err = LlmError::RateLimited {
-            retry_after_secs: None,
-        };
-        let base = Duration::from_secs(10);
-        let got = backoff_duration(&err, 2, base);
-        // attempt 2 -> linear = 20s, jittered to within [15s, 25s).
-        assert!(got >= Duration::from_secs(15) && got < Duration::from_secs(25));
-    }
-
-    #[test]
-    fn backoff_duration_jitters_a_non_rate_limited_retryable_error_too() {
-        let err = LlmError::ServerError {
-            status: 503,
-            message: "down".to_string(),
-        };
-        let base = Duration::from_secs(10);
-        let got = backoff_duration(&err, 1, base);
-        assert!(got >= Duration::from_millis(7500) && got < Duration::from_millis(12500));
-    }
-
-    #[test]
-    fn jitter_factor_is_always_within_the_documented_range() {
-        for _ in 0..20 {
-            let f = jitter_factor();
-            assert!((0.75..1.25).contains(&f), "{f} out of range");
-        }
-    }
-
     #[tokio::test]
     async fn context_overflow_shrinks_history_and_retries() {
         let client = ScriptedClient::new(vec![
@@ -839,37 +799,229 @@ mod tests {
         assert!(matches!(err, LlmError::InvalidRequest { .. }));
         assert_eq!(client.call_count(), 0);
     }
-}
 
-#[cfg(test)]
-mod retry_after_floor_tests {
-    use super::*;
+    // ── truncation (VVAH-E005) ──────────────────────────────────────────
 
-    #[test]
-    fn a_small_retry_after_hint_does_not_shortcut_the_growing_schedule() {
-        let err = LlmError::RateLimited {
-            retry_after_secs: Some(1),
-        };
-        // attempt 3 at a 10 s base is ~30 s ± 25 % jitter — far more than the
-        // 1 s hint, which is a floor and must not win.
-        let d = backoff_duration(&err, 3, Duration::from_secs(10));
-        assert!(d >= Duration::from_secs(22), "{d:?}");
+    fn truncated_response(text: &str) -> ChatResponse {
+        ChatResponse {
+            content: vec![ContentBlock::text(text)],
+            stop_reason: StopReason::MaxTokens,
+            usage: Usage::default(),
+        }
     }
 
-    #[test]
-    fn a_large_retry_after_hint_is_honoured_as_the_floor() {
-        let err = LlmError::RateLimited {
-            retry_after_secs: Some(120),
-        };
-        let d = backoff_duration(&err, 1, Duration::from_secs(10));
-        assert_eq!(d, Duration::from_secs(120));
+    fn cap_400() -> LlmError {
+        LlmError::InvalidRequest {
+            message: "max_tokens: 200 > 150, which is the maximum allowed".to_string(),
+        }
     }
 
-    #[test]
-    fn a_zero_base_still_means_no_sleep_in_tests() {
-        let err = LlmError::RateLimited {
-            retry_after_secs: Some(5),
-        };
-        assert_eq!(backoff_duration(&err, 2, Duration::ZERO), Duration::ZERO);
+    fn auth_error() -> LlmError {
+        LlmError::Authentication {
+            status: Some(401),
+            message: "invalid x-api-key".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_with_retry_resends_a_truncated_reply_once_at_double_the_budget() {
+        let client = ScriptedClient::new(vec![
+            Ok(truncated_response("{\"findings\": [")),
+            Ok(text_response("{\"findings\": []}")),
+        ]);
+        let response = chat_with_retry(&client, &a_request(), 4, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(response.text(), "{\"findings\": []}");
+        assert_eq!(client.budgets(), vec![100, 200]);
+        assert_eq!(
+            client.truncation_notes(),
+            0,
+            "a recovered truncation is not counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_retry_gives_up_with_the_partial_after_a_second_truncation() {
+        let client = ScriptedClient::new(vec![
+            Ok(truncated_response("{\"a\":")),
+            Ok(truncated_response("{\"a\": [1,")),
+        ]);
+        let err = chat_with_retry(&client, &a_request(), 4, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            LlmError::Truncated {
+                requested: 100,
+                retried_at: Some(200),
+                partial: Box::new(truncated_response("{\"a\": [1,")),
+            }
+        );
+        assert_eq!(err.code(), Some("VVAH-E005"));
+        assert_eq!(client.truncation_notes(), 1);
+    }
+
+    /// The provider's 400 on the doubled budget IS its cap: the caller
+    /// gets the first reply back as the partial, never the 400 about a
+    /// request it did not make.
+    #[tokio::test]
+    async fn chat_with_retry_reads_a_budget_400_on_the_retry_as_the_providers_cap() {
+        let client = ScriptedClient::new(vec![Ok(truncated_response("first")), Err(cap_400())]);
+        let err = chat_with_retry(&client, &a_request(), 4, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            LlmError::Truncated {
+                requested: 100,
+                retried_at: Some(200),
+                partial: Box::new(truncated_response("first")),
+            }
+        );
+        assert_eq!(client.truncation_notes(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_with_retry_keeps_the_doubled_budget_across_a_transient_retry() {
+        let client = ScriptedClient::new(vec![
+            Ok(truncated_response("{")),
+            Err(LlmError::ServerError {
+                status: 503,
+                message: "down".to_string(),
+            }),
+            Ok(text_response("{}")),
+        ]);
+        let response = chat_with_retry(&client, &a_request(), 4, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(response.text(), "{}");
+        assert_eq!(client.budgets(), vec![100, 200, 200]);
+    }
+
+    #[tokio::test]
+    async fn chat_with_retry_capped_honors_the_ceiling() {
+        let client =
+            ScriptedClient::new(vec![Ok(truncated_response("{")), Ok(text_response("{}"))]);
+        chat_with_retry_capped(&client, &a_request(), 4, Duration::ZERO, Some(150))
+            .await
+            .unwrap();
+        assert_eq!(client.budgets(), vec![100, 150]);
+
+        // Already at the ceiling: no retry at all.
+        let client = ScriptedClient::new(vec![Ok(truncated_response("{"))]);
+        let err = chat_with_retry_capped(&client, &a_request(), 4, Duration::ZERO, Some(100))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            LlmError::Truncated {
+                requested: 100,
+                retried_at: None,
+                partial: Box::new(truncated_response("{")),
+            }
+        );
+        assert_eq!(client.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_with_retry_retries_authentication_three_times_then_halts() {
+        let client = ScriptedClient::new(vec![
+            Err(auth_error()),
+            Err(auth_error()),
+            Err(auth_error()),
+            Err(auth_error()),
+        ]);
+        let err = chat_with_retry(&client, &a_request(), 0, Duration::ZERO)
+            .await
+            .unwrap_err();
+        assert_eq!(err, auth_error());
+        assert!(err.halts_scan());
+        assert_eq!(client.call_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn chat_with_retry_survives_a_credential_that_recovers() {
+        let client = ScriptedClient::new(vec![Err(auth_error()), Ok(text_response("ok"))]);
+        let response = chat_with_retry(&client, &a_request(), 0, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(response.text(), "ok");
+    }
+
+    /// The bug this closes: a turn cut off by its budget is not a tool
+    /// call, so the loop used to hand the half-written text back as the
+    /// session's final answer.
+    #[tokio::test]
+    async fn a_truncated_final_turn_is_retried_at_double_the_budget() {
+        let client = ScriptedClient::new(vec![
+            Ok(truncated_response("VERDICT: TRUE_POS")),
+            Ok(text_response("VERDICT: TRUE_POSITIVE")),
+        ]);
+        let mut cfg = instant_config();
+        cfg.max_tokens = 1000;
+        let outcome = run_agentic(&client, &FakeTools::new(), "hi", &cfg)
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_text, "VERDICT: TRUE_POSITIVE");
+        assert_eq!(client.budgets(), vec![1000, 2000]);
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_turn_stays_truncated_fails_with_the_partial() {
+        let client = ScriptedClient::new(vec![
+            Ok(truncated_response("VERDICT: TR")),
+            Ok(truncated_response("VERDICT: TRUE_")),
+        ]);
+        let mut cfg = instant_config();
+        cfg.max_tokens = 1000;
+        cfg.max_tokens_ceiling = Some(1500);
+        let err = run_agentic(&client, &FakeTools::new(), "hi", &cfg)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            LlmError::Truncated {
+                requested: 1000,
+                retried_at: Some(1500),
+                partial: Box::new(truncated_response("VERDICT: TRUE_")),
+            }
+        );
+        assert_eq!(client.budgets(), vec![1000, 1500]);
+        assert_eq!(client.truncation_notes(), 1);
+    }
+
+    /// An overflow naming the doubled budget is the provider's cap, not
+    /// history to evict: nothing is shrunk and the first reply comes back.
+    #[tokio::test]
+    async fn an_agentic_budget_refusal_on_the_retry_is_the_cap_not_an_overflow() {
+        let client = ScriptedClient::new(vec![
+            Ok(truncated_response("partial")),
+            Err(LlmError::ContextOverflow {
+                message: "input length and `max_tokens` exceed context limit".to_string(),
+            }),
+        ]);
+        let err = run_agentic(&client, &FakeTools::new(), "hi", &instant_config())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            LlmError::Truncated {
+                requested: 16_000,
+                retried_at: Some(32_000),
+                partial: Box::new(truncated_response("partial")),
+            }
+        );
+        assert_eq!(client.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_agentic_turn_retries_authentication_before_halting() {
+        let client = ScriptedClient::new(vec![Err(auth_error()), Ok(text_response("done"))]);
+        let outcome = run_agentic(&client, &FakeTools::new(), "hi", &instant_config())
+            .await
+            .unwrap();
+        assert_eq!(outcome.final_text, "done");
+        assert_eq!(client.call_count(), 2);
     }
 }

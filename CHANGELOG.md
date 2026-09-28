@@ -4,6 +4,276 @@ All notable changes to this project are recorded here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-09-28
+
+This release brings the port up to vvaharness v1.3.0 and v1.4.0, apart
+from v1.4.0's exploit verification. That feature sends live attack
+traffic at a running API, which is dynamic testing and out of scope for a
+static analysis tool, so it is deliberately not ported. The release also
+adds an OpenAI Responses API transport, request-side prompt caching for
+both dialects, a per-model capability table, an API specification step in
+target testing, and cooperative Ctrl-C cancellation.
+
+Most of this was tested offline against mocked providers. What has since
+been checked against the real thing is named below; the checks that still
+need a live provider are called out on the capabilities they affect.
+
+### Behavior changes to know about before upgrading
+
+- **The default model is `gpt-5.6-luna`**, a reasoning model, and the
+  default OpenAI transport is `--openai-api auto`, which sends reasoning
+  models to the Responses API. Pass `--model gpt-4o --openai-api chat`
+  for the old behavior. On reasoning models, `--temperature`, `--top-p`
+  and `--seed` are dropped with a warning unless `--reasoning-effort none`
+  is set, because the provider rejects them.
+- **Retired models are refused before any spend.** Claude 2 and 3.x,
+  `gpt-3.5*`, the original `gpt-4`, `gpt-4-turbo`, `o1-preview` and
+  `o1-mini` stop the run with a suggested replacement;
+  `--allow-unsupported-model` overrides it for a gateway with its own
+  names. Deprecated and legacy models (including `gpt-4o`) get one
+  warning each. Unknown names are allowed.
+- **A remediation run can now exit non-zero.** `1` when an S10 or S11
+  call failed, `3` when validation ran and nothing came out fixed, and
+  `130` for a run canceled with Ctrl-C. A plain scan's exit code is
+  unchanged. `--remediation-exit-code false` restores the old behavior;
+  the GitHub Action only fails on these when `fail-on-remediation: "true"`.
+- **Config loading is stricter.** A secret-named environment variable
+  (`*TOKEN*`, `*API_KEY*`, `*SECRET*` and similar) can no longer be
+  interpolated into any config key; a Python profile still carrying
+  `api_key: ${...}` needs that line deleted (it was never read here).
+  `config.local.yaml` is refused when it is a symlink, owned by another
+  user, or group or world writable (`BC_NO_LOCAL_CONFIG=1` skips it).
+- **S4 refuses a malformed findings reply** (`{}`, `{"findings": null}`,
+  a misspelled key) instead of counting it as zero findings, and asks the
+  model once to repair it.
+- **Eleven specialist lenses run by default instead of six**:
+  `injection`, `csrf`, `sensitive-data`, `hardcoded-creds` and
+  `log-injection` join the six, and `deserialization` is on by default.
+  Expect more S4 calls on repositories with those surfaces.
+- **S11 stays on by default after `--remediate`**, which differs from
+  v1.4.0, where validation is opt-in: here S11 is what rolls back a patch
+  it grades Not Fixed. `--no-validate` turns it off.
+
+### OpenAI Responses API, reasoning effort and a per-model capability table
+
+- `--openai-api chat|responses|auto` (env `BC_OPENAI_API`, config
+  `llm.openai_api`, per role `models.<role>.use_responses_api`). Requests
+  send `store: false` and ask for encrypted reasoning, which is replayed
+  across tool-calling turns, so reasoning models keep their reasoning with
+  tools instead of running with it switched off. `auto` falls back to
+  Chat Completions only when the endpoint does not serve Responses (404,
+  405, 501, or a 400 naming a Responses-only parameter) and never on a
+  429, 5xx or timeout, and remembers the answer per model.
+- `--reasoning-effort none|minimal|low|medium|high|xhigh|max`, per role
+  `models.<role>.effort`. Anthropic models get adaptive thinking with
+  `output_config.effort` on 4.6 and later, and a thinking budget on older
+  models; thinking blocks are kept and replayed verbatim.
+- `bc_llm_client::capabilities` knows, per model family, which sampling
+  parameters are accepted, the effort levels, the output token cap, the
+  cache minimum, and whether forced tool choice is allowed. Requests drop
+  or clamp what a model would reject before sending, and a per-model
+  memory of learned rejections is the backstop for anything the table
+  gets wrong. `--doctor` prints each configured model's row.
+
+### Prompt caching on both dialects, and cost tracking that counts it
+
+- Anthropic: breakpoints on the tool list, the system prompt, a shared
+  prefix block and the conversation tail, at most four, gated on the
+  model's minimum cacheable size, never on a thinking block. Config
+  `llm.cache_markers`, `llm.cache_min_block_tokens`, `llm.cache_ttl`
+  (`5m` or `1h`), and `--no-cache-markers`.
+- OpenAI: a hashed `prompt_cache_key` per stage, and the stable prefix
+  sent first so implicit prefix caching can match it. Cache writes are
+  parsed as well as reads.
+- S4 sends one byte-identical shared context block (application profile,
+  compact threat model, entry-point inventory, trust rule) as the cached
+  prefix of every chunk, and the source code as well for consecutive lens
+  chunks of the same shard. The first chunk of a shard runs first so its
+  siblings hit a warm cache (`step4.shard_cache_gating`).
+- Cached reads and writes are priced at the right rates, including the
+  1-hour Anthropic write at twice the input rate.
+- `--doctor --cache-probe` makes two calls through the real client and
+  reports whether caching actually works on that route. It spends tokens.
+
+### Transport hardening
+
+- A reply that stops at its output budget (VVAH-E005) is retried once at
+  double the budget. If it is still cut off, S2, S3, S4, S7 and S8 keep
+  what arrived: S4 closes the cut-off findings document back to its last
+  complete finding instead of losing the reply.
+- A rejected credential (VVAH-E001) or a proxy or TLS failure (VVAH-E002)
+  stops the whole scan through the budget gate, as quota exhaustion
+  already did, instead of failing every chunk in turn.
+- Mutual TLS with `--client-cert` / `--client-key`, failing closed on a
+  missing or malformed file. Anthropic OAuth tokens (`sk-ant-oat...`) are
+  sent as Bearer auth. The startup probe asks for 256 tokens, not 4.
+
+### Detection pipeline (ported from v1.3.0 and v1.4.0)
+
+- S2 sends redacted, capped excerpts of representative config files,
+  finds manifests up to three directories deep, reads everything through
+  the path jail, repairs a malformed reply once, caps threats, assets and
+  boundaries deterministically without dropping a boundary's only cover,
+  and gives every baseline item an id and a required disposition. An
+  optional read-only agentic pass is available (`step2.agentic`).
+- S3 groups files by their immediate directory with a cap, emits lens
+  chunks shard by shard, stops splitting taint chunks, grounds the
+  strategist with a file id inventory, salvages individual chunks from an
+  off-schema reply, and has a coverage backstop that keeps files the
+  reachability filter would drop.
+- S1's model-authored auto-exclude overlay can no longer exclude a whole
+  language or the whole repository, and warns when under 10% of files
+  survive. S5 exempts point-of-occurrence findings (hard-coded
+  credentials, missing controls) from `require_evidence`.
+- S4 votes against the runs that succeeded, skips chunks with no files,
+  and leaves binary files and base64 data URIs out of prompts. S6 repairs
+  an unparseable verdict once and accepts it only if it agrees with the
+  first reply. S8 degrades on an empty scope and redacts before
+  truncating.
+- Markdown output strips bidi overrides, zero-width characters and
+  Unicode line breaks from model text.
+- Tree-sitter call graph fixes for Java and C# class definitions and
+  constructor calls, `*.d.ts` is no longer treated as source, and the
+  COBOL `COPY` pattern is anchored.
+
+### Remediation and validation hardening
+
+- The post-patch repository walk, the validator's scope walk and the
+  `Glob` tool no longer follow symlinked directories, and every walk is
+  capped, so a symlink loop cannot hang or exhaust a run.
+- The validator's pattern scanner returns no matched text and has hard
+  per-file, per-scan and per-match limits with a truncation summary.
+- A patch that introduces a reusable workflow pinned to anything but an
+  existing full commit SHA is rolled back and rejected
+  (`unsafe_workflow_reference`).
+- Diffs are redacted with their hunk structure intact before the
+  validator sees them. Agent-supplied evidence is bounded and redacted
+  before truncation. An inconclusive validation is reported as `n/a` or
+  `null`, never as a score of 0.
+- An ACCEPT needs a kept, non-empty Fixed or Partially Fixed diff. The
+  summary counts fixed, not fixed and failed separately. S10 and S11
+  resume checkpoints are keyed by model, so changing `--model` no longer
+  reuses another model's result.
+- Exported patches no longer silently drop deleted files.
+
+### Input hardening
+
+- `--checkmarx-xml` reports are read with the bounded `bc-xml` reader. A
+  deeply nested report used to overflow the stack and abort the whole
+  scan; now a report over 64 MiB, nested deeper than 32 levels, or with
+  any `<!DOCTYPE` is skipped with a WARN naming the file and the limit.
+  Real CxSAST exports parse to the same findings as before.
+- Every vendor export file (`--checkmarx-xml`, `--snyk-json`,
+  `--semgrep-json`, `--aikido-json`, `--sonatype-json`) is read with a
+  256 MiB cap instead of being read whole into memory first; a larger
+  file is skipped with a WARN and recorded as unreadable.
+
+### Observability
+
+- Every stage, S0 to S11, reports an outcome (completed, completed with
+  errors, cached, skipped, disabled, error), a duration and its own
+  counters. `run_manifest.json` (`--out-run-manifest`) records them with
+  per-stage tokens, cache reads and writes, cost, the models and
+  transports used, input file hashes and a scrubbed command line.
+- Plain-text progress lines for CI logs: `--progress-style
+  compact|verbose|summary_only|stage_only`, `scan_progress.*`, or
+  `BC_SCAN_PROGRESS_ENABLED`. `--s6-progress-file` writes S6 counters
+  atomically as verification runs.
+- A Pipeline Diagnostics report section appears when something
+  noteworthy happened: repairs, truncations, forced coverage, vetoed
+  auto-excludes, capped threats, shard gating waits.
+- Resume is chained: S5 is reused only when S4 was, S6 only when S5 was,
+  and S7 only when S6 was. A resumed S4 still reports its failed chunks.
+- The `--log-file` output is redacted, and the local overlay is announced
+  once with every key it overrode (secrets shown only as set or unset).
+
+### API specification step in target testing
+
+New, not a port. With `--target-tests integration` or above and an HTTP
+API in the repository, `--api-spec auto` (the default) makes sure the
+repository has a correct OpenAPI or Swagger document: it creates one at
+the framework's conventional location when there is none, repairs an
+existing one with a minimal edit that keeps its version and format, and
+moves a misplaced one (updating references in docs and config) when that
+is unambiguous. Every route it documents cites its handler, a
+deterministic validator checks the document, and an independent reviewer
+must accept it before anything is written. It is static: nothing is sent
+to a running application.
+
+The step covers the other API description standards too. GraphQL SDL,
+AsyncAPI 2.x and 3.x, and OpenRPC 1.x documents are created, repaired
+and (for GraphQL under Spring for GraphQL, DGS or Lighthouse) relocated
+the same way, with their own parsers, validators and inventories (root
+fields, send and receive operations on channels, JSON-RPC methods).
+Protocol Buffers, RAML and API Blueprint documents are checked and
+reported, never rewritten: `.proto` files are compared with the gRPC
+services the code registers, and RAML and API Blueprint outcomes note
+that they could be converted to OpenAPI by hand. `--api-spec-formats`
+narrows the step to some standards, and the compiled profiles cap each
+standard separately.
+
+SOAP and OData complete the set. WSDL 1.1 and 2.0 documents, with XML
+Schema embedded or imported from `.xsd` files in the repository, are
+validated (target namespace, imports, unique names, message parts that
+resolve to a declared element or type or an XML Schema built-in, port
+type or interface, binding and service consistency, SOAP style and
+transport, credential-free addresses), repaired with minimal edits that
+keep the version, prefixes and definitions, and created as WSDL 1.1
+document/literal wrapped for JAX-WS, Spring-WS, WCF, CoreWCF, ASMX,
+spyne, PHP SoapServer and Node soap services that have none (as a
+reviewed snapshot where the framework generates the WSDL at run time).
+OData CSDL in XML (EDMX) or JSON is validated (keys, types, navigation
+targets and partners, entity sets, singletons, bindings, action and
+function imports) and version 4 is repaired in place; it is never
+created, because ASP.NET Core OData, SAP CAP and Olingo generate it at
+run time, and a run note says so. OData 2 and 3 metadata is recognized
+as legacy and only validated and reported. All XML is read with the
+project's own `bc-xml` reader, which refuses any DOCTYPE and bounds its
+work, and no imported schema, WSDL or referenced CSDL is ever fetched: a
+remote import is recorded as unverifiable.
+
+### Checked against the real thing
+
+The work above was built and tested offline. These were then verified for
+real, and three of them turned up bugs.
+
+- **The parity harness tracks upstream v1.4.0**, up from v1.2.0. That
+  surfaced real drift: upstream moved merge readiness out of the scoring
+  package and renamed its verdict vocabulary, so the oracle died on import
+  and the test failed with a broken pipe rather than a mismatch. Across all
+  256 gate-status combinations the new derivation agrees with this port, so
+  only the wire shape moved. The comparison now runs in upstream's value
+  space, and this port keeps `UNVERIFIABLE` as the label its reports show.
+- **The parity job could not fail.** It piped `cargo test` into `tee` under
+  a shell without `pipefail`, so the step reported `tee`'s exit status and
+  only a skip could fail the job. A genuinely failing parity test passed CI.
+- **The vendored price table refreshes again**, 202 to 213 providers and
+  7149 to 7745 models. The refresh script could not reach `models.dev`
+  because the site answers the default Python User-Agent with 403; it now
+  identifies itself. Upstream publishes `claude-opus-5-5` at the figures
+  this repository had entered by hand, so the supplement that carried them
+  is gone and its mechanism is kept for the next model to ship early.
+- **`o3-mini` and `o4-mini` carry their published retirement date**
+  (2026-10-23). Without it the startup gate warned about them indefinitely
+  instead of refusing them once they are gone. Every other dated row was
+  checked and already correct.
+- **A liveness check in the remediation tests read `/proc`**, which macOS
+  does not have, so it reported every process dead. One test failed
+  deterministically there; worse, two that assert a process was killed had
+  been passing without ever observing one alive. It asks `ps` now. The
+  process-group kill itself was never broken.
+
+Not yet verified, and still tracked: everything that needs a live model
+gateway, including the container execution path, prompt-cache behavior on
+real endpoints, and Ctrl-C against a real provider.
+
+### Ctrl-C
+
+The first Ctrl-C stops the scan cooperatively: nothing new starts,
+remediation never begins, `verify_command` process groups are killed, and
+the partial report and run manifest are written marked as canceled. The
+exit code is 130. A second Ctrl-C exits at once.
+
 ## [1.0.0] - 2026-09-14
 
 ### Diff-scoped scans no longer edit or report files the pull request never touched

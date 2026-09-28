@@ -420,43 +420,43 @@ fn several_flagged_gates_are_named_alphabetically_in_one_message() {
 }
 
 #[test]
-fn high_confidence_gates_score_exactly_as_unlabelled_ones_do() {
-    let labelled: Vec<GateResult> = all_pass()
+fn high_confidence_gates_score_exactly_as_unlabeled_ones_do() {
+    let labeled: Vec<GateResult> = all_pass()
         .into_iter()
         .map(|mut g| {
             g.confidence = Some(SynthesisConfidence::High);
             g
         })
         .collect();
-    let result = score_fix(&labelled);
+    let result = score_fix(&labeled);
     assert_eq!(result.fix_status, FixVerdict::Fixed);
     assert_eq!(score_fix(&all_pass()).raw_score, result.raw_score);
 }
 
 #[test]
-fn split_confidence_gates_score_exactly_as_unlabelled_ones_do() {
+fn split_confidence_gates_score_exactly_as_unlabeled_ones_do() {
     // The consensus check tests for `Flagged` specifically, not for
     // "anything other than `High`", so a `Split` costs nothing: the
     // conservative status the panel settled on is scored on its own
     // merits by the weights and the critical-gate cap. A gate set where
     // the personas differed only on degree is graded, not withheld.
-    let labelled: Vec<GateResult> = all_pass()
+    let labeled: Vec<GateResult> = all_pass()
         .into_iter()
         .map(|mut g| {
             g.confidence = Some(SynthesisConfidence::Split);
             g
         })
         .collect();
-    assert!(consensus_error(&labelled).is_none());
-    let result = score_fix(&labelled);
-    let unlabelled = score_fix(&all_pass());
-    assert_eq!(result.fix_status, unlabelled.fix_status);
-    assert_eq!(result.raw_score, unlabelled.raw_score);
-    assert_eq!(result.justification, unlabelled.justification);
+    assert!(consensus_error(&labeled).is_none());
+    let result = score_fix(&labeled);
+    let unlabeled = score_fix(&all_pass());
+    assert_eq!(result.fix_status, unlabeled.fix_status);
+    assert_eq!(result.raw_score, unlabeled.raw_score);
+    assert_eq!(result.justification, unlabeled.justification);
 }
 
 #[test]
-fn an_unlabelled_gate_set_never_trips_the_consensus_check() {
+fn an_unlabeled_gate_set_never_trips_the_consensus_check() {
     // `None` is "not synthesized", not "no consensus" — Python's own
     // `RawCriterion.confidence` defaults to the empty string and only
     // an explicit FLAGGED fails closed.
@@ -621,4 +621,41 @@ fn evidence_anchors_are_capped_at_five() {
     assert!(result.justification.contains("f4.py"));
     assert!(!result.justification.contains("f5.py"));
     assert!(!result.justification.contains("f6.py"));
+}
+
+#[test]
+fn fix_verdict_and_synthesis_confidence_parse_their_own_wire_labels() {
+    for v in [
+        FixVerdict::Fixed,
+        FixVerdict::PartiallyFixed,
+        FixVerdict::NotFixed,
+        FixVerdict::Unverifiable,
+    ] {
+        assert_eq!(FixVerdict::parse(v.as_str()), Some(v));
+    }
+    assert_eq!(FixVerdict::parse("fixed"), None);
+    for c in [
+        SynthesisConfidence::High,
+        SynthesisConfidence::Split,
+        SynthesisConfidence::Flagged,
+    ] {
+        assert_eq!(SynthesisConfidence::parse(c.as_str()), Some(c));
+    }
+    assert_eq!(SynthesisConfidence::parse("high"), None);
+}
+
+#[test]
+fn a_huge_files_needing_fixes_list_is_capped_with_a_marker() {
+    let mut gates = all_fail();
+    gates[0].evidence = (0..2000)
+        .map(|i| Evidence {
+            file: format!("src/module_{i:04}.py"),
+            line: None,
+            snippet: String::new(),
+        })
+        .collect();
+    let result = score_fix(&gates);
+    assert!(result.justification.contains(TRUNCATION_MARKER));
+    assert!(result.justification.len() < MAX_FILES_NEEDING_FIXES_CHARS + 1000);
+    assert_eq!(joined_files(&["a".to_string(), "b".to_string()]), "a, b");
 }

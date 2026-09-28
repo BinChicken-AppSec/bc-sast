@@ -21,10 +21,14 @@
 //! keeping the whole PAN/SSN pipeline internally ASCII-only avoids relying
 //! on Unicode digit-category semantics that would need per-engine
 //! verification. Structural separators (`\s`, `\w`) remain Unicode-aware,
-//! matching Python's default behaviour.
+//! matching Python's default behavior.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
+
+mod diff;
+
+pub use diff::redact_diff;
 
 use fancy_regex::{Captures, Regex};
 

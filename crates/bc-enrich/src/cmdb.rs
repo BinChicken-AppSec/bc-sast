@@ -231,7 +231,7 @@ pub fn load_cmdb_csv(path: &Path) -> Result<HashMap<String, AppInfo>, String> {
                 // enabled, and no test installs one, so the two
                 // `env_summary()` calls were never executed.
                 let msg = format!(
-                    "[cmdb] id {:?} normalises to the same key {key:?} as earlier id {:?}, but their exposure/sensitivity differ ({} vs {}); last-wins — disambiguate the CMDB to avoid severity-enrichment drift",
+                    "[cmdb] id {:?} normalizes to the same key {key:?} as earlier id {:?}, but their exposure/sensitivity differ ({} vs {}); last-wins — disambiguate the CMDB to avoid severity-enrichment drift",
                     a.id,
                     prior.id,
                     prior.env_summary(),
@@ -423,16 +423,16 @@ mod tests {
         assert!(err.contains("network paths are not allowed"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_genuine_read_error_on_an_existing_file_is_an_err() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let p = write(dir.path(), "cmdb.csv", "id,name\n1,Acme\n");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = load_cmdb_csv(&p);
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(result.is_err());
+        // A regular file nobody can open for reading. The kernel checks a
+        // sysctl's mode bits itself, without the CAP_DAC_OVERRIDE bypass a
+        // chmod 000 file gets, so the read fails for root as well.
+        let p = Path::new("/proc/sys/vm/drop_caches");
+        assert!(p.is_file(), "the fixture must pass the is_file pre-check");
+        let err = load_cmdb_csv(p).unwrap_err();
+        assert!(err.contains("Permission denied"), "{err}");
     }
 
     #[test]

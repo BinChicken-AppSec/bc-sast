@@ -1110,7 +1110,7 @@ rules:
 
     #[tokio::test]
     async fn e2e_python_a_sanitized_cross_file_path_is_evidence_but_not_a_taint_path() {
-        // `quote` is in the built-in sanitizer set, and it neutralises
+        // `quote` is in the built-in sanitizer set, and it neutralizes
         // the value one hop BEFORE the sink function — the case the
         // symbolic walk used to collapse into a bare `None`, which the
         // soft gate would then have re-emitted as an unsanitized path.

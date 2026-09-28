@@ -291,7 +291,7 @@ pub fn collapse_trivial<T: DedupKey>(
 ///   never satisfy its "explicit, EQUAL CWE" requirement anyway.
 ///
 /// `vuln_class` is deliberately *not* compared: the whole point is that
-/// the four lenses in the field case labelled the same lines
+/// the four lenses in the field case labeled the same lines
 /// `other`/`info-leak`/`logic-flaw`-ish differently.
 ///
 /// Like [`collapse_trivial`], an index already present as a key is a
@@ -369,7 +369,7 @@ pub struct DupRelation {
     /// additional one. The caller uses this to decide whether the
     /// duplicate should be recorded as an extra location on the canonical
     /// (only when `!same_site`), matching the Python original's
-    /// `_attach_duplicates` behaviour.
+    /// `_attach_duplicates` behavior.
     pub same_site: bool,
 }
 
@@ -990,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_identity_still_honours_the_cwe_and_class_guards() {
+    fn flow_identity_still_honors_the_cwe_and_class_guards() {
         // Same flow, but the two CWEs are explicit and disagree: two
         // lenses on one flow, not one finding.
         let items = [

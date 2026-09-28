@@ -225,7 +225,7 @@ fn py_visit(node: Node, src: &[u8], st: &mut FactState) {
 // ── Java ─────────────────────────────────────────────────────────────────
 
 /// LHS identifier when `node` is the RHS of an assignment or the
-/// initialiser of a declarator. Ported from
+/// initializer of a declarator. Ported from
 /// `_java_extract_field_facts::_assign_target_of`.
 fn java_assign_target_of(node: Node, src: &[u8]) -> Option<String> {
     let parent = node.parent()?;
@@ -446,7 +446,7 @@ fn cs_visit(node: Node, src: &[u8], st: &mut FactState) {
             }
         }
         "variable_declarator" => {
-            // `Type x = obj.Field;` — the initialiser may sit inside an
+            // `Type x = obj.Field;` — the initializer may sit inside an
             // `equals_value_clause`.
             let name_n = node.child_by_field_name("name");
             let val_n = named_kids(node).find(|c| Some(*c) != name_n).and_then(|c| {
@@ -633,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn java_local_variable_initialised_from_a_field_is_a_field_read() {
+    fn java_local_variable_initialized_from_a_field_is_a_field_read() {
         let src =
             "class C {\n  void m() {\n    String s = o.name;\n    String t = compute();\n  }\n}\n";
         let (_, fr, _) = extract("java", src);
@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn csharp_declarator_initialised_from_a_property_is_a_field_read() {
+    fn csharp_declarator_initialized_from_a_property_is_a_field_read() {
         let src = "class C {\n  void M() {\n    var s = o.Name;\n    var t = Compute();\n  }\n}\n";
         let (_, fr, _) = extract("csharp", src);
         assert_eq!(fr.len(), 1);

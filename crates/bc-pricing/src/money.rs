@@ -19,13 +19,13 @@
 //! exactly, at the point of display.
 //!
 //! A picodollar is 1e-12 US dollars. That is not an arbitrary choice: the
-//! upstream catalogue quotes dollars per million tokens, so scaling a rate
+//! upstream catalog quotes dollars per million tokens, so scaling a rate
 //! by 10^6 to clear its decimals leaves a value that reads directly as
 //! picodollars per token, and `rate * tokens` is then already in
 //! picodollars with no scaling step to get wrong.
 //!
 //! `u128` holds the result. The most expensive rate in the captured
-//! catalogue is 600 dollars per million tokens, or 6e8 picodollars per
+//! catalog is 600 dollars per million tokens, or 6e8 picodollars per
 //! token, so a single call would need on the order of 1e29 tokens to
 //! overflow. Costs are never negative, and there is no subtraction, so an
 //! unsigned type also makes an impossible state unrepresentable.

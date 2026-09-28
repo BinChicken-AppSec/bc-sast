@@ -53,6 +53,28 @@ pub struct AgenticConfig {
     /// default is usually adequate here and this exists for the operator
     /// who needs to raise it.
     pub timeout_secs: Option<u64>,
+    /// Upper bound on the one truncation retry's doubled output budget
+    /// (VVAH-E005, see [`crate::chat_with_retry`]). `None` (the default)
+    /// leaves the doubling uncapped and lets the provider's own 400 on an
+    /// over-cap budget stand in for the ceiling, as Python's OpenAI
+    /// route does; Python's Anthropic route passes the model's output
+    /// cap here instead. A turn already at the ceiling is not retried.
+    pub max_tokens_ceiling: Option<u32>,
+    /// Reasoning-effort tier for every turn (the Python original's
+    /// `models.<role>.effort`), forwarded to
+    /// [`bc_llm_client::ChatRequest::reasoning_effort`]. `None` sends none.
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+    /// Per-role OpenAI transport pin (Python's
+    /// `models.<role>.use_responses_api`), forwarded to
+    /// [`bc_llm_client::ChatRequest::openai_api`]. `None` keeps the
+    /// client's configured transport.
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
+    /// Stable leading prefix of the first user turn, forwarded to
+    /// [`bc_llm_client::ChatRequest::cache_prefix`] on every turn.
+    pub cache_prefix: Option<String>,
+    /// OpenAI `prompt_cache_key` material, forwarded to
+    /// [`bc_llm_client::ChatRequest::cache_key`] on every turn.
+    pub cache_key: Option<String>,
 }
 
 impl AgenticConfig {
@@ -76,6 +98,11 @@ impl AgenticConfig {
             max_context_shrinks: 16,
             retry_backoff_base: Duration::from_secs(10),
             timeout_secs: None,
+            max_tokens_ceiling: None,
+            reasoning_effort: None,
+            openai_api: None,
+            cache_prefix: None,
+            cache_key: None,
         }
     }
 }
@@ -102,6 +129,11 @@ mod tests {
         assert_eq!(cfg.max_context_shrinks, 16);
         assert_eq!(cfg.retry_backoff_base, Duration::from_secs(10));
         assert!(cfg.timeout_secs.is_none());
+        assert!(cfg.max_tokens_ceiling.is_none());
+        assert!(cfg.reasoning_effort.is_none());
+        assert!(cfg.openai_api.is_none());
+        assert!(cfg.cache_prefix.is_none());
+        assert!(cfg.cache_key.is_none());
     }
 
     #[test]

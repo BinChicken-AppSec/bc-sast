@@ -63,7 +63,7 @@ pub fn confine(root: &Path, candidate: &str) -> Option<PathBuf> {
 }
 
 /// True if `candidate` resolves to a location inside (or equal to) `root`.
-/// The inverse-flavoured sibling of [`confine`], used by the config
+/// The inverse-flavored sibling of [`confine`], used by the config
 /// trust-gate to ask "does this file live inside the scan target?" without
 /// needing the caller to join a relative fragment first. A network
 /// (UNC/`\\host\share`) `candidate` is always `false`, checked before any

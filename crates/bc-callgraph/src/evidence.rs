@@ -583,7 +583,7 @@ fn apply_return_to_local(
 ) -> Vec<TaintTransferEdge> {
     let mut edges = Vec::new();
     let empty = Vec::new();
-    // Materialised up front: the loop body mutates `state`, which
+    // Materialized up front: the loop body mutates `state`, which
     // `facts` is not part of, but the borrow checker cannot see that
     // through the map lookup.
     let call_facts: Vec<&CallArgFact> = facts.call_args.get(fid).unwrap_or(&empty).to_vec();
@@ -624,7 +624,7 @@ fn apply_return_to_local(
 }
 
 /// Ported from `_graph.py::_transfer_closure` (L803): run the six
-/// appliers to a fixpoint, sanitizers first so a neutralised value never
+/// appliers to a fixpoint, sanitizers first so a neutralized value never
 /// propagates.
 fn transfer_closure(
     fid: &str,
@@ -769,7 +769,7 @@ pub fn build_taint_evidence_for_path(
                     });
                 }
                 // No live taint left, but a sanitized value did reach the
-                // sink — report the path and mark it neutralised.
+                // sink — report the path and mark it neutralized.
                 if !state.sanitized_locals.is_empty()
                     && cf
                         .arg_symbols
@@ -820,7 +820,7 @@ pub fn build_taint_evidence_for_path(
         if next_slots.is_empty() {
             // Nothing tainted crosses into the next function. If what
             // crosses is a *sanitized* value, that is a positive
-            // finding — the flow exists and is neutralised — and it
+            // finding — the flow exists and is neutralized — and it
             // must be reported as such rather than as "nothing
             // demonstrated". Upstream both cases collapse to `None`
             // because a `None` is dropped either way; under the soft
@@ -890,7 +890,7 @@ fn sink_cwe_of(sink: &CallSite) -> Vec<String> {
 /// `_has_phase1_facts_for_path` is false — `edges: []`, unsanitized
 /// (`_graph.py` L1811-1817 / L1893-1899). Languages with no assign/
 /// return/call-arg extractor (JavaScript, TypeScript, Go) always land
-/// here, keeping their reachability-only behaviour intact.
+/// here, keeping their reachability-only behavior intact.
 pub fn fallback_evidence(
     source: &CallSite,
     sink: &CallSite,

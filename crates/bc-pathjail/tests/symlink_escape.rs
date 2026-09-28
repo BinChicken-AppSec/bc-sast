@@ -27,7 +27,7 @@ fn confine_rejects_symlink_that_resolves_outside_root() {
 #[test]
 fn confine_rejects_symlink_then_dotdot_escape() {
     // A path like "root/evil_symlink/../a.txt" where evil_symlink points
-    // outside root must NOT be treated as if the ".." simply cancelled the
+    // outside root must NOT be treated as if the ".." simply canceled the
     // symlink lexically back to "root/a.txt" — real filesystem semantics
     // resolve the symlink first, so ".." lands in the symlink target's
     // parent, which is outside root. This is the classic naive

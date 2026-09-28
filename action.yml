@@ -36,9 +36,13 @@ inputs:
     required: false
     default: ""
   model:
-    description: "Model identifier used for every pipeline stage."
+    description: >-
+      Model identifier used for every pipeline stage. The default is a
+      reasoning model, reached over the OpenAI Responses API (the scanner's
+      default --openai-api auto). A retired model id stops the run before
+      any token is spent; see docs/github-action.md.
     required: false
-    default: "gpt-4o"
+    default: "gpt-5.6-luna"
   dialect:
     description: "Gateway wire dialect: openai or anthropic."
     required: false
@@ -50,6 +54,25 @@ inputs:
       SARIF/findings output when enabled; no remediation file otherwise. Posting
       the resulting fix-suggestion PR comments is a separate step. See
       docs/github-action.md's consumer workflow 2 example.
+    required: false
+    default: "false"
+  validate:
+    description: >-
+      Run S11's independent fix-validation panel after remediation
+      ("true"/"false"). Only meaningful with `remediate: "true"`. A fix
+      the panel grades Not Fixed or UNVERIFIABLE is rolled back, so
+      turning this off keeps patches nobody independently checked.
+    required: false
+    default: "true"
+  fail-on-remediation:
+    description: >-
+      Let the remediation outcome set the step's exit code ("true"/"false"):
+      1 when an S10 remediation call or an S11 validation failed, 3 when
+      validation passed nothing and failed at least one fix. Defaults to
+      "false", so a workflow that already runs with `remediate: "true"`
+      keeps exiting 0 whenever the scan itself succeeded. When "true",
+      give any following step that must still run (SARIF upload, artifact
+      upload) `if: always()`. See docs/github-action.md.
     required: false
     default: "false"
   remediation-delivery:
@@ -173,6 +196,10 @@ runs:
     - "/github/workspace/security-scan/findings.json"
     - "--remediate"
     - ${{ inputs.remediate }}
+    - "--validate"
+    - ${{ inputs.validate }}
+    - "--remediation-exit-code"
+    - ${{ inputs.fail-on-remediation }}
     - "--remediation-delivery"
     - ${{ inputs.remediation-delivery }}
     - "--out-remediation-json"

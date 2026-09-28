@@ -12,3 +12,7 @@ workspace = true
 bc-redact = { path = "../bc-redact" }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
+# Already a workspace dependency (and pulled in by bc-redact); used for the
+# shared auth/proxy error classifiers.
+regex = { workspace = true }
+tracing = { workspace = true }

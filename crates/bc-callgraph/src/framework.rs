@@ -33,7 +33,7 @@
 //!    exactly the implicit source the function's own docstring describes
 //!    ("route bindings"). Python's `route_facts` are, correspondingly,
 //!    dead: `_build_framework_symbol_table` reads them into a local that
-//!    `build_taint_paths` then never uses. Here every recognised route
+//!    `build_taint_paths` then never uses. Here every recognized route
 //!    mapping also emits a `<framework>_route` marker, so the handler
 //!    becomes an entry point with or without annotated parameters.
 //! 3. **Frameworks Python never covered are wired.** `_scan.py`'s marker
@@ -52,7 +52,7 @@
 //!    reference, which no fact in this crate carries (Python does not
 //!    attempt it either).
 //! 4. **Python handler parameters are read out of typed/defaulted
-//!    parameters too.** Python's own extractor only recognises a bare
+//!    parameters too.** Python's own extractor only recognizes a bare
 //!    `identifier` parameter (its `param.type in ("identifier",
 //!    "parameter")` test can never match `"parameter"` — no such node
 //!    kind exists in tree-sitter-python), so `def view(request:
@@ -113,7 +113,7 @@ fn route_params(rx: &Regex, pattern: &str) -> Vec<String> {
     out
 }
 
-/// One recognised route mapping: a `<framework>_route` marker for the
+/// One recognized route mapping: a `<framework>_route` marker for the
 /// handler plus one [`RouteTaintFact`] per path parameter.
 #[allow(clippy::too_many_arguments)]
 fn push_route(
@@ -1937,7 +1937,7 @@ mod tests {
     use tree_sitter::{Parser, Tree};
 
     /// Parse `src` with the grammar `scan_file` itself would pick for a
-    /// file at `rel` labelled `language` — one grammar table, not a
+    /// file at `rel` labeled `language` — one grammar table, not a
     /// test-only copy that could drift from it.
     fn parse(language: &str, rel: &str, src: &str) -> Tree {
         let lang =
@@ -2259,7 +2259,7 @@ mod tests {
     }
 
     #[test]
-    fn a_python_auth_decorator_is_recognised_qualified_and_called() {
+    fn a_python_auth_decorator_is_recognized_qualified_and_called() {
         // `@auth.login_required` (attribute) and `@jwt_required()`
         // (call) reach the same table as a bare identifier.
         assert_eq!(
@@ -2380,7 +2380,7 @@ mod tests {
 
     // ── Go ──────────────────────────────────────────────────────────
 
-    /// `(framework, pattern, handler)` per recognised Go route.
+    /// `(framework, pattern, handler)` per recognized Go route.
     fn go_routes(src: &str) -> Vec<(String, String, String)> {
         facts("go", src)
             .0
@@ -2394,7 +2394,7 @@ mod tests {
     }
 
     #[test]
-    fn go_net_http_gin_echo_chi_gorilla_and_fiber_routes_are_all_recognised() {
+    fn go_net_http_gin_echo_chi_gorilla_and_fiber_routes_are_all_recognized() {
         let (markers, routes) = facts(
             "go",
             &go_body(
@@ -2474,7 +2474,7 @@ mod tests {
 
     #[test]
     fn a_go_route_call_that_is_not_one_is_skipped() {
-        // A non-selector callee, an unrecognised verb, a `Get` whose
+        // A non-selector callee, an unrecognized verb, a `Get` whose
         // first argument is not a path, and a bare-call verb — none is
         // a route.
         let (markers, _) = facts(
@@ -2777,7 +2777,7 @@ mod tests {
     fn a_nest_decorator_that_is_neither_a_call_nor_a_name_is_ignored() {
         // `@(expr)` parses to a decorator whose inner node is neither an
         // identifier nor a call — at class level, at method level, and
-        // on a parameter — and an unrecognised method or parameter
+        // on a parameter — and an unrecognized method or parameter
         // decorator marks nothing either.
         let (markers, _) = facts(
             "typescript",

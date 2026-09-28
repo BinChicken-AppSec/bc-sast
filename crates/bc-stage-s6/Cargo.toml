@@ -9,6 +9,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+bc-redact = { path = "../bc-redact" }
+tracing = { workspace = true }
 bc-model = { path = "../bc-model" }
 bc-pipeline-core = { path = "../bc-pipeline-core" }
 bc-llm-client = { path = "../bc-llm-client" }

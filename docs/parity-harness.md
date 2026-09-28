@@ -100,14 +100,15 @@ bugs in `bc-validation-scoring`, both fixed in the same change:
    the error, happened to pass anyway. The exhaustive, exact-comparison
    sweep in this harness is what surfaced it.
 
-## Environment note (macOS, this session)
+## Troubleshooting: `pyexpat` fails to import on macOS
 
-Setting this up on this machine hit an unrelated, pre-existing Homebrew
-issue: `python@3.14`'s bottled `pyexpat` failed to import
-(`Symbol not found: _XML_SetAllocTrackerActivationThreshold`). This is a
-known macOS 26.1 libexpat/Python incompatibility
-([Homebrew/homebrew-core#277330](https://github.com/Homebrew/homebrew-core/issues/277330)),
-unrelated to this project. Fixed via the issue's documented workaround
-(`install_name_tool` to repoint `pyexpat.so` at Homebrew's own `expat`
-instead of the system one, then `codesign --sign -` to re-sign it). No
-uninstall/reinstall of `python@3.14`, `llvm`, or `rust` was needed.
+Building the venv on macOS can hit a Homebrew issue unrelated to this
+project: `python@3.14`'s bottled `pyexpat` fails to import with
+`Symbol not found: _XML_SetAllocTrackerActivationThreshold`. It is a known
+macOS 26.1 libexpat/Python incompatibility, tracked as
+[Homebrew/homebrew-core#277330](https://github.com/Homebrew/homebrew-core/issues/277330).
+
+Apply that issue's documented workaround: `install_name_tool` to repoint
+`pyexpat.so` at Homebrew's own `expat` rather than the system one, then
+`codesign --sign -` to re-sign it. Reinstalling `python@3.14` does not help,
+so reach for the workaround rather than the toolchain.

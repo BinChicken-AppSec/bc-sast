@@ -22,6 +22,9 @@ pub struct Parser<'a> {
     lines: Vec<&'a str>,
     pos: usize,
     depth: usize,
+    /// Refuse, rather than approximate, anything outside the supported
+    /// subset. See [`crate::parse_strict`].
+    strict: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -39,7 +42,16 @@ impl<'a> Parser<'a> {
             lines: normalized.lines().collect(),
             pos: 0,
             depth: 0,
+            strict: false,
         }
+    }
+
+    /// A parser that errors on every construct the lenient parser would
+    /// silently approximate or drop. See [`crate::parse_strict`].
+    pub fn new_strict(input: &'a str) -> Self {
+        let mut parser = Self::new(input);
+        parser.strict = true;
+        parser
     }
 
     fn from_owned(s: String) -> Self {
@@ -52,6 +64,7 @@ impl<'a> Parser<'a> {
             lines: leaked.lines().collect(),
             pos: 0,
             depth: 0,
+            strict: false,
         }
     }
 
@@ -87,10 +100,42 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse_document(&mut self) -> Result<Value, YamlError> {
-        match self.peek() {
-            None => Ok(Value::Null),
-            Some((indent, _)) => self.parse_node(indent),
+        if self.strict {
+            self.check_strict_lines()?;
         }
+        let value = match self.peek() {
+            None => Value::Null,
+            Some((indent, _)) => self.parse_node(indent)?,
+        };
+        // The lenient parser stops at the first line it cannot place and
+        // returns what it has, which silently drops the rest of the file.
+        if self.strict && self.peek().is_some() {
+            return Err(self.err(
+                "content the supported YAML subset cannot place (inconsistent indentation, a \
+                 multi-line plain scalar, or a second document)",
+            ));
+        }
+        Ok(value)
+    }
+
+    /// Line-level refusals for strict mode: tab indentation (YAML forbids
+    /// it and this parser counts only spaces) and document markers (this
+    /// parser reads one document and would otherwise treat `---` as text).
+    fn check_strict_lines(&self) -> Result<(), YamlError> {
+        for (index, line) in self.lines.iter().enumerate() {
+            let content = line.trim_start_matches([' ', '\t']);
+            let leading = &line[..line.len() - content.len()];
+            if leading.contains('\t') && !content.is_empty() {
+                return Err(YamlError::new(index + 1, "tab character in indentation"));
+            }
+            if *line == "---" || line.starts_with("--- ") || *line == "..." {
+                return Err(YamlError::new(
+                    index + 1,
+                    "document markers and multi-document streams are outside the supported subset",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// [`Self::parse_node_at`], guarded by [`MAX_DEPTH`] — every recursive
@@ -210,16 +255,31 @@ impl<'a> Parser<'a> {
     ) -> Result<(), YamlError> {
         let colon = find_mapping_colon(content).ok_or_else(|| self.err("expected 'key: value'"))?;
         let key_part = content[..colon].trim();
+        if self.strict && !key_part.starts_with(['"', '\'']) {
+            if let Some(problem) = plain_problem(key_part) {
+                return Err(YamlError::new(self.pos, format!("mapping key: {problem}")));
+            }
+        }
         let key = dequote_scalar(key_part);
+        let key_line = self.pos;
         let rest = content[colon + 1..].trim_start();
         let value = if is_effectively_empty(rest) {
-            self.parse_node(indent + 1)?
+            // A sequence may sit at its key's own indentation (`key:` then
+            // `- item` directly below), which YAML reads as the key's value.
+            match self.peek() {
+                Some((next, item)) if next == indent && (item == "-" || item.starts_with("- ")) => {
+                    self.parse_node(indent)?
+                }
+                _ => self.parse_node(indent + 1)?,
+            }
         } else if let Some((literal, chomp)) = block_scalar_indicator(rest) {
             self.parse_block_scalar(indent, literal, chomp)?
         } else {
             self.parse_inline_value(rest)?
         };
-        map.insert(key, value);
+        if map.insert(key, value).is_some() && self.strict {
+            return Err(YamlError::new(key_line, "duplicate mapping key"));
+        }
         Ok(())
     }
 
@@ -230,8 +290,16 @@ impl<'a> Parser<'a> {
         if content.starts_with('{') || content.starts_with('[') {
             let joined = self.collect_flow_text(content);
             let line = self.line_no();
-            let (v, _consumed) = flow::parse_flow(&joined, line)?;
+            let (v, consumed) = flow::parse_flow_with(&joined, line, self.strict)?;
+            if self.strict && !strip_trailing_comment(joined[consumed..].trim()).is_empty() {
+                return Err(YamlError::new(self.pos, "text after a flow collection"));
+            }
             return Ok(v);
+        }
+        if self.strict {
+            if let Some(problem) = strict_inline_problem(content) {
+                return Err(YamlError::new(self.pos, problem));
+            }
         }
         Ok(scalar_from_line(content))
     }
@@ -317,6 +385,49 @@ fn scalar_from_line(content: &str) -> Value {
     }
     let stripped = strip_trailing_comment(content);
     scalar::resolve_plain(stripped.trim())
+}
+
+/// Why strict mode refuses an inline block-context value, if it does. A
+/// quoted scalar must close and be followed by nothing but a comment; a
+/// plain scalar must pass [`plain_problem`].
+fn strict_inline_problem(content: &str) -> Option<&'static str> {
+    if content.starts_with(['"', '\'']) {
+        let rest = &content[1..];
+        let Some(end) = find_quote_end(rest, content.as_bytes()[0]) else {
+            return Some("unterminated or multi-line quoted scalar");
+        };
+        if !strip_trailing_comment(rest[end..].trim()).is_empty() {
+            return Some("text after a quoted scalar");
+        }
+        return None;
+    }
+    plain_problem(strip_trailing_comment(content).trim())
+}
+
+/// Why strict mode refuses a plain (unquoted) scalar, if it does. A plain
+/// scalar may not start with a YAML indicator this subset does not
+/// implement (anchors, aliases, tags, directives, reserved characters,
+/// block-scalar indentation indicators, complex keys, merge keys), and may
+/// not contain `: `, which YAML rejects and the lenient parser would split
+/// or keep as text.
+pub(crate) fn plain_problem(s: &str) -> Option<&'static str> {
+    let first = s.chars().next()?;
+    let indicator = matches!(
+        first,
+        '&' | '*' | '!' | '%' | '@' | '`' | '|' | '>' | '{' | '[' | '"' | '\''
+    ) || (matches!(first, '?' | '-') && (s.len() == 1 || s[1..].starts_with(' ')))
+        || s == "<<";
+    if indicator {
+        return Some(
+            "a YAML feature outside the supported subset (anchor, alias, tag, directive, \
+             reserved indicator, block-scalar indentation indicator, complex or merge key, \
+             or an unterminated quote)",
+        );
+    }
+    if s.contains(": ") || s.ends_with(':') {
+        return Some("an unquoted ': ' inside a plain scalar");
+    }
+    None
 }
 
 fn dequote_scalar(s: &str) -> String {

@@ -96,9 +96,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.3"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -106,9 +106,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.43.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
@@ -124,8 +124,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bc-api-spec"
+version = "1.1.0"
+dependencies = [
+ "bc-redact",
+ "bc-xml",
+ "bc-yaml",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bc-callgraph"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-json-repair",
  "bc-yaml",
@@ -150,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "bc-checkpoint"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rusqlite",
  "sha1",
@@ -159,9 +171,10 @@ dependencies = [
 
 [[package]]
 name = "bc-cli"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
+ "bc-api-spec",
  "bc-checkpoint",
  "bc-compliance",
  "bc-config",
@@ -175,6 +188,7 @@ dependencies = [
  "bc-llm-anthropic",
  "bc-llm-client",
  "bc-llm-openai",
+ "bc-metrics",
  "bc-model",
  "bc-orchestrator",
  "bc-pathjail",
@@ -208,6 +222,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -217,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "bc-compliance"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-model",
  "bc-pathjail",
@@ -229,19 +244,20 @@ dependencies = [
 
 [[package]]
 name = "bc-config"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-pathjail",
  "bc-yaml",
  "regex",
  "rstest",
+ "rustix",
  "serde_json",
  "tempfile",
 ]
 
 [[package]]
 name = "bc-csv"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-cwe",
  "bc-model",
@@ -251,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "bc-cvss"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "proptest",
  "regex",
@@ -260,18 +276,18 @@ dependencies = [
 
 [[package]]
 name = "bc-cwe"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rstest",
 ]
 
 [[package]]
 name = "bc-dedup-core"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "bc-diffcapture"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-pathjail",
  "tempfile",
@@ -279,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "bc-enrich"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-cvss",
  "bc-model",
@@ -291,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "bc-gateway-http"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-pathjail",
  "reqwest",
@@ -301,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "bc-github"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-model",
  "bc-redact",
@@ -316,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "bc-interactive"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-checkpoint",
@@ -334,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "bc-json-repair"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "regex",
  "rstest",
@@ -344,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "bc-llm-agentic"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-llm-client",
@@ -355,10 +371,12 @@ dependencies = [
 
 [[package]]
 name = "bc-llm-anthropic"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
+ "bc-llm-agentic",
  "bc-llm-client",
+ "bc-pricing",
  "regex",
  "reqwest",
  "serde_json",
@@ -369,29 +387,35 @@ dependencies = [
 
 [[package]]
 name = "bc-llm-client"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-redact",
+ "regex",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
 name = "bc-llm-openai"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
+ "bc-llm-agentic",
  "bc-llm-client",
+ "bc-pricing",
  "regex",
  "reqwest",
  "serde_json",
+ "sha2",
  "tokio",
+ "tracing",
  "wiremock",
 ]
 
 [[package]]
 name = "bc-metrics"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rstest",
  "time",
@@ -399,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "bc-model"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rstest",
  "serde",
@@ -408,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "bc-orchestrator"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-checkpoint",
@@ -452,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "bc-parity-tests"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-config",
  "bc-cvss",
@@ -463,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "bc-pathjail"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "proptest",
  "rstest",
@@ -472,15 +496,16 @@ dependencies = [
 
 [[package]]
 name = "bc-pipeline-core"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "bc-policy-gate"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-pathjail",
  "bc-repo-analysis",
  "bc-yaml",
+ "regex",
  "rstest",
  "serde_json",
  "tempfile",
@@ -488,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "bc-pricing"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -496,23 +521,25 @@ dependencies = [
 
 [[package]]
 name = "bc-prompts"
-version = "1.0.0"
+version = "1.1.0"
 
 [[package]]
 name = "bc-redact"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "fancy-regex",
  "proptest",
  "rstest",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
 name = "bc-repo-analysis"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-model",
+ "bc-pathjail",
  "fancy-regex",
  "regex",
  "rstest",
@@ -539,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "bc-report-md"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-cwe",
  "bc-model",
@@ -551,7 +578,7 @@ dependencies = [
 
 [[package]]
 name = "bc-sandbox-tools"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-llm-client",
  "bc-pathjail",
@@ -566,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "bc-sarif"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-cwe",
  "bc-model",
@@ -581,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "bc-stage-s0"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-callgraph",
@@ -597,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "bc-stage-s1"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-json-repair",
@@ -616,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "bc-stage-s10"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-checkpoint",
@@ -627,6 +654,7 @@ dependencies = [
  "bc-llm-client",
  "bc-model",
  "bc-pathjail",
+ "bc-pipeline-core",
  "bc-policy-gate",
  "bc-redact",
  "bc-repo-analysis",
@@ -638,22 +666,27 @@ dependencies = [
  "sha1",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "bc-stage-s11"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
+ "bc-checkpoint",
  "bc-json-repair",
  "bc-llm-agentic",
  "bc-llm-client",
  "bc-model",
+ "bc-redact",
  "bc-sandbox-tools",
  "bc-stage-s10",
  "bc-validation-scoring",
  "bc-yaml",
+ "serde",
  "serde_json",
+ "sha1",
  "tempfile",
  "tokio",
  "tracing",
@@ -661,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "bc-stage-s2"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-json-repair",
@@ -670,17 +703,19 @@ dependencies = [
  "bc-model",
  "bc-pathjail",
  "bc-pipeline-core",
+ "bc-redact",
  "bc-repo-analysis",
  "regex",
  "rstest",
  "serde_json",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "bc-stage-s3"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-config",
@@ -700,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "bc-stage-s4"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-json-repair",
@@ -725,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "bc-stage-s5"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-llm-client",
@@ -742,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "bc-stage-s6"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-cvss",
@@ -751,17 +786,19 @@ dependencies = [
  "bc-model",
  "bc-pipeline-core",
  "bc-prompts",
+ "bc-redact",
  "bc-repo-analysis",
  "bc-stage-s5",
  "regex",
  "rstest",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "bc-stage-s7"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-dedup-core",
@@ -777,7 +814,7 @@ dependencies = [
 
 [[package]]
 name = "bc-stage-s8"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "async-trait",
  "bc-json-repair",
@@ -785,16 +822,19 @@ dependencies = [
  "bc-llm-client",
  "bc-model",
  "bc-pipeline-core",
+ "bc-redact",
  "bc-repo-analysis",
  "rstest",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "bc-target-tests"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
+ "bc-api-spec",
  "serde",
  "serde_json",
  "tempfile",
@@ -802,10 +842,11 @@ dependencies = [
 
 [[package]]
 name = "bc-thirdparty"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-model",
  "bc-pathjail",
+ "bc-xml",
  "rstest",
  "serde",
  "serde_json",
@@ -813,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "bc-thirdparty-api"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bc-model",
  "bc-thirdparty",
@@ -829,14 +870,21 @@ dependencies = [
 
 [[package]]
 name = "bc-validation-scoring"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rstest",
 ]
 
 [[package]]
+name = "bc-xml"
+version = "1.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "bc-yaml"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "rstest",
  "serde_json",
@@ -2342,9 +2390,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -2405,9 +2453,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -2553,6 +2601,17 @@ name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
 dependencies = [
  "cfg-if",
  "cpufeatures",
@@ -2717,7 +2776,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

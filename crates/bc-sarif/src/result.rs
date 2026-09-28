@@ -105,7 +105,10 @@ fn truncate_description(description: &str) -> String {
 /// invocation notifications, its metrics) and this run does not.
 fn set_validation(props: &mut ResultProperties, v: &ValidationScore) {
     props.validation_status = Some(v.fix_status.as_str().to_string());
-    props.validation_score = Some(v.raw_score);
+    // `None` (so `validationScore` is omitted) for an inconclusive panel:
+    // `UNVERIFIABLE` carries no score, and the `0.0` it used to write read
+    // as "scored zero" to any consumer that did not also check the status.
+    props.validation_score = v.score();
     props.validation_justification = Some(v.justification.clone());
     props.merge_readiness = Some(
         bc_validation_scoring::derive_merge_readiness(v.fix_status)
@@ -543,6 +546,17 @@ mod tests {
             Some("fix verified")
         );
         assert_eq!(props.merge_readiness.as_deref(), Some("Ready"));
+    }
+
+    #[test]
+    fn an_unverifiable_score_is_omitted_rather_than_written_as_zero() {
+        let f = finding(|_| {});
+        let score = validation_score(bc_validation_scoring::FixVerdict::Unverifiable);
+        let props = properties(&ranked(f), None, 0, Some(&score));
+        assert_eq!(props.validation_status.as_deref(), Some("UNVERIFIABLE"));
+        assert_eq!(props.validation_score, None);
+        let json = serde_json::to_value(&props).unwrap();
+        assert!(json.get("validationScore").is_none(), "{json}");
     }
 
     #[test]

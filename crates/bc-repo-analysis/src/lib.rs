@@ -10,6 +10,7 @@ mod frontier;
 mod graph_view;
 mod lang;
 mod reachability;
+mod source;
 mod syntax;
 mod taint;
 mod ts_graph;
@@ -20,7 +21,7 @@ pub use callgraph::{
     CallGraphConfig, CallGraphReport, CallGraphResult, SOURCE_EXTENSIONS,
 };
 pub use dedup::{dedup_configs, ClusterSummary, DedupConfig, DedupReport};
-pub use fnmatch::fnmatch;
+pub use fnmatch::{default_exclude_globs, fnmatch, glob_hit};
 pub use frontier::{ast_context_view, FrontierConfig};
 pub use graph_view::{
     best_source_from_seed, entry_anchor_lines, neighborhood, parse_hop, qnodes_at,
@@ -28,6 +29,7 @@ pub use graph_view::{
 };
 pub use lang::{detect_languages, ext_to_lang, is_iac_file, lang_display, suffix_lower};
 pub use reachability::{reachable_files, reachable_only_too_sparse};
+pub use source::{is_source, lang_of_file};
 pub use syntax::syntax_check;
 pub use taint::{
     add_taint_chunks, bfs_to_sinks, pick_hop_files, size_for, threat_for, TaintChunkConfig,

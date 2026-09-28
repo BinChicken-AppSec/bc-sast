@@ -112,18 +112,19 @@ mod tests {
         assert_eq!(std::fs::read_to_string(config).unwrap(), "bare = false\n");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_unwritable_file_is_reported_as_an_io_error_after_a_valid_match() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.py");
-        std::fs::write(&path, "x = 1\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
-        let out = edit_file(dir.path(), "a.py", "x = 1", "x = 2");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // `/proc/self/status` is a regular file anyone can read but no one
+        // can write: the open is refused for an ordinary user and the write
+        // itself fails for root, which a read-only file would not stop. Its
+        // directory stands in for the repository so the file is in the jail.
+        let root = Path::new("/proc/self");
+        let text = std::fs::read_to_string(root.join("status")).unwrap();
+        assert_eq!(text.matches("Name:").count(), 1, "{text}");
+        let out = edit_file(root, "status", "Name:", "Renamed:");
         assert!(
-            out.starts_with("ERROR: cannot write a.py:"),
+            out.starts_with("ERROR: cannot write status:"),
             "unexpected: {out}"
         );
     }

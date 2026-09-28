@@ -147,18 +147,16 @@ mod tests {
         assert!(out.starts_with('1'));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn unreadable_file_permissions_are_reported_as_an_io_error() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("locked.txt");
-        std::fs::write(&path, "secret\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let out = read(dir.path(), "locked.txt", 0, 10);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // `drop_caches` is a regular file nobody can open for reading. The
+        // kernel checks a sysctl's mode bits itself, without the
+        // CAP_DAC_OVERRIDE bypass a chmod 000 file gets, so the open fails
+        // for root as well. Its directory stands in for the repository.
+        let out = read(Path::new("/proc/sys/vm"), "drop_caches", 0, 10);
         assert!(
-            out.starts_with("ERROR: cannot read locked.txt:"),
+            out.starts_with("ERROR: cannot read drop_caches: Permission denied"),
             "unexpected: {out}"
         );
     }

@@ -83,11 +83,21 @@ const QUERIES: &[LangQuery] = &[
               (attribute attribute: (identifier) @callee)\
             ])",
     },
+    // Upstream v1.3 adds class declarations as defs and `new T(...)` as a
+    // call to `T` (`@ctor_type`, normalized to its simple name), so a
+    // handler that instantiates a service class reaches it. Method
+    // references (`Foo::bar`) and signature-qualified qnodes are NOT
+    // ported: the latter would change the qnode shape every consumer of
+    // the graph (S3 taint BFS, S4 slicing, S5 backfill) matches on.
     LangQuery {
         lang_id: "java",
-        defs: "(method_declaration name: (identifier) @name) @def\n\
+        defs: "(class_declaration name: (identifier) @name) @def\n\
+               (method_declaration name: (identifier) @name) @def\n\
                (constructor_declaration name: (identifier) @name) @def",
-        calls: "(method_invocation name: (identifier) @callee)",
+        calls: "(method_invocation name: (identifier) @callee)\n\
+               (object_creation_expression type: (type_identifier) @ctor_type)\n\
+               (object_creation_expression type: (scoped_type_identifier) @ctor_type)\n\
+               (object_creation_expression type: (generic_type (type_identifier) @ctor_type))",
     },
     // tree-sitter-kotlin-ng's grammar (the actively-maintained
     // tree-sitter-grammars/tree-sitter-kotlin successor this port pins —
@@ -151,15 +161,25 @@ const QUERIES: &[LangQuery] = &[
               (qualified_identifier name: (identifier) @callee)\
             ])",
     },
+    // Same upstream v1.3 additions as Java: type declarations as defs and
+    // `new T(...)` as a call to `T`. The LINQ pseudo-calls upstream also
+    // synthesizes (`From`/`Where`/`Select` edges) are not ported: they only
+    // resolve when the repository itself defines a method of that name.
     LangQuery {
         lang_id: "csharp",
-        defs: "(method_declaration name: (identifier) @name) @def\n\
+        defs: "(class_declaration name: (identifier) @name) @def\n\
+               (struct_declaration name: (identifier) @name) @def\n\
+               (interface_declaration name: (identifier) @name) @def\n\
+               (method_declaration name: (identifier) @name) @def\n\
                (constructor_declaration name: (identifier) @name) @def\n\
                (local_function_statement name: (identifier) @name) @def",
         calls: "(invocation_expression function: [\
               (identifier) @callee \
               (member_access_expression name: (identifier) @callee)\
-            ])",
+            ])\n\
+            (object_creation_expression type: (identifier) @ctor_type)\n\
+            (object_creation_expression type: (qualified_name) @ctor_type)\n\
+            (object_creation_expression type: (generic_name (identifier) @ctor_type))",
     },
     LangQuery {
         lang_id: "ruby",
@@ -372,16 +392,72 @@ fn parse_file(
     let mut caps = cursor2.captures(&bundle.calls, root, text.as_bytes());
     while let Some((m, idx)) = caps.next() {
         let cap = m.captures[*idx];
-        if bundle.calls.capture_names()[cap.index as usize] != "callee" {
-            continue;
-        }
-        let name = &text[cap.node.byte_range()];
-        if !name.is_empty() && !NOT_A_DEF.contains(name) && name.len() >= 2 {
-            calls.push((name.to_string(), cap.node.start_byte()));
+        let raw = &text[cap.node.byte_range()];
+        match bundle.calls.capture_names()[cap.index as usize] {
+            "callee" if !raw.is_empty() && !NOT_A_DEF.contains(raw) && raw.len() >= 2 => {
+                calls.push((raw.to_string(), cap.node.start_byte()));
+            }
+            "ctor_type" => {
+                let name = normalize_type(raw);
+                if !name.is_empty() {
+                    calls.push((name, cap.node.start_byte()));
+                }
+            }
+            _ => {}
         }
     }
     (defs, calls)
 }
+
+/// A type reference reduced to its simple name: generic arguments and
+/// array brackets removed, then the last `.`-separated segment and the
+/// last whitespace-separated token (`java.util.List<String>` -> `List`,
+/// `Outer.Inner` -> `Inner`). Ported from upstream v1.3 `_normalize_type`.
+fn normalize_type(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut depth = 0usize;
+    for ch in raw.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    let out = out.replace("[]", "");
+    out.trim()
+        .rsplit('.')
+        .next()
+        .and_then(|seg| seg.split_whitespace().last())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Merge a same-name def's span into the span already recorded for it in
+/// one file. Adjacent overloads (gap of at most 50 lines) union, as before;
+/// a far-apart one no longer engulfs all the unrelated code between the
+/// two, and instead replaces the recorded span only when its own body is
+/// larger. Ported from upstream v1.3 `ts_graph.build`.
+fn merge_overload_span(prev: (usize, usize), next: (usize, usize)) -> (usize, usize) {
+    let (ps, pe) = prev;
+    let (ns, ne) = next;
+    let gap = if ns > pe {
+        ns - pe
+    } else {
+        ps.saturating_sub(ne)
+    };
+    if gap <= OVERLOAD_MERGE_GAP {
+        (ps.min(ns), pe.max(ne))
+    } else if ne - ns > pe - ps {
+        next
+    } else {
+        prev
+    }
+}
+
+/// Largest line gap across which two same-name defs in one file are still
+/// treated as one slice.
+const OVERLOAD_MERGE_GAP: usize = 50;
 
 /// Innermost def containing `byte_off` (`defs_sorted` ordered by span
 /// width ascending, narrowest first).
@@ -401,8 +477,9 @@ pub struct TsGraphResult {
     /// chunks may focus functions off the call-graph edge frontier).
     pub call_graph_files: BTreeMap<String, Vec<String>>,
     /// Qualified name -> `[start_line, end_line]`, union-spanned across
-    /// same-name defs in one file (e.g. Java/C# overloads) so downstream
-    /// slicing doesn't lose one overload's body.
+    /// ADJACENT same-name defs in one file (e.g. Java/C# overloads) so
+    /// downstream slicing doesn't lose one overload's body; see
+    /// `merge_overload_span` for far-apart ones.
     pub def_spans: BTreeMap<String, (usize, usize)>,
 }
 
@@ -447,13 +524,11 @@ pub fn build(
                 .or_default()
                 .insert(rel.clone());
             let qn = q_join(rel, &d.name);
+            let span = (d.start_line, d.end_line);
             def_spans
                 .entry(qn)
-                .and_modify(|(sl, el)| {
-                    *sl = (*sl).min(d.start_line);
-                    *el = (*el).max(d.end_line);
-                })
-                .or_insert((d.start_line, d.end_line));
+                .and_modify(|prev| *prev = merge_overload_span(*prev, span))
+                .or_insert(span);
         }
         let mut defs_sorted = defs;
         defs_sorted.sort_by_key(|d| d.byte_range.map(|(s, e)| e - s).unwrap_or(usize::MAX));
@@ -859,6 +934,90 @@ mod tests {
         let span = result.def_spans[&q_join("C.java", "m")];
         // First overload: lines 2-4; second: lines 5-8. Union: 2-8.
         assert_eq!(span, (2, 8));
+    }
+
+    #[test]
+    fn far_apart_overloads_do_not_engulf_the_code_between_them() {
+        // Adjacent: union, either order.
+        assert_eq!(merge_overload_span((2, 4), (5, 8)), (2, 8));
+        assert_eq!(merge_overload_span((5, 8), (2, 4)), (2, 8));
+        // Overlapping (a class and its constructor): union.
+        assert_eq!(merge_overload_span((1, 100), (10, 20)), (1, 100));
+        // Far apart: keep the larger body alone.
+        assert_eq!(merge_overload_span((2, 4), (200, 260)), (200, 260));
+        assert_eq!(merge_overload_span((200, 260), (2, 4)), (200, 260));
+        assert_eq!(merge_overload_span((2, 40), (300, 301)), (2, 40));
+    }
+
+    #[test]
+    fn normalize_type_reduces_a_type_reference_to_its_simple_name() {
+        assert_eq!(normalize_type("Foo"), "Foo");
+        assert_eq!(normalize_type("com.acme.Foo"), "Foo");
+        assert_eq!(normalize_type("List<Map<String, Foo>>"), "List");
+        assert_eq!(normalize_type("Foo[]"), "Foo");
+        assert_eq!(normalize_type("  "), "");
+        assert_eq!(normalize_type("<T>"), "");
+    }
+
+    #[test]
+    fn a_java_constructor_call_reaches_the_class_it_instantiates() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Svc.java",
+            "class Svc {\n    Svc() {}\n    void run() {}\n}\n",
+        );
+        write(
+            dir.path(),
+            "Api.java",
+            "class Api {\n    void handle() {\n        Svc a = new Svc();\n        \
+             java.util.List<Svc> b = new java.util.ArrayList<Svc>();\n        \
+             Box<Svc> c = new Box<Svc>();\n    }\n}\nclass Box<T> {}\n",
+        );
+        let files = vec!["Api.java".to_string(), "Svc.java".to_string()];
+        let result = build(&files, dir.path(), 3, &BTreeMap::new());
+        let edges = &result.call_graph[&q_join("Api.java", "handle")];
+        assert!(edges.contains(&q_join("Svc.java", "Svc")), "{edges:?}");
+        assert!(edges.contains(&q_join("Api.java", "Box")), "{edges:?}");
+        // The class def spans its whole body; the ctor inside it is merged.
+        assert_eq!(result.def_spans[&q_join("Svc.java", "Svc")], (1, 4));
+    }
+
+    #[test]
+    fn a_one_letter_callee_is_ignored_like_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "A.java",
+            "class A {\n    void f() {}\n    void g() {\n        f();\n    }\n}\n",
+        );
+        let files = vec!["A.java".to_string()];
+        let result = build(&files, dir.path(), 3, &BTreeMap::new());
+        assert!(!result.call_graph.contains_key(&q_join("A.java", "g")));
+    }
+
+    #[test]
+    fn a_csharp_object_creation_reaches_the_type_it_instantiates() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "Svc.cs",
+            "class Svc { public void Run() {} }\nstruct Point {}\ninterface IRepo {}\n",
+        );
+        write(
+            dir.path(),
+            "Api.cs",
+            "class Api {\n  void Handle() {\n    var a = new Svc();\n    \
+             var b = new Acme.Point();\n    var c = new Wrap<Svc>();\n  }\n}\n\
+             class Wrap<T> {}\n",
+        );
+        let files = vec!["Api.cs".to_string(), "Svc.cs".to_string()];
+        let result = build(&files, dir.path(), 3, &BTreeMap::new());
+        let edges = &result.call_graph[&q_join("Api.cs", "Handle")];
+        assert!(edges.contains(&q_join("Svc.cs", "Svc")), "{edges:?}");
+        assert!(edges.contains(&q_join("Svc.cs", "Point")), "{edges:?}");
+        assert!(edges.contains(&q_join("Api.cs", "Wrap")), "{edges:?}");
+        assert!(result.call_graph_files.contains_key("IRepo"));
     }
 
     #[test]

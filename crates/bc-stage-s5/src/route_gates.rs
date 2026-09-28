@@ -76,7 +76,7 @@ fn guarded_route_reason(guard: &str) -> String {
 
 /// The finding claims the handler performs no authorization/authentication
 /// at all. The CWE list is the authoritative half; this catches the same
-/// claim filed under a neighbouring CWE (639 IDOR, 200 exposure) or under
+/// claim filed under a neighboring CWE (639 IDOR, 200 exposure) or under
 /// none. Two shapes, because the titles S4 actually writes come in two:
 /// the standalone "Unauthenticated Access to …", and the
 /// "Missing/No … authorization" form.
@@ -360,7 +360,7 @@ fn claims_a_bypass(f: &Finding) -> bool {
 ///    line, but the finding is inside a file that declares routes and
 ///    EVERY route it declares is guarded. This is what covers a finding
 ///    raised on the route table itself, and the Ktor routes whose entry
-///    point ids are still synthesised from the path
+///    point ids are still synthesized from the path
 ///    (`post_ops_snapshot_restore`) because the lambda has a body of its
 ///    own or shares its delegate with another route. Deliberately the
 ///    weakest rule: it needs unanimity, so one open route anywhere in

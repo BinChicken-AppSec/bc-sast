@@ -65,9 +65,13 @@
 //! common live failure, and today's (correct) downgrade leaves the finding
 //! simply unfixed.
 
+mod checkpoint;
 mod prompts;
 mod select;
 mod verdict;
+mod verify_process;
+mod workflow_gate;
+mod worktree_walk;
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -79,10 +83,15 @@ use bc_llm_client::{LlmClient, LlmError, ToolExecutor};
 use bc_model::RankedFinding;
 use bc_policy_gate::{Decision, Playbook, RemediationGate, Strategy};
 use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
 
+use checkpoint::{load_cached_record, save_checkpoint};
+
+pub use checkpoint::{
+    checkpoint_done, finding_identity, remediation_step_key, REMEDIATE_STEP_PREFIX,
+};
 pub use select::{band_score, parse_top_spec, resolve_top, select_top_by_cvss, TopSpec};
 pub use verdict::{Change, GateStatus, Gates, RemediationVerdict, Verdict};
+pub use workflow_gate::UNSAFE_WORKFLOW_REFERENCE;
 
 /// One finding's pre-remediation baseline: the on-disk bytes of exactly
 /// the files its agent touched, captured before it ran.
@@ -132,6 +141,16 @@ pub struct Step10Config {
     /// [`bc_llm_client::ChatRequest::seed`] (OpenAI dialect only). `None`
     /// (the default) sends no seed.
     pub seed: Option<u64>,
+    /// Reasoning-effort tier for this stage's calls (the Python
+    /// original's `models.<role>.effort`, else `--reasoning-effort`),
+    /// forwarded to [`bc_llm_client::ChatRequest::reasoning_effort`].
+    /// `None` (the default) sends none, leaving the provider's default.
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+    /// Per-role OpenAI transport pin (Python's
+    /// `models.<role>.use_responses_api`), forwarded to
+    /// [`bc_llm_client::ChatRequest::openai_api`]. `None` (the default)
+    /// keeps the client-wide `--openai-api` choice.
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
     /// Per-turn wall-clock deadline in seconds, overriding the shared
     /// gateway client's own 300 s default. `None` (the default) keeps it.
     pub timeout_secs: Option<u64>,
@@ -158,7 +177,7 @@ pub struct Step10Config {
     /// Ships at `1`: a fix that reaches into a second file is no longer a
     /// targeted change to the code the finding names, it is a design
     /// decision about how two parts of the system talk to each other, and
-    /// that is a judgement a human reviewer has to make. The finding is
+    /// that is a judgment a human reviewer has to make. The finding is
     /// still reported in full; only the automated patch is declined. An
     /// operator who wants the wider blast radius can raise the cap.
     pub max_files_touched: usize,
@@ -235,6 +254,21 @@ pub struct Step10Config {
     /// Net-new versus Python, which has no diff scoping and no remediation
     /// scope gate at all.
     pub diff_scope: bc_model::DiffScope,
+    /// The API dialect (`openai`/`anthropic`) the model is reached
+    /// through, and the gateway host serving it: together with
+    /// [`Self::model`] and this crate's version they make up the
+    /// [`bc_checkpoint::EngineKey`] every `--resume` checkpoint is keyed
+    /// by, so a record produced by one model or endpoint is never served
+    /// as another's. Empty by default, which still keys by model and
+    /// version; the CLI fills both from the resolved gateway settings.
+    pub dialect: String,
+    pub base_host: String,
+    /// The run's cooperative cancellation (Ctrl-C). Once tripped,
+    /// [`run_remediation`] starts no further finding and a running
+    /// [`Self::verify_command`] is killed together with everything it
+    /// started (the patch is then rolled back like any failed verify).
+    /// `None` (the default) is a run nothing can cancel.
+    pub cancel: Option<bc_pipeline_core::CancelTokenRef>,
 }
 
 impl Step10Config {
@@ -263,6 +297,8 @@ impl Step10Config {
             temperature: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
+            openai_api: None,
             timeout_secs: None,
             syntax_check: true,
             keep_unverified: false,
@@ -275,6 +311,9 @@ impl Step10Config {
             journal: None,
             target_test_context: None,
             diff_scope: bc_model::DiffScope::inactive(),
+            dialect: String::new(),
+            base_host: String::new(),
+            cancel: None,
         }
     }
 }
@@ -371,67 +410,7 @@ fn pre_decision(
     (decision, strategy)
 }
 
-/// Caps a bounded (20000-file) worktree walk for files matching any of
-/// `patterns` — the non-git fallback ground truth for the post-gate
-/// (and the pre-agent snapshot target list), ported from
-/// `policy.postgate.worktree_forbidden_matches`.
-const WORKTREE_SCAN_MAX: usize = 20_000;
-
-fn worktree_forbidden_matches(repo: &Path, patterns: &[String]) -> Vec<String> {
-    worktree_forbidden_matches_capped(repo, patterns, WORKTREE_SCAN_MAX)
-}
-
-/// `worktree_forbidden_matches` with an injectable cap — the fixed
-/// [`WORKTREE_SCAN_MAX`] production value is impractical to actually
-/// exceed in a fast test, so the cap is a parameter here and pinned to
-/// the real constant by the public wrapper above.
-fn worktree_forbidden_matches_capped(repo: &Path, patterns: &[String], max: usize) -> Vec<String> {
-    if patterns.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut seen = 0usize;
-    for entry in walkdir(repo) {
-        seen += 1;
-        if seen > max {
-            break;
-        }
-        // `entry` always comes from `walkdir(repo)`, which only ever
-        // yields paths built by successively joining onto `repo` itself
-        // — `strip_prefix` cannot fail for a path this function
-        // constructed from `repo` in the first place.
-        let rel = entry
-            .strip_prefix(repo)
-            .expect("walkdir only yields paths nested under repo");
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        if patterns.iter().any(|p| bc_policy_gate::glob_match(&rel, p)) {
-            out.push(rel);
-        }
-    }
-    out
-}
-
-/// A minimal recursive file walker (files only) — this crate doesn't
-/// need `bc-repo-analysis`'s full walk (exclusions, config dedup,
-/// language detection); the post-gate just needs every plain file path.
-fn walkdir(root: &Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
+use worktree_walk::worktree_forbidden_matches;
 
 fn dedup_preserve_order(items: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
@@ -593,6 +572,16 @@ pub async fn remediate_finding_with_baseline(
     } else {
         vec![file.clone()]
     };
+    // Every workflow file, policy or not: the workflow-pin gate below
+    // needs the pre-edit text to tell an introduced ref from an existing
+    // one (and to find the pins the repository already trusts), and a
+    // rollback needs a baseline for a workflow the model edited without
+    // listing it in `changes`.
+    for f in workflow_gate::workflow_snapshot_paths(repo) {
+        if !snap_targets.contains(&f) {
+            snap_targets.push(f);
+        }
+    }
     if let Some(p) = policy {
         let patterns = dedup_preserve_order(
             p.gate
@@ -654,6 +643,8 @@ pub async fn remediate_finding_with_baseline(
     agentic_config.temperature = config.temperature;
     agentic_config.top_p = config.top_p;
     agentic_config.seed = config.seed;
+    agentic_config.reasoning_effort = config.reasoning_effort;
+    agentic_config.openai_api = config.openai_api;
     agentic_config.timeout_secs = config.timeout_secs;
 
     let first_answer = match run_agentic(client, tools, &user, &agentic_config).await {
@@ -794,7 +785,15 @@ pub async fn remediate_finding_with_baseline(
         let bad = p.gate.forbidden_files(&candidates);
 
         if bad.is_empty() {
-            let gates_passed = verdict.gates.all_pass();
+            // A policy allow is only PERMISSION to patch, never evidence
+            // that a patch happened: ACCEPT additionally needs a real
+            // on-disk change and a verdict that claims one (ported from
+            // `postgate.py::enforce_post`'s `patch_applied` and verdict
+            // checks). The agent's own evidence gates are necessary, not
+            // sufficient; a no-op `Not Fixed` with three passing gates
+            // used to be labeled ACCEPT.
+            let gates_passed =
+                verdict.gates.all_pass() && claims_a_fix(&verdict) && diff_has_content(&diff);
             final_verdict =
                 Some(bc_policy_gate::cap_verdict(decision.action, gates_passed).to_string());
         } else {
@@ -834,6 +833,50 @@ pub async fn remediate_finding_with_baseline(
             policy_matched_globs = matched.into_iter().collect();
             final_verdict = Some("REJECT".to_string());
         }
+    }
+
+    // ---- Gate 1b: reusable-workflow pins. Always on, with or without a
+    // policy context (see `workflow_gate`'s module doc comment). A remote
+    // reusable workflow may only be pinned to a commit the repository
+    // already pins it to; anything else is an invented SHA or a mutable
+    // ref, and the whole patch goes back. Python reverts only the
+    // offending workflow file here and relies on the verdict alone; this
+    // port's gate 6 would roll the rest back for a `Not Fixed` anyway, so
+    // doing it here in one step keeps the note and the tree in agreement.
+    let unsafe_refs = workflow_gate::unsafe_workflow_refs(repo, &before, &touched);
+    if !unsafe_refs.is_empty() {
+        let rolled_back = bc_diffcapture::revert_all(repo, &touched, &before);
+        note_revert(
+            &mut verdict,
+            &format!(
+                "workflow-pin gate: the edit introduced unverified reusable-workflow refs \
+                 ({}). S10 must pin a remote reusable workflow only to a commit the \
+                 repository already establishes, or decline the fix; it must never invent \
+                 a SHA. All {} file(s) the agent touched were rolled back.",
+                workflow_gate::describe(&unsafe_refs),
+                rolled_back.len()
+            ),
+        );
+        verdict.verdict = Verdict::NotFixed;
+        verdict
+            .changes
+            .retain(|c| !unsafe_refs.contains_key(&bc_diffcapture::norm_path(&c.file)));
+        policy_reverted.extend(rolled_back);
+        policy_reason = Some(UNSAFE_WORKFLOW_REFERENCE.to_string());
+        return Ok((
+            RemediationRecord {
+                finding_index,
+                finding_id,
+                verdict,
+                policy_action,
+                policy_reason,
+                final_verdict: Some("REJECT".to_string()),
+                policy_reverted,
+                policy_matched_globs,
+                diff: None,
+            },
+            baseline,
+        ));
     }
 
     // ---- Gate 2: the agent must not have left unparseable source behind.
@@ -880,7 +923,14 @@ pub async fn remediate_finding_with_baseline(
 
     // ---- Gate 3: the operator's own build/lint/test command.
     if let Some(command) = &config.verify_command {
-        if let Err(detail) = run_verify_command(repo, command, config.verify_timeout_secs).await {
+        if let Err(detail) = run_verify_command(
+            repo,
+            command,
+            config.verify_timeout_secs,
+            config.cancel.as_ref(),
+        )
+        .await
+        {
             let rolled_back = bc_diffcapture::revert_all(repo, &touched, &before);
             note_revert(
                 &mut verdict,
@@ -977,6 +1027,16 @@ pub async fn remediate_finding_with_baseline(
         }
     }
 
+    // The post-gate ran before the later gates could still roll the patch
+    // back, so its provisional ACCEPT is reconciled against the diff the
+    // record actually ends up with (`plugin_runner/run.py::
+    // _reconcile_post_meta`): an ACCEPT with no captured diff is a label
+    // contradicting the evidence, and becomes REJECT/`no_diff_captured`.
+    if final_verdict.as_deref() == Some("ACCEPT") && !diff_has_content(&record_diff) {
+        final_verdict = Some("REJECT".to_string());
+        policy_reason = Some(NO_DIFF_CAPTURED.to_string());
+    }
+
     Ok((
         RemediationRecord {
             finding_index,
@@ -992,6 +1052,11 @@ pub async fn remediate_finding_with_baseline(
         baseline,
     ))
 }
+
+/// [`RemediationRecord::policy_reason`] when the policy allowed a patch,
+/// every gate passed, and yet no diff survived to the record, matching
+/// Python's reconciled `policy_reason`.
+pub const NO_DIFF_CAPTURED: &str = "no_diff_captured";
 
 /// The agent's answer text turned into a verdict — the lenient
 /// JSON-salvage coercion, with an unparseable response becoming a
@@ -1255,8 +1320,13 @@ fn changed_line_count(diff: &str) -> usize {
 /// intent no process is ever spawned. `kill_on_drop` means a timeout
 /// actually kills the child rather than orphaning a build that then races
 /// the rollback for the same files.
-async fn run_verify_command(repo: &Path, command: &str, timeout_secs: u64) -> Result<(), String> {
-    run_verify_command_with_shell(repo, VERIFY_SHELL, command, timeout_secs).await
+async fn run_verify_command(
+    repo: &Path,
+    command: &str,
+    timeout_secs: u64,
+    cancel: Option<&bc_pipeline_core::CancelTokenRef>,
+) -> Result<(), String> {
+    run_verify_command_with_shell(repo, VERIFY_SHELL, command, timeout_secs, cancel).await
 }
 
 /// The interpreter [`run_verify_command`] spawns. A parameter on the
@@ -1288,15 +1358,22 @@ async fn run_verify_command_with_shell(
     shell: &str,
     command: &str,
     timeout_secs: u64,
+    cancel: Option<&bc_pipeline_core::CancelTokenRef>,
 ) -> Result<(), String> {
-    let mut cmd = tokio::process::Command::new(shell);
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(repo)
-        .kill_on_drop(true);
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => Ok(()),
-        Ok(Ok(out)) => Err(tail_lines(
+    use verify_process::GroupRun;
+    // Its own process group, killed as a whole on timeout or cancellation:
+    // see `verify_process` for why killing `sh` alone is not enough.
+    match verify_process::run_in_group(
+        repo,
+        shell,
+        command,
+        Duration::from_secs(timeout_secs),
+        cancel,
+    )
+    .await
+    {
+        GroupRun::Finished(Ok(out)) if out.status.success() => Ok(()),
+        GroupRun::Finished(Ok(out)) => Err(tail_lines(
             &format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),
@@ -1308,15 +1385,20 @@ async fn run_verify_command_with_shell(
         // `NotFound` whether the program or the working directory is the
         // thing that is missing, and blaming a missing shell for a missing
         // repo path would send an operator hunting the wrong problem.
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound && repo.is_dir() => Err(format!(
-            "verify_command could not run: no shell. '{shell}' is not present on this \
+        GroupRun::Finished(Err(e)) if e.kind() == std::io::ErrorKind::NotFound && repo.is_dir() => {
+            Err(format!(
+                "verify_command could not run: no shell. '{shell}' is not present on this \
              system, so the operator's build or test command could not be started. The \
              gate fails closed rather than passing a patch it could not verify; unset \
              step_remediate.verify_command to run without it."
-        )),
-        Ok(Err(e)) => Err(format!("the verify command could not be started: {e}")),
-        Err(_) => Err(format!(
+            ))
+        }
+        GroupRun::Finished(Err(e)) => Err(format!("the verify command could not be started: {e}")),
+        GroupRun::TimedOut => Err(format!(
             "the verify command did not finish within {timeout_secs}s and was killed"
+        )),
+        GroupRun::Canceled(reason) => Err(format!(
+            "the verify command was stopped ({reason}) and killed before it finished"
         )),
     }
 }
@@ -1719,102 +1801,6 @@ fn action_label(action: bc_policy_gate::Action) -> &'static str {
     }
 }
 
-/// A stable content identity for one finding at one position, ported
-/// from `remediation_agent/runner.py::_finding_identity`: SHA-1 (not
-/// Python's SHA-256 — see this crate's module doc comment for why) hex
-/// digest of `finding_index`, `title`, `file`, and the finding's
-/// rendered body, NUL-separated. Used to detect whether a checkpoint
-/// saved under a position-keyed step (`remediate_<index>`) still
-/// describes the SAME finding — not a security control, just staleness
-/// detection for `--resume` (a rescan that reorders/replaces findings
-/// must not silently reuse a stale checkpoint for a different one).
-pub fn finding_identity(finding_index: i64, finding: &RankedFinding) -> String {
-    let mut hasher = Sha1::new();
-    for part in [
-        finding_index.to_string(),
-        finding.finding.title.clone(),
-        finding.finding.file.clone(),
-        render_finding_body(finding),
-    ] {
-        hasher.update(part.as_bytes());
-        hasher.update([0u8]);
-    }
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-/// The `--resume` checkpoint's on-disk shape — a private implementation
-/// detail of [`run_remediation`], not part of this crate's public
-/// surface (nothing outside this function needs to know the payload
-/// format, matching [`bc_checkpoint::CheckpointStore`]'s own
-/// byte-payload design where serialization is entirely the caller's
-/// business).
-#[derive(Serialize, Deserialize)]
-struct CheckpointPayload {
-    finding_id: String,
-    record: RemediationRecord,
-}
-
-/// Loads and validates a checkpoint for `step`: `None` on any miss,
-/// corrupt/unparseable payload, or (critically) an identity mismatch —
-/// a checkpoint whose stored `finding_id` doesn't match `fid` belongs to
-/// a DIFFERENT finding that once occupied this position, and must never
-/// be treated as "already done" for the current one.
-fn load_cached_record(
-    store: &dyn CheckpointStore,
-    run_id: &str,
-    step: &str,
-    fid: &str,
-) -> Option<RemediationRecord> {
-    let bytes = store.load(run_id, step)?;
-    let payload: CheckpointPayload = serde_json::from_slice(&bytes).ok()?;
-    (payload.finding_id == fid).then_some(payload.record)
-}
-
-/// Saves `record` under `step`, tagged with `fid`. Failures are silently
-/// swallowed (matching `save_ckpt`'s own log-and-continue posture in the
-/// Python original) — a checkpoint write failing must never fail the
-/// remediation run itself, since the checkpoint is a resume convenience,
-/// not a correctness requirement of the current run.
-fn save_checkpoint(
-    store: &dyn CheckpointStore,
-    run_id: &str,
-    step: &str,
-    fid: &str,
-    record: &RemediationRecord,
-) {
-    let payload = CheckpointPayload {
-        finding_id: fid.to_string(),
-        record: record.clone(),
-    };
-    if let Ok(bytes) = serde_json::to_vec(&payload) {
-        let _ = store.save(run_id, step, &bytes);
-    }
-}
-
-/// `true` iff `checkpoint` already holds a record for `finding_index`
-/// whose stored [`finding_identity`] matches `finding` as it stands
-/// right now — i.e. "has this exact finding already been remediated,"
-/// independent of `--resume`. Exposed for UIs (the `-i`/`--interactive`
-/// picker) that want to show a finding's done/pending status live,
-/// regardless of whether the CURRENT run was invoked with `--resume`.
-pub fn checkpoint_done(
-    checkpoint: Option<&dyn CheckpointStore>,
-    run_id: &str,
-    finding_index: i64,
-    finding: &RankedFinding,
-) -> bool {
-    let Some(store) = checkpoint else {
-        return false;
-    };
-    let step = format!("remediate_{finding_index}");
-    let fid = finding_identity(finding_index, finding);
-    load_cached_record(store, run_id, &step, &fid).is_some()
-}
-
 /// One finding's checkpoint-aware remediation, ported from
 /// `remediation_agent/runner.py::remediate_one` (shared by both the
 /// sequential `--top` walk in [`run_remediation`] and the `-i`/
@@ -1855,11 +1841,13 @@ pub async fn remediate_one_checkpointed(
         return (RemediationOutcome::Processed(Box::new(record)), None);
     }
 
-    let step = format!("remediate_{finding_index}");
+    let step = remediation_step_key(config, finding_index, finding);
     let fid = finding_identity(finding_index, finding);
 
     if resume {
-        if let Some(cached) = checkpoint.and_then(|s| load_cached_record(s, run_id, &step, &fid)) {
+        if let Some(cached) =
+            checkpoint.and_then(|s| load_cached_record(s, run_id, &step, &fid, config))
+        {
             // No baseline: the snapshot lives in memory only and belongs to
             // whichever process originally ran this finding. A caller that
             // later needs to undo this record falls back to
@@ -1889,7 +1877,7 @@ pub async fn remediate_one_checkpointed(
             // exact way a bad fix used to become a permanently skipped one.
             if let Some(store) = checkpoint {
                 if !was_reverted(&record) {
-                    save_checkpoint(store, run_id, &step, &fid, &record);
+                    save_checkpoint(store, run_id, &step, &fid, config, &record);
                 }
             }
             (
@@ -1934,7 +1922,39 @@ pub async fn run_remediation(
         outcomes: Vec::with_capacity(findings.len()),
         baselines: Vec::with_capacity(findings.len()),
     };
+    // Engine-keyed rows are never overwritten by a run under another
+    // model; they stop being found. Clear the ones no finding of THIS run
+    // claims, so they neither pile up nor come back if the operator later
+    // switches to the old model again (`prune_stale_steps` in Python).
+    // Batch walk only: the interactive picker remediates one finding at a
+    // time and cannot know the live set.
+    if let Some(store) = checkpoint {
+        let live: Vec<String> = findings
+            .iter()
+            .map(|(index, finding)| remediation_step_key(config, *index, finding))
+            .collect();
+        let pruned = store
+            .prune_stale(run_id, REMEDIATE_STEP_PREFIX, &live)
+            .len();
+        if pruned > 0 {
+            tracing::info!(
+                "[ckpt] pruned {pruned} stale {REMEDIATE_STEP_PREFIX}* checkpoint row(s), \
+                 written by an earlier engine, model or finding set"
+            );
+        }
+    }
     for (finding_index, finding) in findings {
+        // A canceled run starts no further finding. Each one not reached
+        // is still recorded, as a failure naming the cancellation, so the
+        // outcomes stay one per selected finding and nothing reads as fixed.
+        if let Some(reason) = bc_pipeline_core::canceled(config.cancel.as_ref()) {
+            run.outcomes.push(RemediationOutcome::Failed {
+                finding_index: *finding_index,
+                error: format!("not attempted: {reason}"),
+            });
+            run.baselines.push(None);
+            continue;
+        }
         let (outcome, baseline) = remediate_one_checkpointed(
             client,
             tools,
@@ -1952,6 +1972,48 @@ pub async fn run_remediation(
         run.baselines.push(baseline);
     }
     run
+}
+
+/// How one S10 walk turned out, in the terms a progress line or an exit
+/// code needs. Computed from outcomes, so it reflects every later rollback
+/// (an S11 revert marks the record, and the fix stops counting).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemediationCounts {
+    /// Every finding the walk was given.
+    pub attempted: usize,
+    /// Processed, verdict `Fixed`, a non-empty diff, and not rolled back:
+    /// a fix that is actually on disk (or, in a dry run, captured).
+    pub fixed: usize,
+    /// Processed but not [`Self::fixed`]: declined, denied, out of scope,
+    /// rolled back, or answered with anything but `Fixed`.
+    pub not_fixed: usize,
+    /// The agentic call itself failed ([`RemediationOutcome::Failed`]).
+    pub failed: usize,
+}
+
+impl RemediationCounts {
+    pub fn from_outcomes(outcomes: &[RemediationOutcome]) -> Self {
+        let mut counts = RemediationCounts {
+            attempted: outcomes.len(),
+            ..RemediationCounts::default()
+        };
+        for outcome in outcomes {
+            match outcome {
+                RemediationOutcome::Processed(record) if is_kept_fix(record) => counts.fixed += 1,
+                RemediationOutcome::Processed(_) => counts.not_fixed += 1,
+                RemediationOutcome::Failed { .. } => counts.failed += 1,
+            }
+        }
+        counts
+    }
+}
+
+/// `true` when `record` is a fix that stands: verdict `Fixed`, a diff
+/// with content, and no rollback note.
+pub fn is_kept_fix(record: &RemediationRecord) -> bool {
+    record.verdict.verdict == Verdict::Fixed
+        && diff_has_content(&record.diff)
+        && !was_reverted(record)
 }
 
 /// [`run_remediation`]'s full result: one outcome per finding, plus each

@@ -638,7 +638,7 @@ fn a_service_layer_finding_with_no_entry_point_keeps_its_finding() {
 /// its OWN route. The guarded one is dropped; the open one, in the same
 /// file, is still kept.
 #[test]
-fn ktor_a_guarded_handler_is_dropped_by_name_while_its_open_neighbour_is_kept() {
+fn ktor_a_guarded_handler_is_dropped_by_name_while_its_open_neighbor_is_kept() {
     let dir = repo(&[("src/routes/ReportRoutes.kt", KTOR_REPORT_ROUTES)]);
     let eps = [
         ep("src/routes/ReportRoutes.kt", "searchReports", true),
@@ -726,7 +726,7 @@ fn an_unreadable_file_falls_back_to_no_source() {
 // ── the pieces, directly ────────────────────────────────────────────
 
 #[test]
-fn the_missing_authorization_claim_is_recognised_by_cwe_or_by_wording() {
+fn the_missing_authorization_claim_is_recognized_by_cwe_or_by_wording() {
     let mut f = missing_authz("a.rb", 1, 1);
     for cwe in [
         "CWE-284", "CWE-285", "CWE-287", "CWE-306", "CWE-862", "CWE-863",
@@ -736,7 +736,7 @@ fn the_missing_authorization_claim_is_recognised_by_cwe_or_by_wording() {
         f.description = "d".to_string();
         assert!(claims_missing_authz(&f), "{cwe}");
     }
-    // The same claim filed under a neighbouring CWE, or none at all.
+    // The same claim filed under a neighboring CWE, or none at all.
     f.cwe = Some("CWE-639".to_string());
     f.title = "Unauthenticated access to the operator console".to_string();
     assert!(claims_missing_authz(&f));
@@ -905,7 +905,7 @@ fn the_guard_label_names_each_frameworks_own_spelling() {
         guard_label(Some(RAILS_REPORTS_CONTROLLER), Some(LARAVEL_ROUTES)),
         "before_action :authenticate_user!"
     );
-    // And nothing recognisable falls back to the generic label.
+    // And nothing recognizable falls back to the generic label.
     assert_eq!(guard_label(Some("nothing here"), None), GENERIC_GUARD);
     assert_eq!(guard_label(None, None), GENERIC_GUARD);
 }

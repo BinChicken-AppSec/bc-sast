@@ -234,6 +234,9 @@ pub fn render_metrics(m: &ScanMetrics) -> Vec<String> {
     if !m.folders_scanned.is_empty() {
         lines.push(format!("- Folders scanned: {}", m.folders_scanned.len()));
     }
+    // Python's placement: right after the folder count, before the token
+    // table (`models/_scan.py::_render_metrics`).
+    lines.extend(crate::diagnostics::render_pipeline_diagnostics(m));
 
     if let Some(phases) = m.tokens_by_phase.as_ref().filter(|p| !p.is_empty()) {
         lines.push("### Tokens by Phase".to_string());
@@ -320,15 +323,28 @@ pub fn render_scan_health(
     let budget_stop = metrics
         .map(|m| m.budget_stop.as_str())
         .filter(|b| !b.is_empty());
-    if !degraded && failed == 0 && errs.is_empty() && budget_stop.is_none() {
+    let canceled = metrics.is_some_and(|m| m.canceled);
+    if !degraded && failed == 0 && errs.is_empty() && budget_stop.is_none() && !canceled {
         return Vec::new();
     }
     let mut lines = vec!["## Scan Health".to_string(), String::new()];
-    // First, and on its own line: a budget stop means the scan analysed
-    // less than it was asked to, and every other number in this report
-    // has to be read in that light. Before this, tripping `--max-tokens`
-    // left no trace in the report at all.
-    if let Some(budget_stop) = budget_stop {
+    // A cancellation leads, and replaces the budget wording: the stop
+    // travels through the same budget channel, but "BUDGET REACHED" would
+    // tell the reader the run ran out of money when the operator stopped
+    // it on purpose.
+    if canceled {
+        let at = budget_stop.map(|b| format!(" ({b})")).unwrap_or_default();
+        lines.push(format!(
+            "- \u{26a0}\u{fe0f} **CANCELED** by the operator (Ctrl-C){at}. This is a \
+             PARTIAL report: the scan stopped starting new work at that point, the stages \
+             after it were skipped, and any finding listed as not verified was never sent \
+             to the verifier."
+        ));
+    } else if let Some(budget_stop) = budget_stop {
+        // First, and on its own line: a budget stop means the scan
+        // analyzed less than it was asked to, and every other number in
+        // this report has to be read in that light. Before this, tripping
+        // `--max-tokens` left no trace in the report at all.
         lines.push(format!(
             "- \u{26a0}\u{fe0f} **BUDGET REACHED** — {budget_stop}. The scan stopped starting new \
              work at that point; findings from the work not done are absent, and any finding \
@@ -955,6 +971,50 @@ mod tests {
             md.contains("- Recoverable errors logged by stage: s7=1"),
             "{md}"
         );
+    }
+
+    #[test]
+    fn a_canceled_run_says_canceled_not_budget_and_names_where_it_stopped() {
+        let m = ScanMetrics {
+            canceled: true,
+            budget_stop: "S6: canceled by user (Ctrl-C)".to_string(),
+            ..ScanMetrics::default()
+        };
+        let md = render_scan_health(false, "", Some(&m)).join("\n");
+        assert!(md.contains("## Scan Health"), "{md}");
+        assert!(
+            md.contains("**CANCELED** by the operator (Ctrl-C) (S6: canceled"),
+            "{md}"
+        );
+        assert!(md.contains("PARTIAL report"), "{md}");
+        assert!(!md.contains("BUDGET REACHED"), "{md}");
+    }
+
+    #[test]
+    fn a_canceled_run_with_no_stop_point_still_renders_the_banner() {
+        let m = ScanMetrics {
+            canceled: true,
+            ..ScanMetrics::default()
+        };
+        let md = render_scan_health(false, "", Some(&m)).join("\n");
+        assert!(
+            md.contains("**CANCELED** by the operator (Ctrl-C). This"),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn render_metrics_places_pipeline_diagnostics_before_the_token_table() {
+        let mut m = base_metrics();
+        m.llm_truncated_replies = 1;
+        m.tokens_by_phase = Some(BTreeMap::from([(
+            "s4".to_string(),
+            serde_json::json!({"calls": 1, "prompt": 1, "completion": 1}),
+        )]));
+        let md = render_metrics(&m).join("\n");
+        let diag = md.find("### Pipeline Diagnostics").expect(&md);
+        let tokens = md.find("### Tokens by Phase").expect(&md);
+        assert!(diag < tokens, "{md}");
     }
 
     #[test]

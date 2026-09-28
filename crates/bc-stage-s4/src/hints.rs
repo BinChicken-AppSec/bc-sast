@@ -312,7 +312,9 @@ For each finding give a concrete remediation (the exact directive to add
 or remove) and rate severity from real-world exposure: a public S3 bucket
 in prod = HIGH; missing log-retention setting on a dev account = LOW."#
         }
-        _ => "",
+        // The five lenses upstream v1.3 added live beside this function in
+        // `crate::lens_hints`; anything else is still `""`.
+        other => crate::lens_hints::specialist_lens_hint(other).unwrap_or(""),
     }
 }
 
@@ -399,9 +401,9 @@ Easy to miss:
   field's actual size after a struct change.
 - `sizeof(ptr)` where `sizeof(array)` was meant — once a parameter has
   decayed to a pointer, `sizeof` is the word size, not the buffer size.
-- Signed overflow and shifting into the sign bit are undefined behaviour, so
+- Signed overflow and shifting into the sign bit are undefined behavior, so
   a self-referential check like `if (a + b < a)` may be deleted outright by
-  the optimiser."#;
+  the optimizer."#;
 
 /// The C++-only half, appended to [`C_HINT`] for the `"cpp"`/`"c-cpp"`
 /// keys. Every C hazard is still live in a C++ translation unit, so this
@@ -1490,6 +1492,11 @@ mod tests {
         "deserialization",
         "batch-etl",
         "iac",
+        "injection",
+        "csrf",
+        "sensitive-data",
+        "hardcoded-creds",
+        "log-injection",
     ];
     const LANG_KEYS: &[&str] = &[
         "c-cpp",
@@ -1542,7 +1549,7 @@ mod tests {
             let body = specialist_hint(key);
             assert!(!body.is_empty(), "missing specialist hint for {key}");
         }
-        assert_eq!(SPECIALIST_KEYS.len(), 6);
+        assert_eq!(SPECIALIST_KEYS.len(), 11);
 
         // Spot-check a distinctive phrase per key so a mis-wired match arm
         // (wrong body swapped to the wrong key) would fail loudly.
@@ -1689,7 +1696,7 @@ mod tests {
             assert!(cpp.contains(extra), "missing C++ hazard {extra}");
         }
         // The coarse `EXT_TO_LANG` key a mixed chunk keeps must carry both
-        // halves, since either flavour may be in it.
+        // halves, since either flavor may be in it.
         assert_eq!(lang_hint("c-cpp"), Some(cpp));
     }
 
@@ -1764,7 +1771,7 @@ mod tests {
 
     #[test]
     fn hint_key_for_path_passes_other_extensions_through_and_rejects_unknown_ones() {
-        // Uppercase and a directory-qualified name both normalise.
+        // Uppercase and a directory-qualified name both normalize.
         assert_eq!(hint_key_for_path("SRC/App.PY"), Some("python"));
         assert_eq!(
             hint_key_for_path("web/views/index.hbs"),

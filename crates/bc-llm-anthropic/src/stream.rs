@@ -54,6 +54,13 @@ struct Block {
     name: String,
     /// `text_delta` fragments, for a text block.
     text: String,
+    /// `thinking_delta` fragments and the `signature_delta`, for a
+    /// thinking block: both must be replayed exactly on the next turn.
+    thinking: String,
+    signature: String,
+    /// The opaque payload of a `redacted_thinking` block, which arrives
+    /// whole on `content_block_start`.
+    data: String,
     /// `input_json_delta` fragments, for a tool_use block — a single
     /// JSON document arriving in slices, parseable only once complete.
     partial_json: String,
@@ -101,10 +108,19 @@ impl StreamAssembler {
                 block.kind = start["type"].as_str().unwrap_or_default().to_string();
                 block.id = start["id"].as_str().unwrap_or_default().to_string();
                 block.name = start["name"].as_str().unwrap_or_default().to_string();
-                // A text block can be opened with content already in it.
-                if let Some(text) = start["text"].as_str() {
-                    block.text.push_str(text);
-                }
+                // A block can be opened with content already in it.
+                block
+                    .text
+                    .push_str(start["text"].as_str().unwrap_or_default());
+                block
+                    .thinking
+                    .push_str(start["thinking"].as_str().unwrap_or_default());
+                block
+                    .signature
+                    .push_str(start["signature"].as_str().unwrap_or_default());
+                block
+                    .data
+                    .push_str(start["data"].as_str().unwrap_or_default());
             }
             "content_block_delta" => {
                 let block = self.blocks.entry(index).or_default();
@@ -116,10 +132,14 @@ impl StreamAssembler {
                     "input_json_delta" => block
                         .partial_json
                         .push_str(delta["partial_json"].as_str().unwrap_or_default()),
-                    // `thinking_delta`/`signature_delta` and anything
-                    // newer: the block itself is still emitted (with its
-                    // type), and `parse_response_body` skips it, so
-                    // there is nothing to accumulate.
+                    "thinking_delta" => block
+                        .thinking
+                        .push_str(delta["thinking"].as_str().unwrap_or_default()),
+                    "signature_delta" => block
+                        .signature
+                        .push_str(delta["signature"].as_str().unwrap_or_default()),
+                    // Anything newer: the block itself is still emitted
+                    // (with its type), so there is nothing to accumulate.
                     _ => {}
                 }
             }
@@ -200,9 +220,16 @@ impl StreamAssembler {
                     // nothing parseable accumulated).
                     "input": b.input.expect("every tool_use block was closed above"),
                 }),
-                // Text and everything else keeps its own wire type, so a
-                // `thinking` block stays a `thinking` block for the
-                // parser to skip.
+                // Rebuilt in exactly the shape a whole response carries,
+                // so the replayed block is byte-identical either way.
+                "thinking" => json!({
+                    "type": "thinking",
+                    "thinking": b.thinking,
+                    "signature": b.signature,
+                }),
+                "redacted_thinking" => json!({"type": "redacted_thinking", "data": b.data}),
+                // Text and everything else keeps its own wire type, so an
+                // unknown block stays one for the parser to skip.
                 kind => json!({"type": kind, "text": b.text}),
             })
             .collect();
@@ -366,18 +393,33 @@ mod tests {
     }
 
     #[test]
-    fn a_thinking_block_keeps_its_type_and_is_skipped_by_the_parser() {
+    fn thinking_and_its_signature_are_reassembled_for_replay() {
         let body = assemble(&[
-            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}"#,
-            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hm"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"m"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig=="}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"citations_delta_from_the_future"}}"#,
             r#"{"type":"content_block_stop","index":0}"#,
-            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":"answer"}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"cipher"}}"#,
             r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"mystery"}}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"text","text":"answer"}}"#,
+            r#"{"type":"content_block_stop","index":3}"#,
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}"#,
         ])
         .unwrap();
-        assert_eq!(body["content"][0]["type"], "thinking");
-        assert_eq!(parse_response_body(&body).unwrap().text(), "answer");
+        assert_eq!(
+            body["content"][0],
+            json!({"type": "thinking", "thinking": "hmm", "signature": "sig=="})
+        );
+        assert_eq!(
+            body["content"][1],
+            json!({"type": "redacted_thinking", "data": "cipher"})
+        );
+        let resp = parse_response_body(&body).unwrap();
+        assert_eq!(resp.text(), "answer");
+        assert_eq!(resp.content.len(), 3, "two opaque blocks and the answer");
     }
 
     #[test]

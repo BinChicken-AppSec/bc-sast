@@ -6,6 +6,8 @@
 //! an orchestration-layer concern, not something a pure-logic utility
 //! crate should do as a side effect.
 
+mod truncated;
+
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -16,6 +18,8 @@ use serde_json::Value;
 /// is O(openers x length); this cap only ever trims a runaway response —
 /// normal LLM envelopes are a few KB.
 pub const MAX_JSON_INPUT: usize = 5_000_000;
+
+pub use truncated::{close_truncated, extract_truncated_json};
 
 const VALID_ESCAPE: &str = "\"\\/nrtu";
 
@@ -172,7 +176,7 @@ fn repair_loose_json(span: &str) -> Option<String> {
     while i < chars.len() {
         let c = chars[i];
         match c {
-            // A proper JSON string: copy it out verbatim, honouring
+            // A proper JSON string: copy it out verbatim, honoring
             // escapes, so nothing inside it is ever rewritten.
             '"' => {
                 out.push('"');
@@ -452,7 +456,7 @@ mod tests {
     fn list_returned_directly_when_response_does_not_signal_dict_intent() {
         // The response doesn't start with '{', so want_dict is false and a
         // top-level list is returned immediately — no hold-and-keep-
-        // scanning behaviour applies here at all.
+        // scanning behavior applies here at all.
         let text = "prose [1, 2, 3] more prose, no object here";
         let v = extract_json(text).unwrap();
         assert_eq!(v, serde_json::json!([1, 2, 3]));

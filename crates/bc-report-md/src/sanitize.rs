@@ -47,19 +47,81 @@ pub fn demote_md_headings(text: &str) -> String {
     out.join("\n")
 }
 
+/// Line and paragraph separators beyond `\r`/`\n`: VT, FF, FS/GS/RS,
+/// NEL, LS and PS. Many renderers and post-processors treat every one of
+/// these as a line break, so an untrusted value carrying e.g. U+2028 could
+/// still forge a table row or heading after `\r`/`\n` were neutralized.
+/// Folded to a space, exactly like `\r`/`\n`. Mirrors the upstream
+/// `_MD_LINEBREAK_RX`.
+fn is_md_linebreak(c: char) -> bool {
+    matches!(
+        c,
+        '\r' | '\n'
+            | '\u{0B}'
+            | '\u{0C}'
+            | '\u{1C}'
+            | '\u{1D}'
+            | '\u{1E}'
+            | '\u{85}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// Remaining C0 controls and DEL (tab excepted), plus zero-width and
+/// bidirectional formatting characters. Stripped so an untrusted value
+/// cannot hide, disguise or visually reorder rendered report text (a
+/// Trojan Source style spoof, e.g. making a FAILED status read as
+/// something else). Mirrors the upstream `_MD_INVISIBLE_RX`; call only
+/// after [`is_md_linebreak`] characters have been folded.
+fn is_md_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00}'..='\u{08}'
+            | '\u{0E}'..='\u{1F}'
+            | '\u{7F}'
+            | '\u{AD}'
+            | '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Fold every line-breaking character to a space and strip invisible or
+/// bidi-reordering characters. The shared first step of [`md_cell`] and
+/// [`md_code_span`].
+fn neutralize_invisible(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| {
+            if is_md_linebreak(c) {
+                Some(' ')
+            } else if is_md_invisible(c) {
+                None
+            } else {
+                Some(c)
+            }
+        })
+        .collect()
+}
+
 /// Escape a value for embedding in a Markdown table cell or single-line
-/// bullet: collapse `\r`/`\n` to a space (so an injected newline can't
-/// break out of a table row or spawn a new bullet/heading line), escape
-/// `\` itself, THEN escape `|` (the table-cell delimiter), then trim.
+/// bullet: fold every line-breaking character (`\r`, `\n`, VT, FF,
+/// FS/GS/RS, NEL, U+2028, U+2029) to a space (so an injected newline can't
+/// break out of a table row or spawn a new bullet/heading line), strip the
+/// remaining C0 controls, zero-width and bidi override/isolate characters,
+/// escape `\` itself, THEN escape `|` (the table-cell delimiter), then trim.
 ///
 /// The backslash escape must come first: escaping `|` before `\` lets an
 /// attacker-supplied `\` immediately preceding a `|` consume the `\` this
 /// function inserts, so the pair renders as one literal backslash
-/// followed by a bare, unescaped `|` — re-exposing the table-cell
+/// followed by a bare, unescaped `|`, re-exposing the table-cell
 /// delimiter this function exists to neutralize. Confirmed exploitable
 /// against the pre-fix ordering; matches the upstream Python fix.
 pub fn md_cell(text: &str) -> String {
-    text.replace(['\r', '\n'], " ")
+    neutralize_invisible(text)
         .replace('\\', "\\\\")
         .replace('|', "\\|")
         .trim()
@@ -67,21 +129,22 @@ pub fn md_cell(text: &str) -> String {
 }
 
 /// Escape a value for embedding inside a single backtick-delimited inline
-/// code span (`` `{value}` ``): collapse `\r`/`\n` to a space (same
-/// row/line-breakout rationale as [`md_cell`]) and replace a literal
-/// backtick with the visually-similar U+02CB MODIFIER LETTER GRAVE ACCENT
-/// (ˋ) so it can never close the span early and let the rest of the value
-/// render as raw, unintended Markdown.
+/// code span (`` `{value}` ``): fold line breaks and strip invisible or
+/// bidi characters exactly as [`md_cell`] does (same row/line-breakout and
+/// visual-spoofing rationale), and replace a literal backtick with the
+/// visually-similar U+02CB MODIFIER LETTER GRAVE ACCENT (ˋ) so it can
+/// never close the span early and let the rest of the value render as
+/// raw, unintended Markdown.
 ///
-/// A repo-controlled file path (or CMDB-supplied value — both untrusted
+/// A repo-controlled file path (or CMDB-supplied value, both untrusted
 /// per this module's own doc comment) containing a literal backtick was
 /// confirmed to break out of every inline code span this port renders one
-/// into unescaped — `md_cell` alone doesn't help here, since backtick
+/// into unescaped. `md_cell` alone doesn't help here, since backtick
 /// isn't one of the characters it escapes; that function targets *table*
 /// breakout, this one targets *code-span* breakout, and a value can need
 /// either, both, or neither depending on where it's embedded.
 pub fn md_code_span(text: &str) -> String {
-    text.replace(['\r', '\n'], " ")
+    neutralize_invisible(text)
         .replace('`', "\u{2CB}")
         .trim()
         .to_string()
@@ -224,5 +287,44 @@ mod tests {
     fn md_code_span_collapses_newlines() {
         assert_eq!(md_code_span("line1\nline2"), "line1 line2");
         assert_eq!(md_code_span("line1\r\nline2"), "line1  line2");
+    }
+
+    #[test]
+    fn md_cell_folds_every_unicode_line_separator_to_a_space() {
+        for sep in [
+            '\u{0B}', '\u{0C}', '\u{1C}', '\u{1D}', '\u{1E}', '\u{85}', '\u{2028}', '\u{2029}',
+        ] {
+            let input = format!("a{sep}## forged");
+            assert_eq!(md_cell(&input), "a ## forged", "separator {sep:?}");
+            assert_eq!(md_code_span(&input), "a ## forged", "separator {sep:?}");
+        }
+    }
+
+    #[test]
+    fn md_cell_strips_remaining_c0_controls_and_del_but_keeps_tab() {
+        assert_eq!(md_cell("a\u{00}b\u{07}c\u{1B}d\u{1F}e\u{7F}f"), "abcdef");
+        assert_eq!(md_cell("a\tb"), "a\tb");
+        assert_eq!(md_code_span("a\u{08}b\u{0E}c"), "abc");
+    }
+
+    #[test]
+    fn md_cell_strips_zero_width_characters() {
+        let input = "FA\u{200B}IL\u{200C}E\u{200D}D\u{2060}\u{FEFF}\u{AD}\u{2064}";
+        assert_eq!(md_cell(input), "FAILED");
+        assert_eq!(md_code_span(input), "FAILED");
+    }
+
+    #[test]
+    fn md_cell_strips_bidi_overrides_embeddings_isolates_and_marks() {
+        // Trojan Source style: U+202E would render "DELIAF" reversed so a
+        // FAILED status could visually read as something else.
+        let input = "\u{202E}DELIAF\u{202C} \u{2066}x\u{2069} \u{200E}y\u{200F} \u{061C}z\u{202A}\u{202B}\u{202D}\u{2067}\u{2068}";
+        assert_eq!(md_cell(input), "DELIAF x y z");
+        assert_eq!(md_code_span(input), "DELIAF x y z");
+    }
+
+    #[test]
+    fn md_cell_leaves_ordinary_non_ascii_text_alone() {
+        assert_eq!(md_cell("café ü 漢字 \u{2065}"), "café ü 漢字 \u{2065}");
     }
 }

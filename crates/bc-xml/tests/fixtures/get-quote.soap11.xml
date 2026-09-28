@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- TEST FIXTURE ONLY: a hand-written SOAP 1.1 request for bc-xml
+     round-trip tests. -->
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <soapenv:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+        soapenv:mustUnderstand="1">
+      <wsse:UsernameToken>
+        <wsse:Username>placeholder-user</wsse:Username>
+      </wsse:UsernameToken>
+    </wsse:Security>
+  </soapenv:Header>
+  <soapenv:Body>
+    <TradePriceRequest xmlns="http://example.com/stockquote.xsd">
+      <tickerSymbol>BHP&#x2E;AX</tickerSymbol>
+      <asOf xsi:nil="true"/>
+      <note><![CDATA[a < b && c > d]]></note>
+    </TradePriceRequest>
+  </soapenv:Body>
+</soapenv:Envelope>

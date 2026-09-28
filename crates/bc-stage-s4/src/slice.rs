@@ -124,7 +124,7 @@ fn render_file(
             return 0;
         }
     };
-    let redacted = redact_source(&text);
+    let redacted = redact_source(&text, rel);
     let lines: Vec<String> = redacted
         .lines()
         .map(|ln| truncate_chars(ln, MAX_LINE_CHARS))

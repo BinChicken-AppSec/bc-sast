@@ -15,21 +15,31 @@ the validatable set entirely, leaving its slot `None`.
 
 ## Enabling / disabling it
 
-**There is no CLI flag for validation at all**: no
-`--validate`/`--no-validate`/`--enforce-validation`/
-`--out-validation-json`. It's controlled by exactly one thing:
+S11 runs whenever `--remediate` does, unless something turns it off.
+Three things decide it, the later winning:
 
-```rust
-/// Whether Phase 3's S11 fix-validation panel runs right after each
-/// finding's remediation... Defaults to `true`, matching the shipped
-/// `default.yaml` profile's `step_validate.enabled: true`;
-/// overridable via `--config`'s `step_validate.enabled`.
-pub validate_enabled: bool,
-```
+1. The built-in default: **on**.
+2. A `--config` file whose own YAML (not the defaults-merged tree) sets
+   `step_validate.enabled`.
+3. `--validate` / `--validate true` / `--validate false`, or
+   `--no-validate` (the same as `--validate false`). The flags beat the
+   config file in either direction. The GitHub Action exposes this as its
+   `validate` input.
 
-`validate_enabled` starts hardcoded `true` in `build_remediate_settings`
-and can only be lowered by a `--config` file whose own YAML (not the
-defaults-merged tree) sets `step_validate.enabled: false`:
+When S11 is skipped the run says so on stderr
+(`[s11] disabled (--no-validate or step_validate.enabled: false); ...`),
+so a patch kept without an independent grade is never kept silently.
+
+**Why on by default, when vvaharness v1.4.0 ships it off.** Upstream
+switched `step_validate.enabled` to `false` in its `default.yaml`
+between v1.2.0 and v1.4.0, keeping validation as an opt-in. This port
+deliberately does not follow: here S11 is not only a report, it is what
+rolls back a patch it grades `Not Fixed` or `UNVERIFIABLE` (see
+[A failed validation now rolls the patch back](#a-failed-validation-now-rolls-the-patch-back)).
+Turning it off by default would silently keep every patch S10's own
+gates let through, with nobody independently checking it. An operator
+who wants the upstream behavior sets `--no-validate` or
+`step_validate.enabled: false`.
 
 ```rust
 // Reads `user_provided`, not `data`: `data` always has
@@ -68,9 +78,27 @@ still validates only 20 fixes by default. `0`/absent validates every
 validatable finding. The `-i` picker does not apply it: a human choosing
 findings by hand is already the cap.
 
-Since there's no independent trigger, validation is effectively "on
-whenever `--remediate` runs and a config file doesn't explicitly turn
-it off". It can never run on its own.
+Validation never runs on its own: every trigger above only matters
+together with `--remediate` (or `--remediate-from`).
+
+### `--resume`
+
+A computed score is checkpointed
+(`bc_stage_s11::validate_finding_checkpointed`) under a
+`validate_<digest>` step whose digest covers the finding id, a digest of
+the redacted diff the panel judged, and the whole panel: every persona's
+effective model, whether the cross-repo persona and the fact tools took
+part, the API dialect and the gateway host
+(`Step11Config::engine_key`). Under `--resume` a matching score is reused
+without running a single persona; a changed fix, model or panel is a
+different key and runs the panel again. The payload is a serde mirror of
+the `ValidationScore` with every free-text field redacted. Python
+checkpoints S11 the same way (`validate_<digest>` in
+`orchestrator/checkpoints.py`); this port previously re-ran the whole
+panel on every resume. The batch walk in `bc_orchestrator::remediate`
+must call `validate_finding_checkpointed` (with the run's store, run id
+and `--resume` flag) for this to take effect, and should prune
+`VALIDATE_STEP_PREFIX` rows no validated finding claims.
 
 ## The persona panel
 
@@ -93,15 +121,18 @@ multi-component (e.g. a monorepo with independently-versioned
 services). When on, it runs on **every** finding rather than
 conditionally per-diff.
 
-The Python original's `effort` and `max_budget_usd` knobs are both
-absent, for different reasons. `step_validate.effort` (`"high"`) still
-ships in `bc_config::step_defaults()` for schema parity and is read by
-nothing, because this port's agentic config has no reasoning-effort dial
-to apply it to. `max_budget_usd` is not shipped at all: in Python it only
-ever reached the Claude CLI and Claude Agent SDK backends, which this
-port does not have, as S6's module comment traces in full. A config that
-still sets it loads and warns. The real spend controls are `--max-tokens`
-and `--max-scan-seconds`.
+`step_validate.effort` is wired: it is the panel's reasoning-effort
+tier, `high` by default as in the Python original (`DEFAULT_EFFORT`),
+and every persona's turns carry it. `--reasoning-effort` overrides it,
+and `models.validate.orchestrator.effort` overrides both (see
+[`configuration.md`](configuration.md#modelsrole-per-stage-model-overrides)).
+A model that takes no effort parameter has it dropped, and on an
+Anthropic model that thinks, `temperature` is dropped alongside it.
+`max_budget_usd` is not shipped at all: in Python it only ever reached
+the Claude CLI and Claude Agent SDK backends, which this port does not
+have, as S6's module comment traces in full. A config that still sets it
+loads and warns. The real spend controls are `--max-tokens` and
+`--max-scan-seconds`.
 
 | Persona | Focus |
 |---|---|
@@ -300,7 +331,7 @@ merely denying:
 | `DiffTouched` | `file_path` | `{"touched": bool, "added_ranges": [[start_line, line_count], ...]}` for that file in the remediation diff |
 | `ChangedLines` | `file_path` | just the `added_ranges` array |
 | `DiffImpactMap` | none | `{"files_changed": [...], "trust_boundary_touched": bool}`, where the flag fires on a path matching `auth`/`session`/`crypto`/`token`/`config` and others |
-| `PatternScan` | `pattern_set` | ordered `{file, line, snippet, pattern_set, rule, description}` hits for `"secret_exposure"` or `"insecure_value"` |
+| `PatternScan` | `pattern_set` | ordered `{kind: "match", file, line, pattern_set, rule, description}` records for `"secret_exposure"` or `"insecure_value"`, then one `{kind: "summary", ...}` record |
 | `TestInventory` | none | `{"test_files": [{file, lines, negative_test_markers, has_negative_tests}], "total_test_files", "files_with_negative_tests"}` |
 
 The last five are the **deterministic fact tools**, ported from
@@ -312,7 +343,7 @@ instruction Python's orchestrator prompt carries
 (`validation/prompts/system.md:79-81`); this port's personas are
 top-level calls with no orchestrator parent to inherit it from.
 
-Three details differ from the Python original, deliberately:
+One detail differs from the Python original, deliberately:
 
 - **The diff is passed as text, not read from `diff.patch`.** Python's
   validator runs as a separate command over a staged per-finding
@@ -320,19 +351,57 @@ Three details differ from the Python original, deliberately:
   after S10 applies the fix, so the diff comes straight from
   `RemediationRecord::diff`. A finding with no diff (a denied or failed
   remediation) gets honest "nothing touched" answers, not an error.
-- **`PatternScan` snippets are redacted.** For the `secret_exposure`
-  set the matched text *is* the credential, and every other route by
-  which source reaches a model here goes through `bc_redact` first.
-  File, line, pattern set and description stay exact, which is what the
-  persona needs in order to go look.
-- **`PatternScan`/`TestInventory` walk the production scan scope**,
-  skipping vendor/infra dirs and binary/media extensions from
-  `bc_repo_analysis::DEFAULT_EXCLUDE_*`. For `PatternScan` only, test
-  directories are skipped too, since tests are not production attack
-  surface.
-  A symlink whose target resolves outside the repo root is never
-  followed (`bc_pathjail::confine`, applied to every entry the walk
-  discovers).
+As in Python, whose validator only ever reads the persisted, redacted
+`diff.patch`, the diff every persona and fact tool sees is **redacted**
+(`bc_redact::redact_diff`). The redaction is structure-aware, so
+`DiffTouched`/`ChangedLines` still parse the hunks exactly. This port
+used to hand the panel the raw diff and redact only afterwards.
+
+Two further details now match vvaharness v1.4.0:
+
+- **`PatternScan` returns no candidate text at all** (v1.4.0
+  `pattern_scanner.py`). A match record carries only the file, line,
+  pattern set, rule and description: for `secret_exposure` the matched
+  text *is* the credential, and even this port's earlier redacted
+  snippet still told the model its shape and length. The scan is bounded
+  (512 KiB per file, 32 MiB and 10,000 files per scan, 50 matches per
+  file, 200 overall), and the final record is a summary:
+  `matches_seen`, `matches_returned`, `files_considered`,
+  `files_scanned`, `files_too_large`, `files_unreadable`, `binary_files`,
+  `bytes_scanned`, `truncated`, `truncation_reasons` (any of
+  `file_size_limit`, `unreadable_files`, `binary_files`,
+  `overall_file_limit`, `overall_byte_limit`, `per_file_match_limit`,
+  `overall_match_limit`) and the `limits` themselves. The persona prompt
+  tells it to treat truncation or skipped files as incomplete coverage.
+- **`PatternScan`/`TestInventory` walk the production scan scope**
+  (v1.4.0 `_scope.py`): vendor/infra directories are pruned before they
+  are entered, binary/media extensions are skipped, and for
+  `PatternScan` the test directories and S1's own test-file and
+  repository-metadata globs (`test_*.py`, `*.spec.ts`, `LICENSE`, ...)
+  are excluded too, since tests are not production attack surface. The
+  walk never enters a symlinked directory (a repository containing
+  `ln -s . x` used to recurse until `ELOOP`), and a symlinked file is
+  kept only when it resolves inside the repo root. `Grep`'s whole-repo
+  walk and `Glob` share the same no-follow walker (`Glob` used to expand
+  `**` through `glob::glob`, which follows symlinked directories).
+
+Every persona prompt also carries v1.4.0's **Secret-Exposure Evidence**
+rule (`claude_config/rules/adversarial-review.md`): for a hardcoded
+credential finding the diff is intentionally redacted, so never
+reconstruct the removed value or put it in a tool query; check each
+reported location for a remaining literal and a proper config-time
+source; call `PatternScan("secret_exposure")` when it is granted (or use
+`Grep` with credential names, never the value, when it is not); and never
+copy a secret candidate into a report.
+
+**Persona evidence is bounded** before it goes anywhere: at most 20
+evidence entries per gate, 512 characters of `file` and 2,048 of
+`snippet`, each redacted *before* it is cut (truncating first could leave
+a secret prefix too short for a pattern to recognize). A cut is logged at
+`warn` naming the field and limit, and marked `...[truncated]`. The
+justification's joined "files needing fixes" list is capped at 4,096
+characters the same way. All of it flows into the justification,
+`remediation.json`, the report and SARIF.
 
 `step_validate.fact_tools: false` turns the five off; the personas then
 get the three readers and no prompt text naming tools they do not have.
@@ -380,7 +449,10 @@ with it on). Each merged gate carries both a status and a
   change does something and differ only on how complete it is, which is
   a disagreement the scoring rules below already know how to express
   (half credit, and no `Fixed` label for a partial critical gate).
-  `Split` scores exactly as `High` does.
+  `Split` scores exactly as `High` does. This is a deliberate divergence
+  from vvaharness, which flags every tie; `step_validate.split_ties_score:
+  false` restores that (each `Split` becomes `Flagged`, so the fix is
+  `UNVERIFIABLE`).
 - **Every other tie is `Flagged`**: `pass` against `fail`, which is a
   contradiction about whether the fix works at all; any tie involving
   `Invalid`, where one persona's report came through garbled rather
@@ -405,7 +477,7 @@ trips the scoring engine's shape check to `Unverifiable`.
 
 **Confidence is not a score.** It never scales a weight or moves a
 threshold; a single `Flagged` gate is a hard stop, and `High` and
-`Split` both score exactly as an unlabelled gate does. It is also
+`Split` both score exactly as an unlabeled gate does. It is also
 unrelated to the "Fix confidence: N%" figure in justification prose,
 which is just the raw score as a percentage.
 
@@ -547,7 +619,8 @@ to `"Ready"`, `Partially Fixed` to `"Ready with Conditions"`, and
 - **`report.md`**: a `#### Validation` block is appended under the
   matching finding's own `### N. [...]` heading (matched by 1-based
   *position*, not content). The block is `**Status:** {fix_status}
-  (score: {raw_score:.2})` plus the justification text. A no-op when nothing
+  (score: {raw_score:.2})` plus the justification text; an
+  `UNVERIFIABLE` panel has no score and reads `(score: n/a)`. A no-op when nothing
   was validated; fails closed (report left unchanged) on any
   heading-count mismatch rather than guessing which finding an entry
   belongs to.
@@ -557,10 +630,16 @@ to `"Ready"`, `Partially Fixed` to `"Ready with Conditions"`, and
   `mergeReadiness` comes from `derive_merge_readiness`). These are
   informational SARIF result properties, not the SARIF `level`/severity
   field, and nothing downstream in this codebase reads them back.
+  `validationScore` is omitted for an `UNVERIFIABLE` result.
 - **`--out-remediation-json`**: `RemediationRecordExport.validation:
-  Option<ValidationScoreExport>` (`raw_score`, `fix_status`,
+  Option<ValidationScoreExport>` (`raw_score`, `decision`, `fix_status`,
   `justification`, `gate_results[]`, `has_critical_failure`), and
   `Some(_)` only for a finding validation actually ran and scored.
+  `decision` is vvaharness v1.4.0's `fixed`/`partially_fixed`/
+  `not_fixed`/`inconclusive`; `raw_score` is `null` when the panel was
+  inconclusive (`fix_status: "UNVERIFIABLE"`), where it used to read
+  `0.0`. The export's `totals` and `rollup` summarize the run, and a
+  `--remediate` run's exit code reflects it (docs/outputs.md).
   There is no separate `--out-validation-json` output.
 
   Each entry in `gate_results[]` carries `gate_name`, `status`,

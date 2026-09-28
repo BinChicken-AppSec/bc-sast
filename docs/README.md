@@ -58,6 +58,9 @@
 - [`architecture.md`](architecture.md): the crate-tier map, the S0-S9
   scan pipeline's data flow, the per-language knowledge in the S4 and S6
   prompts, and how S10 remediation and S11 validation hang off it.
+- [`llm-transport.md`](llm-transport.md): what the model clients send:
+  the OpenAI Responses API and its learned fallback, per-model parameter
+  capabilities, learned rejections, prompt caching, and cache pricing.
 - [`remediation.md`](remediation.md), stage S10: the agentic fix loop,
   finding selection, diff capture/revert, and the deterministic policy
   gate (`bc-policy-gate`).
@@ -69,7 +72,7 @@
 ## Release
 
 - [`../CHANGELOG.md`](../CHANGELOG.md): what changed, grouped by theme.
-  `1.0.0` is the current release.
+  `1.1.0` is the current release.
 
 ## Contributing
 

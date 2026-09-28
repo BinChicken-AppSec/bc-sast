@@ -49,9 +49,30 @@ pub use error::YamlError;
 
 /// Parse a YAML document into a `serde_json::Value`. An empty (or
 /// all-comments/all-blank) document parses to `Value::Null`, matching
-/// PyYAML's `safe_load` behaviour for an empty file.
+/// PyYAML's `safe_load` behavior for an empty file.
 pub fn parse(input: &str) -> Result<serde_json::Value, YamlError> {
     block::Parser::new(input).parse_document()
+}
+
+/// Parse a YAML document, refusing anything the subset above cannot
+/// represent exactly instead of approximating it.
+///
+/// [`parse`] is tuned for this project's own config files and stays
+/// lenient: text after the first line it cannot place is dropped, an
+/// anchor or tag becomes part of a plain string, and a repeated key keeps
+/// its last value. That is tolerable for files this project writes and
+/// dangerous for a file someone else wrote, where a silently different
+/// value could be mistaken for the author's intent. `parse_strict`
+/// returns an error for each of those cases (unplaced trailing content,
+/// tab indentation, document markers, anchors, aliases, tags, directives,
+/// reserved indicators, block-scalar indentation indicators, complex and
+/// merge keys, unterminated or trailing-text quoted scalars, `: ` inside a
+/// plain scalar, text after a flow collection, and duplicate keys), so a
+/// successful parse means every line was read under rules this crate
+/// implements. It does not make the parser more capable: an error means
+/// "not verifiable here", not "invalid YAML".
+pub fn parse_strict(input: &str) -> Result<serde_json::Value, YamlError> {
+    block::Parser::new_strict(input).parse_document()
 }
 
 #[cfg(test)]
@@ -470,5 +491,114 @@ deny_paths:
             cur = &cur[format!("k{i}")];
         }
         assert_eq!(cur["leaf"], "value");
+    }
+
+    #[test]
+    fn a_sequence_at_its_keys_own_indentation_is_the_keys_value() {
+        let yaml = "tags:\n- users\n- admin\nname: api\n";
+        let expected = json!({"tags": ["users", "admin"], "name": "api"});
+        assert_eq!(parse(yaml).unwrap(), expected);
+        assert_eq!(parse_strict(yaml).unwrap(), expected);
+        // The same shape under a mapping that starts on a dash line.
+        assert_eq!(
+            parse_strict("- name: a\n  items:\n  - 1\n").unwrap(),
+            json!([{"name": "a", "items": [1]}])
+        );
+    }
+
+    #[test]
+    fn strict_parsing_accepts_what_the_subset_represents_exactly() {
+        let yaml = "\
+# comment
+openapi: 3.1.0
+info:
+  title: \"Pets # not a comment\"
+  version: '1.0'
+  description: |
+    Line one.
+    Line two.
+paths:
+  /pets/{id}:
+    get:
+      tags: [pets, 'read']
+      parameters: []
+      responses: {\"200\": {description: ok}} # trailing comment
+empty:
+";
+        let value = parse_strict(yaml).unwrap();
+        assert_eq!(value["info"]["title"], "Pets # not a comment");
+        assert_eq!(value["info"]["description"], "Line one.\nLine two.\n");
+        assert_eq!(
+            value["paths"]["/pets/{id}"]["get"]["tags"],
+            json!(["pets", "read"])
+        );
+        assert_eq!(value["empty"], serde_json::Value::Null);
+        assert_eq!(parse_strict("").unwrap(), serde_json::Value::Null);
+        assert_eq!(
+            parse_strict("a: \"x\" # note\n").unwrap(),
+            json!({"a": "x"})
+        );
+        assert_eq!(
+            parse_strict("a: [1, 2] # note\n").unwrap(),
+            json!({"a": [1, 2]})
+        );
+        assert_eq!(parse_strict("a: -5\nb: - \n").unwrap_err().line, 2);
+    }
+
+    #[test]
+    fn strict_parsing_refuses_what_the_lenient_parser_would_approximate() {
+        for (yaml, fragment) in [
+            ("a: 1\n  b: 2\nc: 3\n", "cannot place"),
+            ("a: one\n  two\nb: 3\n", "cannot place"),
+            ("- a\nb: 1\n", "cannot place"),
+            ("a:\n\tb: 1\n", "tab character"),
+            ("a: 1\n---\nb: 2\n", "document markers"),
+            ("--- x\n", "document markers"),
+            ("a: 1\n...\n", "document markers"),
+            ("a: &x 1\n", "outside the supported subset"),
+            ("a: *x\n", "outside the supported subset"),
+            ("a: !!str 1\n", "outside the supported subset"),
+            ("a: |2\n   x\n", "outside the supported subset"),
+            ("? a\n", "outside the supported subset"),
+            ("<<: {a: 1}\n", "mapping key"),
+            ("&a key: 1\n", "mapping key"),
+            ("{a: 1}\nb: 2\n", "mapping key"),
+            ("a: b: c\n", "unquoted ': '"),
+            ("a: b:\n", "unquoted ': '"),
+            ("a: \"open\n  close\"\n", "unterminated"),
+            ("a: \"x\" y\n", "text after a quoted scalar"),
+            ("a: [1, 2] x\n", "text after a flow collection"),
+            ("a: [&x 1]\n", "outside the supported subset"),
+            ("a: {&k 1: 2}\n", "outside the supported subset"),
+            ("a: {k: 1, k: 2}\n", "duplicate flow-mapping key"),
+            ("a: 1\na: 2\n", "duplicate mapping key"),
+            ("- ?\n", "outside the supported subset"),
+        ] {
+            let error = parse_strict(yaml).unwrap_err();
+            assert!(
+                error.to_string().contains(fragment),
+                "{yaml:?} gave {error}, expected {fragment:?}"
+            );
+        }
+        // Lenient parsing of the same inputs is unchanged.
+        assert_eq!(parse("a: &x 1\n").unwrap(), json!({"a": "&x 1"}));
+        assert_eq!(parse("a: {k: 1, k: 2}\n").unwrap(), json!({"a": {"k": 2}}));
+        assert_eq!(parse("a: 1\na: 2\n").unwrap(), json!({"a": 2}));
+        assert_eq!(parse("a: [1] x\n").unwrap(), json!({"a": [1]}));
+    }
+
+    #[test]
+    fn strict_duplicate_key_errors_name_the_repeated_line() {
+        let error = parse_strict("a: 1\nb:\n  c: 1\na:\n  d: 2\n").unwrap_err();
+        assert_eq!(error.line, 4);
+    }
+
+    #[test]
+    fn a_tab_inside_content_is_not_indentation() {
+        assert_eq!(parse_strict("a: \"x\ty\"\n").unwrap(), json!({"a": "x\ty"}));
+        assert_eq!(
+            parse_strict("a: 1\n\t\nb: 2\n").unwrap(),
+            json!({"a": 1, "b": 2})
+        );
     }
 }

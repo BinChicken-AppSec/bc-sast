@@ -103,8 +103,9 @@ pub struct Step0Config {
     pub sources_yaml: Option<PathBuf>,
     /// `step0.sinks_yaml` — the sink-rule counterpart.
     pub sinks_yaml: Option<PathBuf>,
-    /// `step1.call_graph_max_targets` — read by S0 too (Python's own
-    /// `callgraph_engine.run` pulls this same config key).
+    /// `step0.call_graph_max_targets`, falling back to
+    /// `step1.call_graph_max_targets` (upstream v1.3
+    /// `callgraph_engine.run`); resolved by the CLI's config layer.
     pub call_graph_max_targets: usize,
     pub walk: WalkConfig,
     /// The whole `step0.callgraph.llm.*` block, plus the
@@ -377,6 +378,8 @@ pub async fn run_seed(
             temperature: c.temperature,
             top_p: c.top_p,
             seed: c.seed,
+            reasoning_effort: c.reasoning_effort,
+            openai_api: c.openai_api,
             timeout_secs: c.timeout_secs,
         }),
     };

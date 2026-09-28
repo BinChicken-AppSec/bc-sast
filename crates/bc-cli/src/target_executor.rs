@@ -1735,7 +1735,7 @@ mod tests {
             .contains("exceeds depth limit 32"));
 
         // The entry and byte ceilings are driven from an already-spent budget.
-        // Materialising 30,000 entries or 256 MiB of content per run would
+        // Materializing 30,000 entries or 256 MiB of content per run would
         // dominate the suite without exercising anything the running totals
         // do not already decide.
         let source = tempfile::tempdir().unwrap();
@@ -1800,33 +1800,62 @@ mod tests {
     #[test]
     fn an_unreadable_source_directory_blocks_the_snapshot_rather_than_silently_skipping_it() {
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let locked = root.path().join("locked");
-        std::fs::create_dir(&locked).unwrap();
-        std::fs::write(locked.join("app.rs"), "fn main() {}\n").unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let outcome = create_snapshot(root.path());
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(outcome
-            .err()
-            .unwrap()
-            .contains("cannot read target snapshot"));
+        // Only a permission bit can make a directory that `lstat` accepts
+        // unlistable, and root ignores it, so this runs only where
+        // permissions are enforced. The listing failure itself is covered
+        // for root too, by `a_source_directory_that_cannot_be_listed_blocks_the_copy`.
+        if crate::test_support::permissions_enforced(
+            "an_unreadable_source_directory_blocks_the_snapshot_rather_than_silently_skipping_it",
+        ) {
+            let root = tempfile::tempdir().unwrap();
+            let locked = root.path().join("locked");
+            std::fs::create_dir(&locked).unwrap();
+            std::fs::write(locked.join("app.rs"), "fn main() {}\n").unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let outcome = create_snapshot(root.path());
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(outcome
+                .err()
+                .unwrap()
+                .contains("cannot read target snapshot"));
+        }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn a_listable_but_unsearchable_source_directory_blocks_the_snapshot() {
-        // Readable but not searchable: `read_dir` still names the entries,
-        // and inspecting any of them fails. Skipping them silently would
-        // hand the container a quietly incomplete copy of the target.
-        use std::os::unix::fs::PermissionsExt;
+    fn a_source_directory_that_cannot_be_listed_blocks_the_copy() {
+        // A path under a regular file cannot be listed (ENOTDIR) by any
+        // user, root included, and the copy reports it rather than
+        // treating the directory as empty.
         let root = tempfile::tempdir().unwrap();
-        let listable = root.path().join("listable");
-        std::fs::create_dir(&listable).unwrap();
-        std::fs::write(listable.join("app.rs"), "fn main() {}\n").unwrap();
-        std::fs::set_permissions(&listable, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let outcome = create_snapshot(root.path()).err();
-        std::fs::set_permissions(&listable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(root.path().join("app.rs"), "fn main() {}\n").unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let mut budget = SnapshotBudget::default();
+        let outcome = copy_sanitized(
+            &root.path().join("app.rs/src"),
+            destination.path(),
+            1,
+            &mut budget,
+        );
+        assert!(outcome.unwrap_err().contains("cannot read target snapshot"));
+        assert_eq!(budget.entries, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_source_entry_that_cannot_be_inspected_blocks_the_snapshot() {
+        // The directory is named by its parent's listing but cannot be
+        // inspected. Skipping it silently would hand the container a
+        // quietly incomplete copy of the target. In the field that is a
+        // parent with read but not search permission, which root ignores;
+        // here the entry's full path exceeds `PATH_MAX`, which fails for
+        // every user.
+        let base = tempfile::tempdir().unwrap();
+        let staged = base.path().join("staged");
+        let listed = staged.join("l".repeat(200));
+        std::fs::create_dir_all(&listed).unwrap();
+        std::fs::write(listed.join("app.rs"), "fn main() {}\n").unwrap();
+        let root = crate::test_support::bury_near_path_max(&staged);
+        let outcome = create_snapshot(&root).err();
         assert!(outcome.unwrap().contains("cannot inspect target snapshot"));
     }
 

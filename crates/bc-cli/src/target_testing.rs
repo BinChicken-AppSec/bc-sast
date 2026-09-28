@@ -13,8 +13,12 @@ use crate::target_executor::{
     CommandKind, ContainerPolicy, DependencyStore, ExecutionResult, ExecutionState, PROVISION_PHASE,
 };
 
+mod api_spec;
 mod builtin_profiles;
 mod discovered_execution;
+
+pub use api_spec::parse_format as parse_api_spec_format;
+pub use api_spec::ApiSpecMode;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PolicyIdentity {
@@ -30,7 +34,7 @@ pub struct TargetTestingConfig {
     pub profile: Option<PolicyIdentity>,
     #[serde(default)]
     pub generate: bool,
-    /// Cumulative generation scope; execution remains separately authorised.
+    /// Cumulative generation scope; execution remains separately authorized.
     #[serde(default)]
     pub level: TestingLevel,
     /// Separate role routing; absent values inherit the remediation model.
@@ -42,6 +46,16 @@ pub struct TargetTestingConfig {
     pub allowed_support_paths: Vec<String>,
     pub execution: Option<ContainerPolicy>,
     pub discovered_execution: Option<Vec<discovered_execution::EcosystemPolicy>>,
+    /// Allowances for the API specification step. Absent disables it.
+    #[serde(default)]
+    pub api_spec: Option<api_spec::ApiSpecPolicy>,
+    /// Set from `--api-spec off`, never from a policy.
+    #[serde(skip)]
+    pub api_spec_disabled: bool,
+    /// Set from `--api-spec-formats`; empty means every standard the
+    /// profile allows. It can only narrow that set.
+    #[serde(skip)]
+    pub api_spec_formats: Vec<bc_api_spec::FormatId>,
 }
 
 pub fn check_mode(cli: &Cli) -> Result<(), String> {
@@ -74,7 +88,11 @@ pub fn load_config(cli: &Cli) -> Result<Option<TargetTestingConfig>, String> {
     };
     // Only compiled entries can authorize execution or test writes. Neither
     // runtime files nor target contents can supply or override a policy.
-    builtin_profiles::load(name).map(Some)
+    let mut config = builtin_profiles::load(name)?;
+    // The operator may switch the step off; nothing can switch it on.
+    config.api_spec_disabled = cli.api_spec == ApiSpecMode::Off;
+    config.api_spec_formats = cli.api_spec_formats.clone();
+    Ok(Some(config))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +196,8 @@ pub struct Assurance {
     pub resolved_execution_policies: Vec<ContainerPolicy>,
     pub generator_model: String,
     pub reviewer_model: String,
+    /// The API specification step's outcome for each document it assessed.
+    pub api_spec: api_spec::ApiSpecReport,
     /// Held only in memory to detect tests changed by the patch writer.
     #[serde(skip)]
     approved_bytes: BTreeMap<String, Vec<u8>>,
@@ -338,29 +358,33 @@ fn validate_proposal(
             ));
         }
         for evidence in &file.expectations {
-            if !safe_relative(&evidence.file)
-                || evidence.line == 0
-                || evidence.snippet.trim().is_empty()
-            {
-                return Err("invalid expectation citation".into());
-            }
-            let source =
-                bc_pathjail::confine(root, &evidence.file).ok_or("expectation outside root")?;
-            if std::fs::metadata(&source).map_err(crate::stringify)?.len() > 800_000 {
-                return Err("expectation file too large".into());
-            }
-            let text = std::fs::read_to_string(source).map_err(crate::stringify)?;
-            if text
-                .lines()
-                .nth(evidence.line - 1)
-                .is_none_or(|l| !l.contains(&evidence.snippet))
-            {
-                return Err(format!(
-                    "unsupported expectation citation: {}:{}",
-                    evidence.file, evidence.line
-                ));
-            }
+            check_citation(root, evidence)?;
         }
+    }
+    Ok(())
+}
+
+/// A citation names an existing, bounded repository file whose cited line
+/// contains the exact snippet. Shared by test expectations and the API
+/// specification step's route inventory.
+fn check_citation(root: &Path, evidence: &ContractEvidence) -> Result<(), String> {
+    if !safe_relative(&evidence.file) || evidence.line == 0 || evidence.snippet.trim().is_empty() {
+        return Err("invalid expectation citation".into());
+    }
+    let source = bc_pathjail::confine(root, &evidence.file).ok_or("expectation outside root")?;
+    if std::fs::metadata(&source).map_err(crate::stringify)?.len() > 800_000 {
+        return Err("expectation file too large".into());
+    }
+    let text = std::fs::read_to_string(source).map_err(crate::stringify)?;
+    if text
+        .lines()
+        .nth(evidence.line - 1)
+        .is_none_or(|l| !l.contains(&evidence.snippet))
+    {
+        return Err(format!(
+            "unsupported expectation citation: {}:{}",
+            evidence.file, evidence.line
+        ));
     }
     Ok(())
 }
@@ -657,6 +681,7 @@ pub async fn prepare(
         resolved_execution_policies: Vec::new(),
         generator_model: config.generator_model.clone().unwrap_or_else(|| model.into()),
         reviewer_model: config.reviewer_model.clone().unwrap_or_else(|| model.into()),
+        api_spec: api_spec::ApiSpecReport::default(),
         approved_bytes: BTreeMap::new(),
         dependencies: DependencyStore::create()?,
     };
@@ -691,21 +716,45 @@ pub async fn prepare(
         assurance.remaining_gaps.push("Execution not authorized: existing baseline, security reproduction and postpatch checks are not run.".into());
     }
     if !config.generate {
+        api_spec::skip(
+            &mut assurance.api_spec,
+            "the selected testing profile does not generate tests or specifications",
+        );
         run_phase(root, &mut assurance, "generated_baseline").await;
         return Ok(assurance);
     }
     assurance.generation_state = "requested".into();
+    let run_generated_baseline =
+        generate_tests(root, config, llm, findings, &mut assurance).await?;
+    // Alongside test generation and before S10, so a specification rides
+    // the same snapshot, review discipline and delivery as the tests.
+    api_spec::run(root, config, llm, &mut assurance).await?;
+    if run_generated_baseline {
+        run_phase(root, &mut assurance, "generated_baseline").await;
+    }
+    Ok(assurance)
+}
+
+/// Generate, review and apply target tests. Returns whether the generated
+/// baseline should run: a blocked generation never reaches it.
+async fn generate_tests(
+    root: &Path,
+    config: &TargetTestingConfig,
+    llm: &dyn LlmClient,
+    findings: &str,
+    assurance: &mut Assurance,
+) -> Result<bool, String> {
     let batches = match plan_batches(findings) {
         Ok(batches) => batches,
         Err(e) => {
             assurance.generation_state = "blocked".into();
             assurance.remaining_gaps.push(e);
-            return Ok(assurance);
+            return Ok(false);
         }
     };
     let tools = SandboxTools::new(root.to_path_buf());
     let approved_commands = bc_redact::redact(
-        &serde_json::to_string(&execution_policies(&assurance)).map_err(crate::stringify)?,
+        &serde_json::to_string(&execution_policies(assurance)).map_err(crate::stringify)?,
     );
     let base = format!(
         "{}\nSelected testing level: {}\nExisting test evidence (untrusted, bounded):\n{}",
@@ -789,7 +838,7 @@ pub async fn prepare(
     if let Some(e) = blocked {
         assurance.generation_state = "blocked".into();
         assurance.remaining_gaps.push(e);
-        return Ok(assurance);
+        return Ok(false);
     }
     assurance.generation_state = "generated".into();
     assurance
@@ -800,7 +849,7 @@ pub async fn prepare(
         if assurance.approved_bytes.is_empty() {
             assurance.generation_state = "blocked".into();
             assurance.remaining_gaps.push("No discovered existing test evidence supports a no-addition proposal; inspect inline or undiscovered tests and resolve the coverage plan before export.".into());
-            return Ok(assurance);
+            return Ok(false);
         }
     }
     if batches.len() > 1 {
@@ -909,8 +958,7 @@ pub async fn prepare(
             execution_state: "not_individually_verified".into(),
         })
         .collect();
-    run_phase(root, &mut assurance, "generated_baseline").await;
-    Ok(assurance)
+    Ok(true)
 }
 
 /// Run one phase for every approved policy, refusing any whose dependencies
@@ -992,7 +1040,7 @@ fn execution_policies(assurance: &Assurance) -> Vec<ContainerPolicy> {
 fn classify_execution(assurance: &mut Assurance) {
     let policies = execution_policies(assurance);
     // An environment failure is never evidence about a fix, so record it
-    // separately from every judgement made below.
+    // separately from every judgment made below.
     assurance.environment_blocked = assurance
         .execution
         .iter()
@@ -1117,6 +1165,7 @@ pub fn remediation_context(assurance: &Assurance) -> String {
             result.phase, result.command_id, result.state
         ));
     }
+    context.push_str(&api_spec::remediation_context(&assurance.api_spec));
     context.push_str("These facts report only the listed scope. Do not claim tests were run when no execution result exists. An EnvironmentFailed result means the dependencies could not be installed and the command was not run; it is not a failing test and says nothing about the code. Preserve existing and independently generated test assertions.\n");
     context
 }
@@ -1143,10 +1192,11 @@ pub fn annotate_outputs(repo: &Path, markdown: &Path, sarif: &Path) -> Result<()
         "review":evidence["review_state"], "export_blocked":evidence["export_blocked"],
         "environment_blocked":evidence["environment_blocked"],
         "execution_results":evidence["execution"].as_array().map_or(0, Vec::len),
+        "api_specification":evidence["api_spec"]["state"],
         "scope":"Configured checks only; inspect security-scan/target-tests.json for coverage gaps and baseline/postpatch evidence"
     });
     if let Ok(mut text) = std::fs::read_to_string(markdown) {
-        text.push_str(&format!("\n## Target repository testing\n\nRequested testing level: {}. Assurance: {}. Generation: {}. Review: {}.\n\nExecution results recorded: {}. These are scoped checks, not proof of complete coverage.\nSee `security-scan/target-tests.json` for individual results and remaining gaps.\n", summary["testing_level"], summary["status"], summary["generation"], summary["review"], summary["execution_results"]));
+        text.push_str(&format!("\n## Target repository testing\n\nRequested testing level: {}. Assurance: {}. Generation: {}. Review: {}.\n\nExecution results recorded: {}. API specification: {}. These are scoped checks, not proof of complete coverage.\nSee `security-scan/target-tests.json` for individual results and remaining gaps.\n", summary["testing_level"], summary["status"], summary["generation"], summary["review"], summary["execution_results"], summary["api_specification"]));
         std::fs::write(markdown, text).map_err(crate::stringify)?;
     }
     if let Ok(raw) = std::fs::read(sarif) {
@@ -2652,19 +2702,22 @@ mod validation_and_artifact_tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_unreadable_contract_file_is_not_treated_as_supporting_evidence() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = contract_root();
-        let readme = root.path().join("README.md");
-        std::fs::set_permissions(&readme, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The cited contract file is a regular file nobody can open for
+        // reading (a chmod 000 file would not stop root). Its directory
+        // stands in for the target root, so the citation is in the jail
+        // and passes the size pre-check before the read is refused.
+        let unreadable = Path::new(crate::test_support::UNREADABLE_FILE);
+        let mut proposal = one(proposed("tests/test_auth.py", TestKind::Unit));
+        proposal.files[0].expectations[0].file =
+            unreadable.file_name().unwrap().to_string_lossy().into();
         let outcome = validate_proposal(
-            root.path(),
+            unreadable.parent().unwrap(),
             &TargetTestingConfig::default(),
-            &one(proposed("tests/test_auth.py", TestKind::Unit)),
+            &proposal,
         );
-        std::fs::set_permissions(&readme, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(outcome.unwrap_err().contains("Permission denied"));
     }
 
@@ -2907,49 +2960,84 @@ mod validation_and_artifact_tests {
     #[tokio::test]
     async fn an_unreadable_destination_stops_generation_before_any_test_is_applied() {
         use std::os::unix::fs::PermissionsExt;
-        let root = contract_root();
-        std::fs::create_dir(root.path().join("tests")).unwrap();
-        let target = root.path().join("tests/test_auth.py");
-        std::fs::write(&target, "def test_owner_can_read():\n    assert True\n").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Only a permission bit can make an existing test inside the target
+        // unreadable, and root ignores it, so this runs only where
+        // permissions are enforced. For root,
+        // `an_existing_test_that_cannot_be_inspected_stops_preparation_before_generation`
+        // covers the same refusal to go on without the existing test's
+        // baseline, and
+        // `an_accepted_test_whose_destination_is_a_directory_is_reported_not_clobbered`
+        // the refusal to apply over a destination that cannot be read.
+        if crate::test_support::permissions_enforced(
+            "an_unreadable_destination_stops_generation_before_any_test_is_applied",
+        ) {
+            let root = contract_root();
+            std::fs::create_dir(root.path().join("tests")).unwrap();
+            let target = root.path().join("tests/test_auth.py");
+            std::fs::write(&target, "def test_owner_can_read():\n    assert True\n").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let config = TargetTestingConfig {
+                generate: true,
+                ..Default::default()
+            };
+            let outcome = prepare(
+                root.path(),
+                &config,
+                "fake",
+                &replies(&[
+                    &proposal_for("tests/test_auth.py", "assert True\n"),
+                    &accepted_review(),
+                ]),
+                "finding",
+            )
+            .await;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(outcome.unwrap_err().contains("Permission denied"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_existing_test_that_cannot_be_inspected_stops_preparation_before_generation() {
+        // Discovery lists an existing test whose full path exceeds
+        // `PATH_MAX`, so its baseline cannot be captured by any user, root
+        // included. Preparation must stop there: no model is consulted
+        // (the scripted client has no replies) and nothing is written.
+        let base = tempfile::tempdir().unwrap();
+        let staged = base.path().join("staged");
+        std::fs::create_dir_all(staged.join("tests")).unwrap();
+        std::fs::write(staged.join("README.md"), "Only owners may read records.\n").unwrap();
+        let name = format!("test_{}.py", "a".repeat(120));
+        std::fs::write(staged.join("tests").join(&name), "assert True\n").unwrap();
+        let root = crate::test_support::bury_near_path_max(&staged);
         let config = TargetTestingConfig {
             generate: true,
             ..Default::default()
         };
-        let outcome = prepare(
-            root.path(),
-            &config,
-            "fake",
-            &replies(&[
-                &proposal_for("tests/test_auth.py", "assert True\n"),
-                &accepted_review(),
-            ]),
-            "finding",
-        )
-        .await;
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(outcome.unwrap_err().contains("Permission denied"));
+        let outcome = prepare(root.as_path(), &config, "fake", &replies(&[]), "finding").await;
+        let unreachable = root.join("tests").join(&name);
+        let expected = std::fs::metadata(&unreachable).unwrap_err().to_string();
+        assert_eq!(outcome.unwrap_err(), expected);
+        assert_eq!(std::fs::read_dir(root.join("tests")).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_test_write_rolls_every_earlier_file_back_to_its_original_bytes() {
-        use std::os::unix::fs::PermissionsExt;
+        // The third file's parent is the second file, which the batch has
+        // just created, so the third write fails (ENOTDIR) for every user.
+        // A read-only directory would not stop root. Everything written
+        // before it must be put back: the edited test restored, the new
+        // one removed.
         let root = contract_root();
         std::fs::create_dir(root.path().join("tests")).unwrap();
         let original = "def test_owner_can_read():\n    assert True\n";
         std::fs::write(root.path().join("tests/test_auth.py"), original).unwrap();
-        let blocked = root.path().join("blocked");
-        std::fs::create_dir(&blocked).unwrap();
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555)).unwrap();
         let proposal = serde_json::json!({
             "files": [
-                {"path": "tests/test_auth.py", "content": "assert False is False\n", "kind": "unit",
-                 "behavior": "denies a non-owner",
-                 "expectations": [{"file": "README.md", "line": 1, "snippet": "Only owners"}]},
-                {"path": "blocked/test_denied.py", "content": "assert True\n", "kind": "unit",
-                 "behavior": "denies a non-owner",
-                 "expectations": [{"file": "README.md", "line": 1, "snippet": "Only owners"}]}
+                proposed_file("tests/test_auth.py"),
+                proposed_file("tests/test_new.py"),
+                proposed_file("tests/test_new.py/test_denied.py")
             ], "remaining_gaps": []
         })
         .to_string();
@@ -2965,24 +3053,39 @@ mod validation_and_artifact_tests {
             "finding",
         )
         .await;
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(outcome.unwrap_err().contains("test write failed"));
         assert_eq!(
             std::fs::read_to_string(root.path().join("tests/test_auth.py")).unwrap(),
             original
         );
-        assert!(!blocked.join("test_denied.py").exists());
+        assert!(!root.path().join("tests/test_new.py").exists());
+    }
+
+    /// One proposed unit test at `path`, citing the contract README.
+    fn proposed_file(path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "path": path, "content": "assert False is False\n", "kind": "unit",
+            "behavior": "denies a non-owner",
+            "expectations": [{"file": "README.md", "line": 1, "snippet": "Only owners"}]
+        })
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn a_rollback_that_cannot_restore_a_test_reports_that_distinctly() {
-        use std::os::unix::fs::PermissionsExt;
+        // The first file creates `tests/test_new.py/` as a directory, so the
+        // second file (that very path) cannot be written, and the rollback
+        // cannot remove the directory with `remove_file`: both fail for
+        // every user. A read-only file would not stop root.
         let root = contract_root();
         std::fs::create_dir(root.path().join("tests")).unwrap();
-        let target = root.path().join("tests/test_auth.py");
-        std::fs::write(&target, "def test_owner_can_read():\n    assert True\n").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let proposal = serde_json::json!({
+            "files": [
+                proposed_file("tests/test_new.py/test_inner.py"),
+                proposed_file("tests/test_new.py")
+            ], "remaining_gaps": []
+        })
+        .to_string();
         let config = TargetTestingConfig {
             generate: true,
             ..Default::default()
@@ -2991,14 +3094,10 @@ mod validation_and_artifact_tests {
             root.path(),
             &config,
             "fake",
-            &replies(&[
-                &proposal_for("tests/test_auth.py", "assert False is False\n"),
-                &accepted_review(),
-            ]),
+            &replies(&[&proposal, &accepted_review()]),
             "finding",
         )
         .await;
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
         let error = outcome.unwrap_err();
         assert!(error.contains("test apply and rollback failed"), "{error}");
     }
@@ -3149,16 +3248,18 @@ mod validation_and_artifact_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn an_unwritable_evidence_path_is_reported_instead_of_dropped() {
-        use std::os::unix::fs::PermissionsExt;
+        // Both failures hold for every user, where a read-only directory
+        // would not stop root: the parent path is a regular file, so the
+        // directory cannot be created, and the artifact path is an
+        // existing directory, so the file cannot be written.
         let assurance = empty_assurance().await;
         let root = tempfile::tempdir().unwrap();
         let locked = root.path().join("locked");
-        std::fs::create_dir(&locked).unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::write(&locked, "not a directory").unwrap();
         let blocked_dir = write_artifact(&locked.join("nested/target-tests.json"), &assurance);
-        let existing = locked.join("target-tests.json");
+        let existing = root.path().join("target-tests.json");
+        std::fs::create_dir(&existing).unwrap();
         let blocked_file = write_artifact(&existing, &assurance);
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(blocked_dir.is_err());
         assert!(blocked_file.is_err());
 
@@ -3221,14 +3322,15 @@ mod validation_and_artifact_tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_or_malformed_artifact_fails_the_annotation_rather_than_being_skipped() {
-        use std::os::unix::fs::PermissionsExt;
+        // An artifact path that exists but cannot be read (a directory,
+        // which fails for every user; a chmod 000 file would not stop
+        // root) is an error, never the "no artifact" no-op.
         let reports = Reports::new();
-        reports.artifact(assurance_json().as_str());
         let path = reports.repo.path().join("security-scan/target-tests.json");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let unreadable = reports.annotate();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(unreadable.is_err());
+        std::fs::create_dir(&path).unwrap();
+        let expected = std::fs::read(&path).unwrap_err().to_string();
+        assert_eq!(reports.annotate().unwrap_err(), expected);
+        std::fs::remove_dir(&path).unwrap();
 
         reports.artifact("{not json");
         assert!(reports.annotate().is_err());
@@ -3262,22 +3364,37 @@ mod validation_and_artifact_tests {
         use std::os::unix::fs::PermissionsExt;
         let reports = Reports::new();
         reports.artifact(assurance_json().as_str());
-        std::fs::write(reports.markdown(), "# Report\n").unwrap();
-        std::fs::set_permissions(reports.markdown(), std::fs::Permissions::from_mode(0o444))
-            .unwrap();
-        let markdown_blocked = reports.annotate();
-        std::fs::set_permissions(reports.markdown(), std::fs::Permissions::from_mode(0o644))
-            .unwrap();
-        assert!(markdown_blocked.is_err());
+        // A Markdown report that reads fine but cannot be written back:
+        // `/proc/self/status` refuses the open for a user and the write
+        // for root, which a read-only file would not stop.
+        #[cfg(target_os = "linux")]
+        {
+            let markdown_blocked = annotate_outputs(
+                reports.repo.path(),
+                Path::new("/proc/self/status"),
+                &reports.sarif(),
+            );
+            assert!(markdown_blocked.is_err());
+        }
 
+        std::fs::write(reports.markdown(), "# Report\n").unwrap();
         std::fs::write(reports.sarif(), "not json").unwrap();
         assert!(reports.annotate().is_err());
 
-        std::fs::write(reports.sarif(), r#"{"runs":[{}]}"#).unwrap();
-        std::fs::set_permissions(reports.sarif(), std::fs::Permissions::from_mode(0o444)).unwrap();
-        let sarif_blocked = reports.annotate();
-        std::fs::set_permissions(reports.sarif(), std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(sarif_blocked.is_err());
+        // A SARIF report must also parse as JSON before the write is
+        // attempted, and there is no JSON file root is unable to write,
+        // so this part runs only where a read-only file is enforced.
+        if crate::test_support::permissions_enforced(
+            "an_unwritable_report_stops_the_annotation_instead_of_reporting_success (SARIF)",
+        ) {
+            std::fs::write(reports.sarif(), r#"{"runs":[{}]}"#).unwrap();
+            std::fs::set_permissions(reports.sarif(), std::fs::Permissions::from_mode(0o444))
+                .unwrap();
+            let sarif_blocked = reports.annotate();
+            std::fs::set_permissions(reports.sarif(), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            assert!(sarif_blocked.is_err());
+        }
     }
 
     #[test]

@@ -28,7 +28,7 @@ pub struct SseDecoder {
     partial: Vec<u8>,
     /// `data:` lines of the event currently being accumulated. The SSE
     /// spec allows several per event, joined by newlines — neither
-    /// dialect sends more than one, but honouring it costs nothing and
+    /// dialect sends more than one, but honoring it costs nothing and
     /// silently dropping the tail would be a corrupt payload.
     data: Vec<String>,
 }

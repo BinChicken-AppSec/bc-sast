@@ -33,8 +33,21 @@ jobs:
     name: fmt + clippy + test + 100% coverage gate
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # This job builds the whole workspace twice (plain, then instrumented
+      # for coverage). With full debug info that outgrew the runner's disk
+      # once the workspace reached 1.1.0: the runner vanished mid-step with
+      # no log. Line tables keep backtraces readable, and coverage
+      # instrumentation needs no debug info at all.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Preinstalled SDKs this job never uses, removed for the same reason.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Install Rust toolchain (per rust-toolchain.toml)
         run: rustup show
@@ -66,6 +79,7 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: cargo llvm-cov (100% lines/functions gate, everything but bc-cli)
+        id: workspace-coverage
         # Every crate excluded below (and the one file-level exclusion,
         # `bc-interactive/src/blocking_io.rs`) has its full rationale
         # (tool artifact vs. genuinely-unreachable defensive branch,
@@ -77,6 +91,20 @@ jobs:
             --ignore-filename-regex 'bc-interactive/src/blocking_io\.rs' \
             --fail-under-lines 100 --fail-under-functions 100 \
             --lcov --output-path lcov-workspace.info
+
+      - name: Show what the workspace coverage gate missed
+        # The gate writes lcov only, so a failure there names no file or
+        # line. Report the same run's data, ignoring the crates the gate
+        # excludes: the total, every uncovered line, and the start of every
+        # function that never ran (which --show-missing-lines omits when
+        # its lines are shared with code that did run).
+        if: failure() && steps.workspace-coverage.outcome == 'failure'
+        run: |
+          IGNORE='crates/(bc-cli|bc-checkpoint|bc-callgraph|bc-repo-analysis|bc-stage-s0|bc-stage-s1|bc-validation-scoring|bc-thirdparty-api|bc-diffcapture|bc-sandbox-tools|bc-orchestrator|bc-parity-tests)/|bc-interactive/src/blocking_io\.rs'
+          cargo llvm-cov report --summary-only --show-missing-lines --ignore-filename-regex "$IGNORE" \
+            | sed -n '/^TOTAL/p;/Uncovered Lines/,$p'
+          cargo llvm-cov report --json --output-path coverage-workspace.json --ignore-filename-regex "$IGNORE"
+          python3 scripts/coverage_gaps.py coverage-workspace.json
 
       - name: cargo llvm-cov (bc-cli, ~99.7% functions, ~99.4% lines)
         # Full rationale: docs/coverage-exceptions.md#bc-cli.
@@ -156,6 +184,10 @@ jobs:
             --fail-under-lines 99.9 --fail-under-functions 99.4 \
             --lcov --output-path lcov-bc-orchestrator.info
 
+      - name: Disk usage at the end of the job
+        if: always()
+        run: df -h / && du -sh target 2>/dev/null || true
+
       - name: Upload coverage artifact
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -198,7 +230,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: visa/visa-vulnerability-agentic-harness
-          ref: 3d972f679d8f5e3838b394edee0b5ea9c626b0fb
+          ref: 287e735b182b11ecdf8de7422b4e70d6ad8bc03a # v1.4.0
           path: vvaharness
 
       - name: Install Rust toolchain (per rust-toolchain.toml)
@@ -225,6 +257,11 @@ jobs:
           BC_PARITY_PYTHON: ${{ github.workspace }}/parity/.venv/bin/python3
           BC_PARITY_REPO: ${{ github.workspace }}/vvaharness
         run: |
+          # pipefail because the default shell for a `run:` step is `bash -e`
+          # without it: piping into tee would otherwise make this step report
+          # tee's exit status, so a genuinely failing parity test passed CI and
+          # only a SKIPPED note could fail the job.
+          set -o pipefail
           cargo test -p bc-parity-tests -- --nocapture 2>&1 | tee parity-output.log
           if grep -q "SKIPPED:" parity-output.log; then
             echo "::error::parity tests were skipped despite this job setting up the venv/repo explicitly. See the SKIPPED note above for which one failed to resolve"

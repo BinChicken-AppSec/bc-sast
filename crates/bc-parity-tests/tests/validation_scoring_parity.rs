@@ -16,6 +16,36 @@ mod support;
 
 use bc_validation_scoring::{derive_merge_readiness, score_fix, GateName, GateResult, GateStatus};
 
+/// This port and upstream name the same four outcomes differently: ours are
+/// report labels (`Fixed`, `UNVERIFIABLE`), upstream's v1.4.0 `Decision` are
+/// wire identifiers (`fixed`, `inconclusive`). Neither spelling is wrong, so
+/// the comparison happens in upstream's space and this table is the only
+/// place the difference lives. A new variant on either side fails to compile
+/// or fails the match rather than silently comparing unequal strings.
+fn upstream_decision(verdict: bc_validation_scoring::FixVerdict) -> &'static str {
+    use bc_validation_scoring::FixVerdict;
+    match verdict {
+        FixVerdict::Fixed => "fixed",
+        FixVerdict::PartiallyFixed => "partially_fixed",
+        FixVerdict::NotFixed => "not_fixed",
+        // Upstream renamed this outcome to `inconclusive` in v1.4.0; the
+        // report label here stays `UNVERIFIABLE`, which is what operators
+        // and the SARIF output already say.
+        FixVerdict::Unverifiable => "inconclusive",
+    }
+}
+
+/// The same translation for `MergeReadiness`, whose upstream values became
+/// snake_case identifiers in v1.4.0 where v1.2.0 rendered display strings.
+fn upstream_readiness(readiness: bc_validation_scoring::MergeReadiness) -> &'static str {
+    use bc_validation_scoring::MergeReadiness;
+    match readiness {
+        MergeReadiness::Ready => "ready",
+        MergeReadiness::ReadyWithConditions => "ready_with_conditions",
+        MergeReadiness::NotReady => "not_ready",
+    }
+}
+
 const STATUSES: [&str; 5] = ["pass", "partial", "fail", "skip", "invalid"];
 const GATE_NAMES: [&str; 4] = [
     "root_cause",
@@ -116,20 +146,20 @@ fn score_fix_matches_the_python_scoring_cli_across_every_gate_status_combination
     for (i, combo) in combos.iter().enumerate() {
         let gates = build_gates(*combo);
         let score = score_fix(&gates);
-        let readiness = derive_merge_readiness(score.fix_status).as_str();
+        let verdict = upstream_decision(score.fix_status);
+        let readiness = upstream_readiness(derive_merge_readiness(score.fix_status));
 
         let py_entry = &out_findings[i];
-        let py_status = py_entry.get("fix_status").unwrap().as_str().unwrap();
+        let py_decision = py_entry.get("decision").unwrap().as_str().unwrap();
         let py_score = py_entry.get("raw_score").unwrap().as_f64().unwrap();
         let py_readiness = py_entry.get("merge_readiness").unwrap().as_str().unwrap();
 
-        let matches = score.fix_status.as_str() == py_status
+        let matches = verdict == py_decision
             && (score.raw_score - py_score).abs() < 1e-9
             && readiness == py_readiness;
         if !matches {
             mismatches.push(format!(
-                "combo {combo:?}: rust=({}, {}, {readiness}) python=({py_status}, {py_score}, {py_readiness})",
-                score.fix_status.as_str(),
+                "combo {combo:?}: rust=({verdict}, {}, {readiness}) python=({py_decision}, {py_score}, {py_readiness})",
                 score.raw_score,
             ));
         }
@@ -155,8 +185,8 @@ fn score_fix_matches_the_python_scoring_cli_across_every_gate_status_combination
     let missing_score = score_fix(&missing_gates);
     let py_missing = &out_findings[combos.len()];
     assert_eq!(
-        missing_score.fix_status.as_str(),
-        py_missing.get("fix_status").unwrap().as_str().unwrap(),
+        upstream_decision(missing_score.fix_status),
+        py_missing.get("decision").unwrap().as_str().unwrap(),
         "missing-gate case"
     );
     assert_eq!(
@@ -175,8 +205,8 @@ fn score_fix_matches_the_python_scoring_cli_across_every_gate_status_combination
     let duplicate_score = score_fix(&duplicate_gates);
     let py_duplicate = &out_findings[combos.len() + 1];
     assert_eq!(
-        duplicate_score.fix_status.as_str(),
-        py_duplicate.get("fix_status").unwrap().as_str().unwrap(),
+        upstream_decision(duplicate_score.fix_status),
+        py_duplicate.get("decision").unwrap().as_str().unwrap(),
         "duplicate-gate case"
     );
     assert_eq!(

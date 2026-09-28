@@ -31,7 +31,7 @@ pub fn count_chars(p: &Path) -> i64 {
 /// from an LLM-authored chunk/group's file list, so a `../../etc/passwd`
 /// entry must size to `0` (the same value a genuinely missing file gets),
 /// never actually stat outside the repo (CWE-22).
-fn confined_loc(repo_root: &Path, rel: &str) -> i64 {
+pub(crate) fn confined_loc(repo_root: &Path, rel: &str) -> i64 {
     bc_pathjail::confine(repo_root, rel)
         .map(|p| count_loc(&p))
         .unwrap_or(0)
@@ -143,7 +143,7 @@ struct Acc {
 ///
 /// Merging is ADJACENT-only, deliberately: the group order coming out of
 /// [`cohesive_groups`] keeps call-graph components and directory siblings
-/// next to each other, so a greedy fold over neighbours preserves that
+/// next to each other, so a greedy fold over neighbors preserves that
 /// locality. Grouping keeps deciding WHICH files sit together, and the
 /// caps alone decide HOW MANY buckets that takes. Reordering buckets to
 /// bin-pack tighter would trade that locality for a marginal count win.
@@ -214,10 +214,17 @@ fn coalesce_underfilled(
         .collect()
 }
 
-/// Re-pack any chunk (LLM-risk or taint) whose LOC/chars/file-count
-/// exceeds the configured caps into `chunk-NN-a`, `chunk-NN-b`, … —
-/// everything else on the chunk (risk_rank, hypothesis, related_cves,
-/// threat_id, focus_entry_points) is preserved on every sub-chunk.
+/// Re-pack any LLM risk chunk whose LOC/chars/file-count exceeds the
+/// configured caps into `chunk-NN-a`, `chunk-NN-b`, and so on. Everything else on
+/// the chunk (risk_rank, hypothesis, related_cves, threat_id,
+/// focus_entry_points) is preserved on every sub-chunk.
+///
+/// `taint-` chunks are exempt (upstream v1.3). Their `source_ref`/
+/// `sink_ref`/`path_funcs` name ONE specific entry-to-sink pair, and the
+/// generic cohesion splitter would copy that metadata onto shards holding
+/// neither the source nor the sink file, telling S4 the wrong thing. An
+/// oversize taint chunk stays whole; S4's sliding-window and function-slice
+/// loaders are what handle its size.
 pub fn split_oversize_risk_chunks(
     manifest_chunks: Vec<Chunk>,
     ctx: &ContextPackage,
@@ -233,6 +240,10 @@ pub fn split_oversize_risk_chunks(
 
     let mut out = Vec::new();
     for mut c in manifest_chunks {
+        if c.id.starts_with("taint-") {
+            out.push(c);
+            continue;
+        }
         let loc: i64 = c.files.iter().map(|f| confined_loc(repo_root, f)).sum();
         let fits = match char_cap {
             Some(cap) => {
@@ -246,7 +257,7 @@ pub fn split_oversize_risk_chunks(
             out.push(c);
             continue;
         }
-        let groups = cohesive_groups(&c.files, ctx);
+        let groups = cohesive_groups(&c.files, ctx, config.max_cohesion_groups());
         let buckets = pack(
             &groups,
             repo_root,
@@ -274,12 +285,13 @@ pub fn split_oversize_risk_chunks(
                 specialist: c.specialist.clone(),
                 // Ported from `c.model_copy(update={...})`: every field
                 // NOT explicitly overridden is copied from the original
-                // chunk verbatim — a taint chunk's structured metadata
-                // survives an oversize split onto each of its pieces.
+                // chunk verbatim. Taint chunks never reach this point (see
+                // above), so these are empty for an LLM chunk in practice.
                 path_funcs: c.path_funcs.clone(),
                 source_ref: c.source_ref.clone(),
                 sink_ref: c.sink_ref.clone(),
                 sink_cwe: c.sink_cwe.clone(),
+                shard_id: String::new(),
             });
         }
     }
@@ -553,7 +565,7 @@ mod tests {
 
         let buckets = pack(&groups, dir.path(), 100, 100, None, true);
 
-        // The oversize file neither absorbs a neighbour nor merges forward
+        // The oversize file neither absorbs a neighbor nor merges forward
         // — and because merging is ADJACENT-only, a.py and b.py (separated
         // by it) stay apart too, even though their union would fit the cap.
         let file_sets: Vec<Vec<String>> = buckets.iter().map(|(_, bf, _)| bf.clone()).collect();
@@ -638,6 +650,7 @@ mod tests {
             source_ref: String::new(),
             sink_ref: String::new(),
             sink_cwe: Vec::new(),
+            shard_id: String::new(),
         }
     }
 
@@ -690,11 +703,29 @@ mod tests {
     }
 
     #[test]
-    fn split_oversize_risk_chunks_preserves_taint_metadata_on_every_piece() {
-        // Ported from `c.model_copy(update={...})`'s full-field-copy
-        // semantics: a taint chunk's `path_funcs`/`source_ref`/
-        // `sink_ref`/`sink_cwe` must survive an oversize split onto
-        // EVERY resulting sub-chunk, not just the first.
+    fn split_oversize_risk_chunks_never_splits_a_taint_chunk() {
+        // A taint chunk's `path_funcs`/`source_ref`/`sink_ref`/`sink_cwe`
+        // name one entry-to-sink pair. Splitting it would copy that onto a
+        // shard holding neither end, so it passes through whole, however
+        // far over the caps it is (upstream v1.3).
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.py", 10);
+        write(dir.path(), "b.py", 10);
+        let ctx = ctx_with_root(dir.path());
+        let mut cfg = Step3Config::new("m");
+        cfg.risk_chunk_loc = 8;
+        cfg.max_files_per_chunk = 1;
+        let mut taint_chunk = chunk("taint-01", vec!["a.py", "b.py"], 1);
+        taint_chunk.path_funcs = vec!["a.py::f".to_string(), "b.py::g".to_string()];
+        taint_chunk.source_ref = "a.py::f".to_string();
+        taint_chunk.sink_ref = "b.py:5".to_string();
+        taint_chunk.sink_cwe = vec!["CWE-89".to_string()];
+        let out = split_oversize_risk_chunks(vec![taint_chunk.clone()], &ctx, &cfg);
+        assert_eq!(out, vec![taint_chunk]);
+    }
+
+    #[test]
+    fn split_oversize_risk_chunks_copies_every_field_onto_each_piece() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "a.py", 10);
         write(dir.path(), "b.py", 10);
@@ -702,20 +733,11 @@ mod tests {
         let mut cfg = Step3Config::new("m");
         cfg.risk_chunk_loc = 8;
         cfg.max_files_per_chunk = 25;
-        let mut taint_chunk = chunk("taint-01", vec!["a.py", "b.py"], 1);
-        taint_chunk.path_funcs = vec!["a.py::f".to_string(), "b.py::g".to_string()];
-        taint_chunk.source_ref = "a.py::f".to_string();
-        taint_chunk.sink_ref = "b.py:5".to_string();
-        taint_chunk.sink_cwe = vec!["CWE-89".to_string()];
-        let out = split_oversize_risk_chunks(vec![taint_chunk], &ctx, &cfg);
+        let mut risk = chunk("chunk-01", vec!["a.py", "b.py"], 1);
+        risk.sink_cwe = vec!["CWE-89".to_string()];
+        let out = split_oversize_risk_chunks(vec![risk], &ctx, &cfg);
         assert_eq!(out.len(), 2);
         for c in &out {
-            assert_eq!(
-                c.path_funcs,
-                vec!["a.py::f".to_string(), "b.py::g".to_string()]
-            );
-            assert_eq!(c.source_ref, "a.py::f");
-            assert_eq!(c.sink_ref, "b.py:5");
             assert_eq!(c.sink_cwe, vec!["CWE-89".to_string()]);
         }
     }
