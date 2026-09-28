@@ -25,6 +25,7 @@
 //! across every stage) with no home in a Tier-4 stage crate yet — nothing
 //! else in this port has that plumbing either.
 
+mod degrade;
 mod hydrate;
 mod prompts;
 mod severity;
@@ -69,6 +70,16 @@ pub struct Step8Config {
     /// that field). `None` (the default) sends no seed. Net-new versus
     /// Python.
     pub seed: Option<u64>,
+    /// Reasoning-effort tier for this stage's calls (the Python
+    /// original's `models.<role>.effort`, else `--reasoning-effort`),
+    /// forwarded to [`bc_llm_client::ChatRequest::reasoning_effort`].
+    /// `None` (the default) sends none, leaving the provider's default.
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+    /// Per-role OpenAI transport pin (Python's
+    /// `models.<role>.use_responses_api`), forwarded to
+    /// [`bc_llm_client::ChatRequest::openai_api`]. `None` (the default)
+    /// keeps the client-wide `--openai-api` choice.
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
     /// Per-call wall-clock deadline in seconds, overriding the shared
     /// gateway client's own 300 s default. Ported from `step8.timeout`
     /// (`_STEP_DEFAULTS`' `3600`, matched by every shipped profile) — a
@@ -89,6 +100,8 @@ impl Step8Config {
             temperature: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
+            openai_api: None,
             timeout_secs: Some(3600),
         }
     }
@@ -110,11 +123,19 @@ pub struct Step8Input {
 /// Python original's belt-and-suspenders `isinstance(data, dict)` check
 /// (itself equally unreachable there, given the Python `extract_json` has
 /// the identical "object or array only" contract this was ported from).
-fn parse_chain_response(raw: &str) -> Result<serde_json::Value, String> {
+///
+/// The `bool` is true when the reply was a salvaged top-level chains array
+/// with no `ranked_findings` at all: the coverage check in [`run_chain`]
+/// must not report that working path as findings shipping unranked.
+fn parse_chain_response(raw: &str) -> Result<(serde_json::Value, bool), String> {
     let data = bc_json_repair::extract_json(raw).map_err(|e| e.to_string())?;
     match data {
-        serde_json::Value::Array(items) => hydrate::coerce_list_payload(&items),
-        other => Ok(other),
+        serde_json::Value::Array(items) => {
+            let obj = hydrate::coerce_list_payload(&items)?;
+            let chains_only = obj.get("ranked_findings").is_none();
+            Ok((obj, chains_only))
+        }
+        other => Ok((other, false)),
     }
 }
 
@@ -133,6 +154,18 @@ pub async fn run_chain(
     } = input;
 
     if findings.is_empty() {
+        let empty = degrade::scope_was_empty(metrics.as_ref());
+        let (summary, degraded_reason) = if empty {
+            (
+                degrade::EMPTY_SCOPE_SUMMARY.to_string(),
+                degrade::EMPTY_SCOPE_REASON.to_string(),
+            )
+        } else {
+            (
+                "No findings survived adversarial verification.".to_string(),
+                String::new(),
+            )
+        };
         return FinalReport {
             provider_ledger: Default::default(),
             repo_root: ctx.repo_root,
@@ -145,9 +178,9 @@ pub async fn run_chain(
             metrics,
             threat_model: None,
             app_profile: None,
-            summary: "No findings survived adversarial verification.".to_string(),
-            degraded: false,
-            degraded_reason: String::new(),
+            summary,
+            degraded: empty,
+            degraded_reason,
             unreachable_files: Vec::new(),
         };
     }
@@ -162,25 +195,35 @@ pub async fn run_chain(
         temperature: config.temperature,
         top_p: config.top_p,
         seed: config.seed,
+        reasoning_effort: config.reasoning_effort,
+        openai_api: config.openai_api,
         thinking_budget: None,
         betas: Vec::new(),
         json_mode: false,
         timeout: config.timeout_secs.map(std::time::Duration::from_secs),
         stream: false,
+        cache_key: Some("s8".to_string()),
+        ..ChatRequest::default()
     };
 
-    let response = match bc_llm_agentic::chat_with_retry(
-        client,
-        &request,
-        config.max_transient_retries,
-        config.retry_backoff_base,
-    )
-    .await
-    {
+    let response = match bc_llm_agentic::salvage_truncated(
+        bc_llm_agentic::chat_with_retry(
+            client,
+            &request,
+            config.max_transient_retries,
+            config.retry_backoff_base,
+        )
+        .await,
+        "s8",
+    ) {
         Ok(r) => r,
         Err(e) => {
+            // The summary ships in the customer report: never interpolate
+            // raw provider-error text (it may quote source or secrets).
+            let err = degrade::redacted_err(&e);
+            tracing::warn!("s8: chain LLM call failed ({err}); emitting unranked report");
             let summary = format!(
-                "Chain analysis call failed ({e}). {} verified findings reported unranked.",
+                "Chain analysis call failed ({err}). {} verified findings reported unranked.",
                 findings.len()
             );
             return hydrate::unranked_report(
@@ -194,11 +237,18 @@ pub async fn run_chain(
         }
     };
 
-    let data = match parse_chain_response(&response.text()) {
+    let raw = response.text();
+    let (data, chains_only_salvage) = match parse_chain_response(&raw) {
         Ok(v) => v,
         Err(e) => {
+            let err = degrade::redacted_err(&e);
+            let (head, tail) = degrade::redacted_head_tail(&raw);
+            tracing::warn!(
+                "s8: chain response not parseable ({err}); emitting unranked report. \
+                 raw[:500]={head:?} raw[-200:]={tail:?}"
+            );
             let summary = format!(
-                "Chain analysis failed to parse ({e}). {} verified findings reported unranked.",
+                "Chain analysis failed to parse ({err}). {} verified findings reported unranked.",
                 findings.len()
             );
             return hydrate::unranked_report(
@@ -220,10 +270,31 @@ pub async fn run_chain(
         raw_findings_count,
         metrics.clone(),
     ) {
-        Ok(report) => report,
+        Ok((report, covered)) => {
+            // Coverage, not emptiness: a reply can carry ranked_findings
+            // entries that every index filter discards (string index, out
+            // of range, repeat) and still leave every finding backfilled at
+            // INFO with `degraded` false. A salvaged chains-only array has
+            // no ranked_findings by design and stays quiet, or the warning
+            // would fire on working replies and desensitize operators.
+            if !chains_only_salvage && covered < findings.len() {
+                let (head, _) = degrade::redacted_head_tail(&raw);
+                // Computed outside the macro: tracing skips evaluating its
+                // arguments when no subscriber listens.
+                let total = findings.len();
+                let missing = total - covered;
+                tracing::warn!(
+                    "s8: chain pass ranked {covered}/{total} findings; {missing} ship unranked \
+                     (severity from CVSS only). raw[:500]={head:?}"
+                );
+            }
+            report
+        }
         Err(e) => {
+            let err = degrade::redacted_err(&e);
+            tracing::warn!("s8: chain hydration failed ({err}); emitting unranked report");
             let summary = format!(
-                "Chain analysis hydration failed ({e}). {} verified findings reported unranked.",
+                "Chain analysis hydration failed ({err}). {} verified findings reported unranked.",
                 findings.len()
             );
             hydrate::unranked_report(
@@ -720,6 +791,52 @@ mod tests {
         assert!(report.summary.contains("Chain analysis call failed"));
         assert!(report.summary.contains("provider down"));
         assert!(report.degraded);
+    }
+
+    #[tokio::test]
+    async fn zero_files_in_scope_is_a_degraded_empty_report_not_a_clean_one() {
+        let mut inp = input(Vec::new());
+        inp.metrics = Some(ScanMetrics::default());
+        let report = run_chain(&FailingClient, inp, &Step8Config::new("m")).await;
+        assert!(report.summary.starts_with("0 files analyzed"));
+        assert!(report.degraded);
+        assert_eq!(report.degraded_reason, degrade::EMPTY_SCOPE_REASON);
+
+        let mut inp = input(Vec::new());
+        inp.metrics = Some(ScanMetrics {
+            total_files_in_scope: 4,
+            ..ScanMetrics::default()
+        });
+        let report = run_chain(&FailingClient, inp, &Step8Config::new("m")).await;
+        assert!(report.summary.contains("No findings survived"));
+        assert!(!report.degraded);
+        assert!(report.degraded_reason.is_empty());
+    }
+
+    /// Provider error text that quotes a credential: the summary ships in
+    /// the customer report so it must come out redacted.
+    struct LeakyFailingClient;
+
+    #[async_trait]
+    impl LlmClient for LeakyFailingClient {
+        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            Err(LlmError::InvalidRequest {
+                message: format!("bad request near AKIA{}", "ABCDEFGHIJKLMNOP"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_error_text_is_redacted_in_the_delivered_summary() {
+        let report = run_chain(
+            &LeakyFailingClient,
+            input(vec![finding("A")]),
+            &Step8Config::new("m"),
+        )
+        .await;
+        assert!(report.degraded);
+        assert!(report.summary.contains("Chain analysis call failed"));
+        assert!(!report.summary.contains("AKIAABCDEFGHIJKLMNOP"));
     }
 
     #[tokio::test]

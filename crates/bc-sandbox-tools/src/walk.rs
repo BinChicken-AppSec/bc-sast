@@ -8,45 +8,112 @@ use std::path::{Path, PathBuf};
 /// Every file reachable via a glob `pattern` rooted at `root`, confined and
 /// sorted. Mirrors `root.glob(pattern)` filtered through `_jail` in the
 /// Python original.
+///
+/// Matched against the same no-follow walk as [`walk_jailed_files`]
+/// rather than through `glob::glob`, which expands `**` by following
+/// symlinked directories: a repository containing `ln -s . x` made a
+/// single `Glob("**/*.rs")` call enumerate every `x/x/x/...` path until
+/// `ELOOP`, exponentially with several such links. The walk starts at the
+/// pattern's literal leading directories (confined, so a `link/*` whose
+/// `link` points out of the repo finds nothing) and, when the pattern has
+/// no `**`, descends only as deep as the pattern can match.
 pub fn glob_jailed_files(root: &Path, pattern: &str) -> Vec<PathBuf> {
     let pattern = pattern.trim_start_matches(['/', '\\']);
-    let full_pattern = root.join(pattern);
-    let Some(full_pattern) = full_pattern.to_str() else {
+    let Ok(matcher) = glob::Pattern::new(pattern) else {
         return Vec::new();
     };
-    let Ok(entries) = glob::glob(full_pattern) else {
+    let components: Vec<&str> = pattern.split('/').collect();
+    let literal = components[..components.len() - 1]
+        .iter()
+        .take_while(|c| !c.contains(['*', '?', '[']))
+        .count();
+    let prefix = components[..literal].join("/");
+    let start = root.join(&prefix);
+    if !prefix.is_empty() && bc_pathjail::confine(root, &prefix).is_none() {
         return Vec::new();
+    }
+    let max_depth = (!pattern.contains("**")).then(|| components.len() - literal);
+    let options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
     };
-    let mut hits: Vec<PathBuf> = entries.flatten().filter(|p| jailed_file(root, p)).collect();
-    hits.sort();
-    hits
+    walk(root, &start, &|_| false, max_depth)
+        .into_iter()
+        .filter(|path| {
+            path.strip_prefix(root)
+                .is_ok_and(|rel| matcher.matches_path_with(rel, options))
+        })
+        .collect()
 }
 
 /// Every file under `dir` (which must itself be inside `root`), confined
 /// and sorted, walked recursively. Mirrors `dir.rglob("*")` filtered
-/// through `_jail` in the Python original.
+/// through `_jail` in the Python original, minus its one hazard: see
+/// [`walk_jailed_files_pruned`].
 pub fn walk_jailed_files(root: &Path, dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    walk_into(root, dir, &mut out);
-    out.sort();
-    out
+    walk_jailed_files_pruned(root, dir, &|_| false)
 }
 
-fn walk_into(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !jailed_file_or_dir(root, &path) {
+/// [`walk_jailed_files`], additionally never entering a directory whose
+/// bare name `prune` accepts, so an excluded `node_modules/` costs one
+/// `read_dir` entry rather than a walk of everything under it (ported from
+/// `validation/tools/_scope.py`'s in-place `dir_names[:]` filter).
+///
+/// **Symlinked directories are never entered**, the guarantee Python's
+/// `os.walk(followlinks=False)` gives. The walk this replaced asked
+/// `Path::is_dir`, which follows links, so a repository containing
+/// `loop -> .` recursed until the path hit `ELOOP`, and several such links
+/// made that exponential: a denial of service any scanned checkout could
+/// trigger through a single `Grep` call. A symlinked FILE is still listed,
+/// but only when it resolves inside `root` (Python's
+/// `_escapes_workspace`), so a link to `/etc/shadow` never reaches a
+/// reader. A plain file needs no such check: it was reached without
+/// crossing a link, so it is inside `root` by construction.
+///
+/// Iterative rather than recursive, so a pathologically deep tree cannot
+/// exhaust the thread's stack either.
+pub(crate) fn walk_jailed_files_pruned(
+    root: &Path,
+    dir: &Path,
+    prune: &dyn Fn(&str) -> bool,
+) -> Vec<PathBuf> {
+    walk(root, dir, prune, None)
+}
+
+/// The walk itself. `max_depth` (when set) is the deepest level a file
+/// may sit at, counting a file directly in `dir` as level 1: directories
+/// that could only hold deeper files are not entered.
+fn walk(
+    root: &Path,
+    dir: &Path,
+    prune: &dyn Fn(&str) -> bool,
+    max_depth: Option<usize>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), 0usize)];
+    while let Some((current, level)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
             continue;
-        }
-        if path.is_dir() {
-            walk_into(root, &path, out);
-        } else if path.is_file() {
-            out.push(path);
+        };
+        // `DirEntry::file_type` does not follow symlinks. An entry whose
+        // type cannot be read is skipped, like an unreadable directory.
+        let typed = entries
+            .flatten()
+            .filter_map(|e| Some((e.file_type().ok()?, e.path(), e.file_name())));
+        for (kind, path, name) in typed {
+            if kind.is_dir() {
+                let deeper = max_depth.is_none_or(|max| level + 1 < max);
+                if deeper && !prune(&name.to_string_lossy()) {
+                    stack.push((path, level + 1));
+                }
+            } else if kind.is_file() || (kind.is_symlink() && jailed_file(root, &path)) {
+                out.push(path);
+            }
         }
     }
+    out.sort();
+    out
 }
 
 /// Re-confine `path` (already discovered on disk under `root`) against
@@ -55,10 +122,6 @@ fn walk_into(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
 /// discovered entry rather than trusting the walk/glob call alone.
 fn jailed_file(root: &Path, path: &Path) -> bool {
     path.is_file() && rel_confined(root, path)
-}
-
-fn jailed_file_or_dir(root: &Path, path: &Path) -> bool {
-    rel_confined(root, path)
 }
 
 fn rel_confined(root: &Path, path: &Path) -> bool {
@@ -159,6 +222,119 @@ mod tests {
             walk_jailed_files(&root, &root),
             vec![root.join("inside.txt")]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_jailed_files_never_descends_a_symlink_loop() {
+        // `ln -s . x` three times over: the old `is_dir`-following walk
+        // recursed through every combination until ELOOP.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(&root, "a.txt", "");
+        write(&root, "sub/b.txt", "");
+        for link in ["x", "y", "sub/z"] {
+            std::os::unix::fs::symlink(".", root.join(link)).unwrap();
+        }
+        std::os::unix::fs::symlink(&root, root.join("sub/back")).unwrap();
+        assert_eq!(
+            walk_jailed_files(&root, &root),
+            vec![root.join("a.txt"), root.join("sub/b.txt")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_jailed_files_does_not_enter_a_symlink_to_a_directory_outside_root() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let root = base.join("root");
+        write(&base, "outside/secret.txt", "");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(base.join("outside"), root.join("out")).unwrap();
+        std::os::unix::fs::symlink("/", root.join("slash")).unwrap();
+        assert!(walk_jailed_files(&root, &root).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_jailed_files_keeps_a_symlinked_file_that_stays_inside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(&root, "real.txt", "");
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("alias.txt")).unwrap();
+        assert_eq!(
+            walk_jailed_files(&root, &root),
+            vec![root.join("alias.txt"), root.join("real.txt")]
+        );
+    }
+
+    #[test]
+    fn walk_jailed_files_pruned_skips_a_pruned_directory_without_entering_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "keep/a.txt", "");
+        write(dir.path(), "node_modules/b.txt", "");
+        let hits = walk_jailed_files_pruned(dir.path(), dir.path(), &|name| name == "node_modules");
+        assert_eq!(hits, vec![dir.path().join("keep/a.txt")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_jailed_files_never_expands_through_a_symlink_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        write(&root, "a.rs", "");
+        write(&root, "sub/b.rs", "");
+        for link in ["x", "y", "sub/z"] {
+            std::os::unix::fs::symlink(".", root.join(link)).unwrap();
+        }
+        assert_eq!(
+            glob_jailed_files(&root, "**/*.rs"),
+            vec![root.join("a.rs"), root.join("sub/b.rs")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_jailed_files_through_a_literal_symlink_prefix_stays_confined() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let root = base.join("root");
+        write(&base, "outside/secret.rs", "");
+        write(&root, "real/inner.rs", "");
+        std::os::unix::fs::symlink(base.join("outside"), root.join("out")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        assert!(glob_jailed_files(&root, "out/*.rs").is_empty());
+        assert_eq!(
+            glob_jailed_files(&root, "alias/*.rs"),
+            vec![root.join("alias/inner.rs")]
+        );
+    }
+
+    #[test]
+    fn glob_jailed_files_matches_literal_paths_and_respects_separators() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/main.rs", "");
+        write(dir.path(), "src/deep/lib.rs", "");
+        write(dir.path(), "top.rs", "");
+        assert_eq!(
+            glob_jailed_files(dir.path(), "src/main.rs"),
+            vec![dir.path().join("src/main.rs")]
+        );
+        // A single `*` never crosses a `/`, as with `glob::glob`.
+        assert_eq!(
+            glob_jailed_files(dir.path(), "*.rs"),
+            vec![dir.path().join("top.rs")]
+        );
+        assert_eq!(
+            glob_jailed_files(dir.path(), "src/*.rs"),
+            vec![dir.path().join("src/main.rs")]
+        );
+        assert_eq!(
+            glob_jailed_files(dir.path(), "*/*/*.rs"),
+            vec![dir.path().join("src/deep/lib.rs")]
+        );
+        assert!(glob_jailed_files(dir.path(), "missing/*.rs").is_empty());
     }
 
     #[test]

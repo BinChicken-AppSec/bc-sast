@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 bc-model = { path = "../bc-model" }
+bc-pipeline-core = { path = "../bc-pipeline-core" }
 bc-llm-client = { path = "../bc-llm-client" }
 bc-llm-agentic = { path = "../bc-llm-agentic" }
 bc-sandbox-tools = { path = "../bc-sandbox-tools" }
@@ -30,6 +31,7 @@ sha1 = { workspace = true }
 # `process`/`time` only: the optional `verify_command` gate spawns
 # `sh -c <operator's command>` under a wall-clock timeout.
 tokio = { workspace = true, features = ["process", "time"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

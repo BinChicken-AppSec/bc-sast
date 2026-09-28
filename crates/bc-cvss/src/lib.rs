@@ -193,7 +193,7 @@ fn roundup1(x: f64) -> f64 {
 // alphabet (e.g. `[NALP]` for AV) — the None arm can't be reached through
 // `score()`. It's still a normal, directly-testable `Option`-returning
 // function rather than a `match ... => unreachable!()`, so the "invalid
-// character" case is real, covered behaviour instead of untestable dead
+// character" case is real, covered behavior instead of untestable dead
 // code (see the tests below).
 
 fn cia_value(c: char) -> Option<f64> {

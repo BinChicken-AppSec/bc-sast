@@ -6,6 +6,7 @@
 
 mod config;
 mod error;
+mod identity;
 
 pub use config::GatewayConfig;
 pub use error::GatewayError;
@@ -20,6 +21,13 @@ pub use error::GatewayError;
 /// - No `ca_cert_path`, `verify_tls: false`: accept any certificate. Same
 ///   "dangerous" path as `backends/oai.py`'s `verify_ssl=false`; this crate
 ///   does not warn about it, callers should.
+///
+/// Independently of the trust settings, `client_cert_path` (plus
+/// `client_key_path` when the key is a separate file) makes the client
+/// present that certificate for mutual TLS. A missing, unreadable,
+/// network-path or malformed identity file is an error, never a silent
+/// fall-back to plain TLS (see the `identity` module for why this
+/// deliberately differs from the Python original).
 pub fn build_client(config: &GatewayConfig) -> Result<reqwest::Client, GatewayError> {
     let mut builder = reqwest::Client::builder().timeout(config.timeout);
 
@@ -56,6 +64,14 @@ pub fn build_client(config: &GatewayConfig) -> Result<reqwest::Client, GatewayEr
         builder = builder.tls_certs_only([cert]);
     } else if !config.verify_tls {
         builder = builder.danger_accept_invalid_certs(true);
+    }
+
+    match (&config.client_cert_path, &config.client_key_path) {
+        (Some(cert), key) => {
+            builder = builder.identity(identity::load(cert, key.as_deref())?);
+        }
+        (None, Some(key)) => return Err(identity::key_without_cert(key)),
+        (None, None) => {}
     }
 
     finish(builder)
@@ -150,6 +166,67 @@ LeXltE6upN6JKdVB655LW4Q=
         cfg.ca_cert_path = Some(path);
         cfg.verify_tls = false;
         assert!(build_client(&cfg).is_ok());
+    }
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn build_client_presents_a_valid_client_identity_alongside_a_private_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, TEST_CA_PEM).unwrap();
+        let mut cfg = GatewayConfig::new("https://gateway.example.com");
+        cfg.ca_cert_path = Some(ca);
+        cfg.client_cert_path = Some(fixture("client-cert.pem"));
+        cfg.client_key_path = Some(fixture("client-key.pem"));
+        assert!(build_client(&cfg).is_ok());
+    }
+
+    #[test]
+    fn build_client_accepts_a_combined_certificate_and_key_file() {
+        let mut cfg = GatewayConfig::new("https://gateway.example.com");
+        cfg.client_cert_path = Some(fixture("client-combined.pem"));
+        assert!(build_client(&cfg).is_ok());
+    }
+
+    /// Fail closed: the Python original would warn and carry on without
+    /// mTLS here.
+    #[test]
+    fn build_client_refuses_a_client_certificate_it_cannot_load() {
+        let mut cfg = GatewayConfig::new("https://gateway.example.com");
+        cfg.client_cert_path = Some(fixture("client-cert.pem"));
+        let err = build_client(&cfg).unwrap_err();
+        assert!(matches!(err, GatewayError::InvalidClientIdentity { .. }));
+
+        cfg.client_cert_path = Some(std::path::PathBuf::from("/does/not/exist.pem"));
+        let err = build_client(&cfg).unwrap_err();
+        assert!(matches!(err, GatewayError::InvalidClientIdentity { .. }));
+    }
+
+    #[test]
+    fn build_client_refuses_a_client_key_without_a_certificate() {
+        let mut cfg = GatewayConfig::new("https://gateway.example.com");
+        cfg.client_key_path = Some(fixture("client-key.pem"));
+        let err = build_client(&cfg).unwrap_err();
+        assert!(matches!(err, GatewayError::InvalidClientIdentity { .. }));
+        assert!(err.to_string().contains("without a client certificate"));
+    }
+
+    /// A key that is not the certificate's own is refused when the TLS
+    /// configuration is built, still at startup.
+    #[test]
+    fn build_client_refuses_a_key_that_does_not_match_the_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("other-key.pem");
+        std::fs::write(&key, TEST_PRIVATE_KEY_PEM).unwrap();
+        let mut cfg = GatewayConfig::new("https://gateway.example.com");
+        cfg.client_cert_path = Some(fixture("client-cert.pem"));
+        cfg.client_key_path = Some(key);
+        assert!(build_client(&cfg).is_err());
     }
 
     #[test]

@@ -25,19 +25,29 @@ struct FlowParser<'a> {
     line: usize,
     src: &'a str,
     depth: usize,
+    strict: bool,
 }
 
 /// Parse a flow collection starting at the beginning of `s` (which must
 /// start with `{` or `[`, after any leading whitespace). Returns the value
 /// and the count of UTF-8 bytes of `s` consumed, so the caller can inspect
 /// anything left over (e.g. a trailing comment).
+#[cfg(test)]
 pub fn parse_flow(s: &str, line: usize) -> Result<(Value, usize), YamlError> {
+    parse_flow_with(s, line, false)
+}
+
+/// [`parse_flow`], optionally in strict mode (see [`crate::parse_strict`]):
+/// plain scalars that start with an unsupported indicator and duplicate
+/// mapping keys are errors instead of text and a silent overwrite.
+pub fn parse_flow_with(s: &str, line: usize, strict: bool) -> Result<(Value, usize), YamlError> {
     let mut p = FlowParser {
         chars: s.chars().collect(),
         pos: 0,
         line,
         src: s,
         depth: 0,
+        strict,
     };
     p.skip_ws();
     let v = p.parse_value()?;
@@ -82,9 +92,11 @@ impl<'a> FlowParser<'a> {
             Some('[') => self.parse_sequence(),
             Some('"') => Ok(Value::String(self.parse_double_quoted()?)),
             Some('\'') => Ok(Value::String(self.parse_single_quoted()?)),
-            Some(_) => Ok(scalar::resolve_plain(
-                self.consume_plain(&[',', '}', ']', ':']).trim(),
-            )),
+            Some(_) => {
+                let text = self.consume_plain(&[',', '}', ']', ':']);
+                let plain = self.checked_plain(text.trim())?;
+                Ok(scalar::resolve_plain(plain))
+            }
             None => Err(self.err("unexpected end of input while parsing a flow value")),
         }
     }
@@ -102,7 +114,10 @@ impl<'a> FlowParser<'a> {
             let key = match self.peek() {
                 Some('"') => self.parse_double_quoted()?,
                 Some('\'') => self.parse_single_quoted()?,
-                Some(_) => self.consume_plain(&[':', ',', '}']).trim().to_string(),
+                Some(_) => {
+                    let text = self.consume_plain(&[':', ',', '}']);
+                    self.checked_plain(text.trim())?.to_string()
+                }
                 None => return Err(self.err("unexpected end of input reading a flow-mapping key")),
             };
             self.skip_ws();
@@ -112,7 +127,9 @@ impl<'a> FlowParser<'a> {
             } else {
                 Value::Null // `{key}` shorthand: value defaults to null
             };
-            map.insert(key, value);
+            if map.insert(key, value).is_some() && self.strict {
+                return Err(self.err("duplicate flow-mapping key"));
+            }
             self.skip_ws();
             match self.peek() {
                 Some(',') => {
@@ -153,6 +170,14 @@ impl<'a> FlowParser<'a> {
             }
         }
         Ok(Value::Array(items))
+    }
+
+    /// `plain` unchanged, unless strict mode refuses it.
+    fn checked_plain<'t>(&self, plain: &'t str) -> Result<&'t str, YamlError> {
+        match crate::block::plain_problem(plain) {
+            Some(problem) if self.strict => Err(self.err(problem)),
+            _ => Ok(plain),
+        }
     }
 
     fn consume_plain(&mut self, stops: &[char]) -> String {

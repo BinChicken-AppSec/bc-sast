@@ -709,6 +709,67 @@ async fn validate_finding_routes_each_persona_to_its_own_model_override() {
     assert_eq!(model_for("cross-repo"), Some("test-model".to_string()));
 }
 
+/// Records each call's effort and transport pin.
+struct EffortCapturingClient {
+    seen: std::sync::Mutex<Vec<(Option<ReasoningEffortArg>, Option<OpenAiApiArg>)>>,
+}
+
+type ReasoningEffortArg = bc_llm_client::ReasoningEffort;
+type OpenAiApiArg = bc_llm_client::OpenAiApi;
+
+#[async_trait]
+impl LlmClient for EffortCapturingClient {
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((request.reasoning_effort, request.openai_api));
+        Ok(ChatResponse {
+            content: vec![ContentBlock::Text(all_pass_gates_json())],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        })
+    }
+}
+
+#[test]
+fn the_panel_defaults_to_pythons_high_effort() {
+    assert_eq!(
+        Step11Config::new("m").reasoning_effort,
+        Some(ReasoningEffortArg::High)
+    );
+    assert_eq!(Step11Config::new("m").openai_api, None);
+}
+
+#[tokio::test]
+async fn every_persona_carries_the_configured_effort_and_transport_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = EffortCapturingClient {
+        seen: std::sync::Mutex::new(Vec::new()),
+    };
+    let tools = SandboxTools::new(dir.path());
+    let mut cfg = config();
+    cfg.reasoning_effort = Some(ReasoningEffortArg::XHigh);
+    cfg.openai_api = Some(OpenAiApiArg::Chat);
+
+    validate_finding(
+        &client,
+        &tools,
+        dir.path(),
+        &finding("SQLi", None, None),
+        &record(Some("diff")),
+        &cfg,
+    )
+    .await
+    .unwrap();
+
+    let seen = client.seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(seen
+        .iter()
+        .all(|s| *s == (Some(ReasoningEffortArg::XHigh), Some(OpenAiApiArg::Chat))));
+}
+
 // --- persona_gates: the bounded one-shot retry on an unusable reply ---
 
 /// Serves a SCRIPTED sequence of replies per persona, so a retry is
@@ -1234,7 +1295,7 @@ fn a_persona_listing_one_gate_twice_still_votes_once_at_its_most_conservative() 
     // Mirrors Python's
     // `test_duplicate_gate_from_one_persona_keeps_the_conservative_vote`.
     // Their fixture lists the duplicate `fail`-then-`pass` because their
-    // naive behaviour was last-write-wins (a dict assignment); ours was
+    // naive behavior was last-write-wins (a dict assignment); ours was
     // first-match-wins (`Iterator::find`), so only the reverse order
     // catches it here. Asserting both directions covers either mistake
     // and pins the rule itself: a persona gets one vote per gate name,
@@ -1639,7 +1700,7 @@ fn effective_allowed_tools_strips_the_fact_tools_when_the_toggle_is_off() {
 }
 
 #[test]
-fn effective_allowed_tools_honours_an_explicit_list_rather_than_re_adding_defaults() {
+fn effective_allowed_tools_honors_an_explicit_list_rather_than_re_adding_defaults() {
     let mut cfg = Step11Config::new("m");
     cfg.allowed_tools = vec!["Read".to_string(), "DiffImpactMap".to_string()];
     assert_eq!(effective_allowed_tools(&cfg), vec!["Read", "DiffImpactMap"]);
@@ -1800,4 +1861,152 @@ fn no_persona_prompt_names_a_fact_tool_it_was_not_given() {
         assert!(sys.contains("EVIDENCE:"), "{sys}");
         assert!(sys.contains("SIGNAL-TO-NOISE"), "{sys}");
     }
+}
+
+// ---- the redacted diff and `--resume` checkpoints -----------------------
+
+const SECRET_DIFF: &str = "\
+--- a/app.py
++++ b/app.py
+@@ -1 +1 @@
+-password = \"hunter2hunter2\"
++password = os.environ[\"DB_PASSWORD\"]
+";
+
+#[tokio::test]
+async fn the_panel_only_ever_sees_the_redacted_diff() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = PromptCapturingClient {
+        seen: std::sync::Mutex::new(Vec::new()),
+    };
+    let tools = SandboxTools::new(dir.path());
+    validate_finding(
+        &client,
+        &tools,
+        dir.path(),
+        &finding("Hardcoded password", Some("CWE-798"), None),
+        &record(Some(SECRET_DIFF)),
+        &config(),
+    )
+    .await
+    .unwrap();
+    let seen = client.seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    for prompt in seen.iter() {
+        assert!(!prompt.contains("hunter2"), "{prompt}");
+        assert!(
+            prompt.contains("+password = os.environ[\"DB_PASSWORD\"]"),
+            "{prompt}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_checkpointed_score_is_reused_on_resume_without_running_the_panel() {
+    let dir = tempfile::tempdir().unwrap();
+    let ckpt = tempfile::tempdir().unwrap();
+    let store = bc_checkpoint::SqliteCheckpointStore::new(ckpt.path().join("state.db")).unwrap();
+    let tools = SandboxTools::new(dir.path());
+    let f = finding("SQLi", Some("CWE-89"), None);
+    let rec = record(Some("+fixed\n"));
+
+    let fresh = validate_finding_checkpointed(
+        &RoutedClient::two_persona(all_pass_gates_json(), all_pass_gates_json()),
+        &tools,
+        dir.path(),
+        &f,
+        &rec,
+        &config(),
+        Some(&store),
+        "run1",
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fresh.fix_status, bc_validation_scoring::FixVerdict::Fixed);
+
+    // FailingClient would error if a single persona ran.
+    let resumed = validate_finding_checkpointed(
+        &FailingClient,
+        &tools,
+        dir.path(),
+        &f,
+        &rec,
+        &config(),
+        Some(&store),
+        "run1",
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed, fresh);
+
+    // A different model is a different key: the panel runs (and fails).
+    let mut other = config();
+    other.model = "another-model".to_string();
+    let err = validate_finding_checkpointed(
+        &FailingClient,
+        &tools,
+        dir.path(),
+        &f,
+        &rec,
+        &other,
+        Some(&store),
+        "run1",
+        true,
+    )
+    .await;
+    assert!(err.is_err());
+
+    // Without resume the cache is not consulted either.
+    let err = validate_finding_checkpointed(
+        &FailingClient,
+        &tools,
+        dir.path(),
+        &f,
+        &rec,
+        &config(),
+        Some(&store),
+        "run1",
+        false,
+    )
+    .await;
+    assert!(err.is_err());
+
+    // And with no store at all, it is just `validate_finding`.
+    let plain = validate_finding_checkpointed(
+        &RoutedClient::two_persona(all_pass_gates_json(), all_pass_gates_json()),
+        &tools,
+        dir.path(),
+        &f,
+        &rec,
+        &config(),
+        None,
+        "run1",
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plain.fix_status, bc_validation_scoring::FixVerdict::Fixed);
+}
+
+// ---- step_validate.split_ties_score -------------------------------------
+
+#[test]
+fn the_tie_policy_keeps_split_by_default_and_flags_it_when_switched_off() {
+    let split = with_confidence(
+        &gate_result(GateName::RootCause, GateStatus::Partial, "s"),
+        SynthesisConfidence::Split,
+    );
+    let high = with_confidence(
+        &gate_result(GateName::InstanceCoverage, GateStatus::Pass, "s"),
+        SynthesisConfidence::High,
+    );
+    let gates = vec![split.clone(), high.clone()];
+    assert_eq!(apply_tie_policy(gates.clone(), true), gates);
+    let flagged = apply_tie_policy(gates, false);
+    assert_eq!(flagged[0].confidence, Some(SynthesisConfidence::Flagged));
+    assert_eq!(flagged[0].status, GateStatus::Partial);
+    assert_eq!(flagged[1], high);
+    assert!(Step11Config::new("m").split_ties_score);
 }

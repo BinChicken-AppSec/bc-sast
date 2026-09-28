@@ -57,6 +57,9 @@ REMEDIATION RULES (authoritative):
     findings, move the value to a config/env/secret-manager read and note that
     rotation is required.
   - SNIPPETS: quote at most ~20 lines of code in your output.
+  - WORKFLOW PINS: never invent a commit SHA or write a placeholder SHA. Pin a
+    remote reusable workflow only to an exact commit already evidenced in the
+    repository. If no such SHA is available, make no edit and report Not Fixed.
   - VERIFY BEFORE CLAIMING SUCCESS: after editing a file, use your read tool
     to re-read it back and confirm the change is actually present on disk
     before setting `verdict` to "Fixed" or "Partially Fixed". If the edit
@@ -255,6 +258,17 @@ mod tests {
         // a real behavioral ask, not just documentation.
         let sys = build_system();
         assert!(sys.contains("VERIFY BEFORE CLAIMING SUCCESS"));
+    }
+
+    #[test]
+    fn build_system_forbids_inventing_a_workflow_pin() {
+        // The prompt half of the workflow-pin gate (`crate::workflow_gate`
+        // is the enforcing half): say up front that an invented SHA is
+        // refused, so the model declines instead of spending a session on
+        // an edit that will be rolled back.
+        let sys = build_system();
+        assert!(sys.contains("WORKFLOW PINS: never invent a commit SHA"));
+        assert!(sys.contains("make no edit and report Not Fixed"));
     }
 
     #[test]

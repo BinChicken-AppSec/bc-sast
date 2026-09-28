@@ -18,7 +18,10 @@ mod args;
 mod autoexclude;
 mod baseline;
 mod batch;
+mod cache_probe;
+pub mod cancel;
 mod clone;
+mod config_load;
 mod config_overrides;
 mod csv_parse;
 pub mod delivery;
@@ -26,10 +29,15 @@ pub mod delivery_archive;
 pub mod delivery_branch;
 mod environment;
 mod estimate;
+mod llm_settings;
 mod logging;
+mod model_policy;
 mod preflight;
 mod progress;
+mod progress_lines;
 pub mod provider_publish;
+mod run_manifest;
+mod s6_progress;
 pub mod target_executor;
 pub mod target_testing;
 mod worktree;
@@ -85,6 +93,8 @@ fn repo_path(cli: &Cli) -> &Path {
 /// behavior.
 pub fn build_scan_config(cli: &Cli) -> Result<ScanConfig, String> {
     let mut config = ScanConfig {
+        autoexclude: Default::default(),
+        cancel: None,
         // Static detection uses the corpus embedded in this build. Runtime
         // configuration may toggle S0, but cannot replace its rule files.
         step0_enabled: true,
@@ -149,8 +159,9 @@ pub fn build_scan_config(cli: &Cli) -> Result<ScanConfig, String> {
     // standalone rather than silently requiring a config file.
     let mut data = Value::Null;
     if let Some(path) = &cli.config {
-        let loaded = bc_config::load(path, &getenv).map_err(stringify)?;
+        let loaded = config_load::load(path).map_err(stringify)?;
         bc_config::check_config_trust(path, repo_path(cli), &getenv).map_err(stringify)?;
+        config_overrides::validate_model_roles(&loaded.data)?;
         config.step2_enabled =
             config_overrides::step2_enabled_override(&loaded.data).unwrap_or(config.step2_enabled);
         config.step0_enabled =
@@ -167,6 +178,14 @@ pub fn build_scan_config(cli: &Cli) -> Result<ScanConfig, String> {
         }
     }
     config_overrides::apply_overrides(&mut config, &data, global_sampling(cli));
+    // One-hour cache writes bill at their own rate. Only the Anthropic
+    // dialect sends a lifetime at all; an OpenAI run keeps the default.
+    if cli.dialect == Dialect::Anthropic {
+        config.pricing.cache_ttl =
+            llm_settings::resolve(cli.openai_api, cli.no_cache_markers, &data)?
+                .cache
+                .ttl;
+    }
     if cli.no_threat_model {
         config.step2_enabled = false;
     }
@@ -194,11 +213,13 @@ pub struct RemediateSettings {
     /// instead of the automatic top-N batch walk.
     pub interactive: bool,
     /// Whether Phase 3's S11 fix-validation panel runs right after each
-    /// finding's remediation — only meaningful for the batch (non-
-    /// `interactive`) path, matching `bc_orchestrator::remediate`'s own
-    /// scope (see its doc comment). Defaults to `true`, matching the
-    /// shipped `default.yaml` profile's `step_validate.enabled: true`;
-    /// overridable via `--config`'s `step_validate.enabled`.
+    /// finding's remediation (both the batch walk and the `-i` picker).
+    /// Defaults to `true` whenever `--remediate` is set: a deliberate
+    /// divergence from vvaharness v1.4.0, which ships S11 off, because
+    /// here S11's grade is what rolls back a patch it finds `Not Fixed` or
+    /// `UNVERIFIABLE` (see docs/validation.md). Overridable by
+    /// `--config`'s `step_validate.enabled`, and by `--validate`/
+    /// `--no-validate`, which win over the config.
     pub validate_enabled: bool,
     pub step11: bc_stage_s11::Step11Config,
 }
@@ -236,8 +257,9 @@ pub fn build_remediate_settings(cli: &Cli) -> Result<RemediateSettings, String> 
     let mut playbook_file = None;
 
     if let Some(path) = &cli.config {
-        let loaded = bc_config::load(path, &getenv).map_err(stringify)?;
+        let loaded = config_load::load(path).map_err(stringify)?;
         bc_config::check_config_trust(path, repo_path(cli), &getenv).map_err(stringify)?;
+        config_overrides::validate_model_roles(&loaded.data)?;
         config_overrides::apply_step10_overrides(&mut step10, &loaded.data, global_sampling(cli));
         config_overrides::apply_step11_overrides(&mut step11, &loaded.data, global_sampling(cli));
         top_default = config_overrides::step_remediate_top_n_findings(&loaded.data);
@@ -261,6 +283,13 @@ pub fn build_remediate_settings(cli: &Cli) -> Result<RemediateSettings, String> 
         validate_enabled = config_overrides::step_validate_enabled_override(&loaded.user_provided)
             .unwrap_or(validate_enabled);
     }
+    // The explicit flags beat the config file, in either direction.
+    if let Some(explicit) = cli.validate {
+        validate_enabled = explicit;
+    }
+    if cli.no_validate {
+        validate_enabled = false;
+    }
 
     let top = cli
         .top
@@ -283,6 +312,14 @@ pub fn build_remediate_settings(cli: &Cli) -> Result<RemediateSettings, String> 
         config_overrides::apply_step11_overrides(&mut step11, &Value::Null, global_sampling(cli));
     }
     apply_remediation_gate_flags(cli, &mut step10);
+    // The dialect and gateway host are part of every S10/S11 `--resume`
+    // checkpoint key, so a record produced by one endpoint is never
+    // served as another's (see `bc_checkpoint::EngineKey`).
+    let (dialect, base_host) = engine_identity(cli);
+    step10.dialect.clone_from(&dialect);
+    step10.base_host.clone_from(&base_host);
+    step11.dialect = dialect;
+    step11.base_host = base_host;
 
     let policy = enforce_policy.then(|| {
         let policy_path = cli.remediation_policy.clone().or(policy_file);
@@ -330,7 +367,22 @@ pub fn build_remediate_settings(cli: &Cli) -> Result<RemediateSettings, String> 
     })
 }
 
-/// The four global sampling/timeout flags, bundled for the config
+/// `(dialect, gateway host)` for the checkpoint engine key: the wire
+/// dialect's lower-case name, and the host of `--gateway-base-url` (empty
+/// when it does not parse, which still keys by model and version).
+fn engine_identity(cli: &Cli) -> (String, String) {
+    let dialect = match cli.dialect {
+        Dialect::Openai => "openai",
+        Dialect::Anthropic => "anthropic",
+    };
+    let host = reqwest::Url::parse(&cli.gateway_base_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+    (dialect.to_string(), host)
+}
+
+/// The global sampling/effort/timeout flags, bundled for the config
 /// projection — see `config_overrides::GlobalSampling` for which side
 /// wins against a per-role config value.
 fn global_sampling(cli: &Cli) -> config_overrides::GlobalSampling {
@@ -338,6 +390,7 @@ fn global_sampling(cli: &Cli) -> config_overrides::GlobalSampling {
         temperature: cli.temperature,
         top_p: cli.top_p,
         seed: cli.seed,
+        reasoning_effort: cli.reasoning_effort,
         step_timeout_secs: cli.step_timeout,
     }
 }
@@ -383,7 +436,7 @@ fn apply_remediation_gate_flags(cli: &Cli, step10: &mut bc_stage_s10::Step10Conf
 /// CVEs already filed" and S3 as "DO NOT REDISCOVER", and the controls
 /// become S3's `DESIGN CONTROLS` block — so a load failure degrades to
 /// "inject nothing" with a warning rather than failing the scan, matching
-/// Python's own `[inject] WARN`-and-continue behaviour in
+/// Python's own `[inject] WARN`-and-continue behavior in
 /// `injectors/cve_feed.py`/`design_controls.py`. That is deliberately
 /// unlike `--compliance-policy`, which fails hard: a compliance policy
 /// can DROP findings from the report, so scanning without one silently
@@ -448,7 +501,7 @@ pub fn build_scan_input(cli: &Cli) -> ScanInput {
     // this function at all means the file parsed.
     let (data, config_dir) = match &cli.config {
         Some(path) => (
-            bc_config::load(path, &getenv)
+            config_load::load(path)
                 .map(|l| l.data)
                 .unwrap_or(Value::Null),
             path.parent().unwrap_or(Path::new("")).to_path_buf(),
@@ -838,35 +891,99 @@ pub fn resolve_output_paths(cli: &Cli) -> OutputPaths {
     }
 }
 
-/// Build the concrete, network-backed `LlmClient` for `cli.dialect`,
-/// wrapped in [`bc_llm_client::StreamLargeResponses`] when streaming is
-/// enabled (see [`stream_large_responses`]).
-///
-/// The wrapper goes HERE, not in a stage: whether a call is big enough to
-/// be worth streaming depends only on its own `max_tokens`, so one
-/// decorator at the single point every stage's client comes from applies
-/// the policy everywhere without any stage knowing it exists.
+/// Build the concrete, network-backed `LlmClient` for `cli.dialect`; see
+/// [`build_llm_stack`].
 pub fn build_llm_client(cli: &Cli) -> Result<Arc<dyn LlmClient>, String> {
+    build_llm_stack(cli).map(|stack| stack.client)
+}
+
+/// The configured client together with what was decided building it,
+/// which the run manifest reports.
+pub(crate) struct LlmStack {
+    pub client: Arc<dyn LlmClient>,
+    pub settings: llm_settings::TransportSettings,
+    /// The OpenAI client's per-model learning, shared so the manifest
+    /// can count the models that fell back from the Responses API.
+    /// `None` on the Anthropic dialect.
+    pub learned: Option<Arc<bc_llm_openai::LearnedModels>>,
+}
+
+impl LlmStack {
+    /// How many models this process moved from the Responses API to Chat
+    /// Completions; `None` on the Anthropic dialect, which has no such
+    /// choice.
+    pub(crate) fn responses_fallbacks(&self) -> Option<u64> {
+        self.learned.as_ref().map(|l| l.responses_fallbacks())
+    }
+}
+
+/// Build the concrete client for `cli.dialect`, speaking the OpenAI API
+/// shape [`llm_settings::resolve`] settled on, wrapped in
+/// [`bc_llm_client::ApplyCachePolicy`] (the operator's prompt-cache
+/// policy) and, when streaming is enabled (see
+/// [`stream_large_responses`]), [`bc_llm_client::StreamLargeResponses`].
+///
+/// The wrappers go HERE, not in a stage: whether to cache or stream is a
+/// transport question, so one decorator at the single point every
+/// stage's client comes from applies the policy everywhere without any
+/// stage knowing it exists.
+pub(crate) fn build_llm_stack(cli: &Cli) -> Result<LlmStack, String> {
+    let settings = llm_settings::resolve(
+        cli.openai_api,
+        cli.no_cache_markers,
+        &lenient_config_data(cli),
+    )?;
     let mut gateway_config = bc_gateway_http::GatewayConfig::new(cli.gateway_base_url.clone());
     gateway_config.ca_cert_path = cli.ca_cert.clone();
+    gateway_config.client_cert_path = cli.client_cert.clone();
+    gateway_config.client_key_path = cli.client_key.clone();
     let http = bc_gateway_http::build_client(&gateway_config).map_err(|e| e.to_string())?;
-    let client: Arc<dyn LlmClient> = match cli.dialect {
-        Dialect::Openai => Arc::new(bc_llm_openai::OpenAiClient::new(
-            http,
-            cli.gateway_base_url.clone(),
-            cli.gateway_api_key.clone(),
-        )),
-        Dialect::Anthropic => Arc::new(bc_llm_anthropic::AnthropicClient::new(
-            http,
-            cli.gateway_base_url.clone(),
-            cli.gateway_api_key.clone(),
-        )),
+    let (client, learned): (Arc<dyn LlmClient>, _) = match cli.dialect {
+        Dialect::Openai => {
+            let learned = Arc::new(bc_llm_openai::LearnedModels::new());
+            let client = bc_llm_openai::OpenAiClient::new(
+                http,
+                cli.gateway_base_url.clone(),
+                cli.gateway_api_key.clone(),
+            )
+            .with_api(settings.openai_api)
+            .with_learned_models(learned.clone());
+            (Arc::new(client), Some(learned))
+        }
+        Dialect::Anthropic => (
+            Arc::new(bc_llm_anthropic::AnthropicClient::new(
+                http,
+                cli.gateway_base_url.clone(),
+                cli.gateway_api_key.clone(),
+            )),
+            None,
+        ),
     };
-    Ok(if stream_large_responses(cli) {
+    let client: Arc<dyn LlmClient> =
+        Arc::new(bc_llm_client::ApplyCachePolicy::new(client, settings.cache));
+    let client = if stream_large_responses(cli) {
         Arc::new(bc_llm_client::StreamLargeResponses::new(client))
     } else {
         client
+    };
+    Ok(LlmStack {
+        client,
+        settings,
+        learned,
     })
+}
+
+/// The merged `--config` tree for a reader that runs before (or beside)
+/// `build_scan_config`, or `Value::Null` without a config or when it
+/// fails to load: `build_scan_config` reports a bad config itself, once,
+/// so every earlier reader treats it as "no opinion" (see
+/// [`stream_large_responses`]).
+fn lenient_config_data(cli: &Cli) -> Value {
+    cli.config
+        .as_ref()
+        .and_then(|path| config_load::load(path).ok())
+        .map(|loaded| loaded.data)
+        .unwrap_or(Value::Null)
 }
 
 /// Whether large model calls should be streamed —
@@ -892,7 +1009,7 @@ fn stream_large_responses(cli: &Cli) -> bool {
     }
     cli.config
         .as_ref()
-        .and_then(|path| bc_config::load(path, &getenv).ok())
+        .and_then(|path| config_load::load(path).ok())
         .and_then(|loaded| config_overrides::llm_stream_large_responses_override(&loaded.data))
         .unwrap_or(false)
 }
@@ -1154,6 +1271,43 @@ pub fn write_outputs(
     Ok(())
 }
 
+/// The process exit code for a finished `main_impl`, shared by `main.rs`
+/// and the run manifest so the two can never disagree.
+///
+/// `1` for an error, or for a `--doctor`/`--setup` run that found the
+/// environment unhealthy. A run that remediated reports how that went
+/// ([`RemediationSummary::exit_code`]: `1` for an S10/S11 failure, `3`
+/// when nothing validated as fixed) unless `remediation_exit_code` is
+/// off. Everything else, a plain scan included, is `0`.
+///
+/// A run the operator canceled (Ctrl-C) is
+/// [`cancel::CANCELED_EXIT_CODE`] (130) whatever else happened, an error
+/// included: the error of a run that was told to stop is a consequence
+/// of the stop, and a caller scripting around this tool needs to tell
+/// "canceled" from "failed".
+pub fn process_exit_code(
+    result: &Result<ScanSummary, String>,
+    remediation_exit_code: bool,
+    canceled: bool,
+) -> u8 {
+    if canceled {
+        return cancel::CANCELED_EXIT_CODE;
+    }
+    let Ok(summary) = result else {
+        return 1;
+    };
+    let unhealthy = summary.doctor.as_ref().is_some_and(|d| !d.healthy())
+        || summary.setup.as_ref().is_some_and(|s| !s.healthy());
+    if unhealthy {
+        return 1;
+    }
+    summary
+        .remediation
+        .as_ref()
+        .filter(|_| remediation_exit_code)
+        .map_or(0, RemediationSummary::exit_code)
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ScanSummary {
     pub provider_publication: Option<String>,
@@ -1282,31 +1436,43 @@ impl std::fmt::Display for AugmentedReports {
 pub struct DoctorSummary {
     pub checks_rendered: String,
     pub blocking: usize,
+    /// One capability row per configured model (lifecycle, effort tiers,
+    /// sampling support, cache minimum), from
+    /// `bc_llm_client::capabilities`.
+    pub models_rendered: String,
     /// `None` when skipped (a blocking static check failed first).
     pub probe: Option<environment::Check>,
+    /// `--cache-probe`'s result; `None` when it was not asked for.
+    pub cache_probe: Option<cache_probe::CacheProbeOutcome>,
 }
 
 impl DoctorSummary {
     /// `true` when nothing here should fail the process: no blocking
     /// static check, and either the probe wasn't required to run
-    /// (impossible given `blocking == 0` implies it ran) or it succeeded.
+    /// (impossible given `blocking == 0` implies it ran) or it succeeded,
+    /// and a requested cache probe reached a verdict (whichever verdict:
+    /// a cache that does not work is a finding, not a broken doctor).
     pub fn healthy(&self) -> bool {
         self.blocking == 0
             && self
                 .probe
                 .as_ref()
                 .is_some_and(|p| p.status == environment::CheckStatus::Ok)
+            && self
+                .cache_probe
+                .as_ref()
+                .is_none_or(cache_probe::CacheProbeOutcome::completed)
     }
 }
 
 impl std::fmt::Display for DoctorSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "{}", self.checks_rendered)?;
-        if self.blocking > 0 {
-            write!(
-                f,
-                "  [probe] skipped — fix the blocking item(s) above first"
-            )
+        if !self.models_rendered.is_empty() {
+            writeln!(f, "{}", self.models_rendered)?;
+        }
+        let probe_line = if self.blocking > 0 {
+            "  [probe] skipped — fix the blocking item(s) above first".to_string()
         } else {
             let probe = self
                 .probe
@@ -1317,7 +1483,11 @@ impl std::fmt::Display for DoctorSummary {
             } else {
                 '\u{2717}'
             };
-            write!(f, "  [probe] {icon} {}", probe.detail)
+            format!("  [probe] {icon} {}", probe.detail)
+        };
+        match &self.cache_probe {
+            Some(outcome) => write!(f, "{probe_line}\n{outcome}"),
+            None => f.write_str(&probe_line),
         }
     }
 }
@@ -1481,7 +1651,7 @@ pub struct ValidationTally {
 /// A `--remediate` run's outcome, condensed to what `ScanSummary`'s
 /// `Display` and the caller need — the full per-finding detail lives in
 /// `--out-remediation-json`, not here.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RemediationSummary {
     /// `Some(reason)` when the git-SHA staleness preflight refused to run
     /// remediation at all (see `bc_orchestrator::remediate`) — `processed`/
@@ -1489,6 +1659,18 @@ pub struct RemediationSummary {
     pub refused: Option<String>,
     pub processed: usize,
     pub failed: usize,
+    /// Processed findings whose fix stands: verdict `Fixed`, a non-empty
+    /// diff, and not rolled back by an S10 gate or by S11
+    /// (`bc_stage_s10::is_kept_fix`). `processed` alone used to be the
+    /// only success count, and it includes denials, no-op answers and
+    /// rolled-back patches.
+    pub fixed: usize,
+    /// Processed findings that are not [`Self::fixed`].
+    pub not_fixed: usize,
+    /// Case-state and validator-decision counts, the shape vvaharness
+    /// v1.4.0 writes into its run manifest (`case_rollup.py`). Counts
+    /// only, never a title or path from the scanned target.
+    pub rollup: bc_validation_scoring::Rollup,
     /// `Some(_)` when S11 validation ran at all this run (`--remediate`'s
     /// `validate_enabled`, batch path only — see `RemediateSettings`),
     /// regardless of how many findings actually got a score; `None` when
@@ -1503,13 +1685,78 @@ pub struct RemediationSummary {
     pub validation_failures: usize,
 }
 
+/// The process exit code for a run in which nothing S11 validated came
+/// out fixed and at least one fix failed validation (vvaharness v1.4.0
+/// `case_rollup.py::EXIT_NOT_REMEDIATED`). Distinct from `1`, which means
+/// the tool itself failed.
+pub const EXIT_NOT_REMEDIATED: u8 = 3;
+
+impl RemediationSummary {
+    /// The exit code this remediation outcome calls for, applied only when
+    /// remediation actually ran (a plain scan's exit code is unchanged):
+    ///
+    /// - `1` when an S10 agentic call failed or an S11 validation errored:
+    ///   the run is incomplete, which outranks anything it concluded
+    ///   (Python's `rem_rc or val_rc`, and `failures` taking first claim
+    ///   in `validation/cli/_run.py`);
+    /// - [`EXIT_NOT_REMEDIATED`] when validation ran, validated nothing as
+    ///   fixed, and failed at least one fix. An all-inconclusive run does
+    ///   not trip it: inconclusive is "re-validate", not "failed";
+    /// - `0` otherwise, including a refused run (the scan itself finished
+    ///   and its output is valid).
+    pub fn exit_code(&self) -> u8 {
+        if self.failed > 0 || self.validation_failures > 0 {
+            return 1;
+        }
+        let not_remediated = self
+            .validated
+            .is_some_and(|v| v.fixed == 0 && v.partially_fixed + v.not_fixed > 0);
+        if not_remediated {
+            EXIT_NOT_REMEDIATED
+        } else {
+            0
+        }
+    }
+}
+
+/// One case per processed finding: its validator decision when S11
+/// scored it, else remediated (a patch stands) or declined (none does).
+/// An S10 call that errored produced no case and is counted in `failed`
+/// instead, as Python writes no case file for it.
+fn remediation_rollup(
+    outcome: &bc_orchestrator::RemediateOutcome,
+) -> bc_validation_scoring::Rollup {
+    use bc_validation_scoring::{verdict_state, CaseState};
+    let cases = outcome.outcomes.iter().enumerate().filter_map(|(i, o)| {
+        let bc_stage_s10::RemediationOutcome::Processed(record) = o else {
+            return None;
+        };
+        let decision = outcome
+            .validations
+            .get(i)
+            .and_then(Option::as_ref)
+            .map(|s| s.decision());
+        let state = match decision {
+            Some(d) => verdict_state(d),
+            None if record.diff.as_deref().is_some_and(|d| !d.trim().is_empty())
+                && !bc_stage_s10::was_reverted(record) =>
+            {
+                CaseState::Remediated
+            }
+            None => CaseState::Declined,
+        };
+        Some((state, decision))
+    });
+    bc_validation_scoring::Rollup::tally(cases)
+}
+
+#[cfg(test)]
+mod remediation_outcome_tests;
+
 impl From<&bc_orchestrator::RemediateOutcome> for RemediationSummary {
     fn from(outcome: &bc_orchestrator::RemediateOutcome) -> Self {
-        let processed = outcome
-            .outcomes
-            .iter()
-            .filter(|o| matches!(o, bc_stage_s10::RemediationOutcome::Processed(_)))
-            .count();
+        let counts = bc_stage_s10::RemediationCounts::from_outcomes(&outcome.outcomes);
+        let processed = counts.fixed + counts.not_fixed;
         let validated = (!outcome.validations.is_empty()).then(|| {
             let mut tally = ValidationTally::default();
             for score in outcome.validations.iter().flatten() {
@@ -1525,7 +1772,10 @@ impl From<&bc_orchestrator::RemediateOutcome> for RemediationSummary {
         RemediationSummary {
             refused: outcome.refused.clone(),
             processed,
-            failed: outcome.outcomes.len() - processed,
+            failed: counts.failed,
+            fixed: counts.fixed,
+            not_fixed: counts.not_fixed,
+            rollup: remediation_rollup(outcome),
             validated,
             validation_failures: outcome.validation_failures,
         }
@@ -1597,8 +1847,8 @@ impl std::fmt::Display for ScanSummary {
             }
             Some(r) => {
                 let msg = format!(
-                    " Remediation: {} processed, {} failed.",
-                    r.processed, r.failed
+                    " Remediation: {} processed, {} failed. Outcome: {} fixed, {} not fixed.",
+                    r.processed, r.failed, r.fixed, r.not_fixed
                 );
                 write!(f, "{msg}")?;
                 r.validated.iter().try_for_each(|v| {
@@ -1610,6 +1860,10 @@ impl std::fmt::Display for ScanSummary {
                 })?;
                 if r.validation_failures > 0 {
                     write!(f, " ({} validation error(s).)", r.validation_failures)?;
+                }
+                if r.exit_code() == EXIT_NOT_REMEDIATED {
+                    let code = EXIT_NOT_REMEDIATED;
+                    write!(f, " Nothing validated as fixed (exit code {code}).")?;
                 }
             }
             None => {}
@@ -1755,6 +2009,19 @@ pub async fn remediate_from(
     path: &Path,
     llm: Arc<dyn LlmClient>,
 ) -> Result<ScanSummary, String> {
+    remediate_from_with_cancel(cli, path, llm, None).await
+}
+
+/// [`remediate_from`] under the run's Ctrl-C cancellation: once `cancel`
+/// trips, no remediation, target-test or validation session starts, and
+/// the one under way has its next model call refused (see
+/// `bc_orchestrator::RemediateTelemetry::cancel`).
+async fn remediate_from_with_cancel(
+    cli: &Cli,
+    path: &Path,
+    llm: Arc<dyn LlmClient>,
+    cancel: Option<bc_pipeline_core::CancelTokenRef>,
+) -> Result<ScanSummary, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read findings export {}: {e}", path.display()))?;
     let export: FindingsExport = serde_json::from_str(&text)
@@ -1804,8 +2071,18 @@ pub async fn remediate_from(
     // The read-only executor S11 uses for an in-place run; the worktree
     // path builds its own (see `dispatch_remediation`).
     let read_tools: Arc<dyn ToolExecutor> = Arc::new(SandboxTools::new(repo.to_path_buf()));
-    let (result, remediation_patch) =
-        dispatch_remediation(llm, read_tools, repo, &report, run).await;
+    let (result, remediation_patch) = dispatch_remediation(
+        llm,
+        read_tools,
+        repo,
+        &report,
+        run,
+        bc_orchestrator::RemediateTelemetry {
+            cancel,
+            ..Default::default()
+        },
+    )
+    .await;
     write_remediation_json(out_json.as_deref(), &result).map_err(stringify)?;
 
     // The prior run's own reports, augmented in place where they exist —
@@ -1889,7 +2166,14 @@ async fn dispatch_remediation(
     repo_root: &Path,
     report: &bc_model::FinalReport,
     run: RemediateRun,
+    // The scan's event sink and pricing, so S10/S11 report and are metered
+    // as stages (see `bc_orchestrator::remediate_observed`).
+    telemetry: bc_orchestrator::RemediateTelemetry,
 ) -> (bc_orchestrator::RemediateOutcome, Option<PathBuf>) {
+    // Every model session this dispatch starts (target-test and API-spec
+    // generation included, which run before S10) is refused once the run
+    // is canceled.
+    let llm = bc_orchestrator::cancel_aware_client(llm, telemetry.cancel.clone());
     let RemediateRun {
         mut settings,
         tools: write_tools,
@@ -1994,6 +2278,12 @@ async fn dispatch_remediation(
             }
         }
     }
+    if !settings.validate_enabled {
+        eprintln!(
+            "  [s11] disabled (--no-validate or step_validate.enabled: false); S10 patches \
+             are kept without an independent validation pass"
+        );
+    }
     let mut result = if settings.interactive {
         let mut term = bc_interactive::RealTerminal;
         let validate = settings
@@ -2021,7 +2311,7 @@ async fn dispatch_remediation(
                 step11: &settings.step11,
                 tools: validate_tools.as_ref(),
             });
-        bc_orchestrator::remediate(
+        bc_orchestrator::remediate_observed(
             llm,
             write_tools,
             &rem_root,
@@ -2030,6 +2320,7 @@ async fn dispatch_remediation(
             settings.policy.as_ref(),
             checkpoint,
             validate,
+            &telemetry,
         )
         .await
     };
@@ -2042,7 +2333,15 @@ async fn dispatch_remediation(
             assurance.export_blocked = true;
             assurance.remaining_gaps.push("Independent patch review failed; passing tests cannot replace the missing review. Export withheld.".into());
         }
-        target_testing::finish(&rem_root, test_config, assurance).await;
+        // No target-test process starts after a cancellation.
+        if let Some(reason) = bc_pipeline_core::canceled(telemetry.cancel.as_ref()) {
+            assurance.export_blocked = true;
+            assurance.remaining_gaps.push(format!(
+                "Target tests were not run: {reason}. Export withheld."
+            ));
+        } else {
+            target_testing::finish(&rem_root, test_config, assurance).await;
+        }
         block_export = assurance.export_blocked;
         let artifact = bc_pathjail::confine(repo_root, "security-scan/target-tests.json");
         let saved = artifact
@@ -2093,7 +2392,8 @@ async fn dispatch_remediation(
             }
             _ => true,
         });
-        if block_export
+        if bc_pipeline_core::canceled(telemetry.cancel.as_ref()).is_some()
+            || block_export
             || result.refused.is_some()
             || result.validation_failures > 0
             || rejected_review
@@ -2258,9 +2558,25 @@ pub async fn run_with_publication(
     // fuzzy fallback reuses S7's own line tolerance, so "within N lines"
     // means the same thing across runs as it does within one.
     let line_tolerance = config.step7.line_tolerance;
+    // Captured before `config` moves into `run_scan`: remediation reports
+    // S10/S11 on the scan's own event stream, priced the same way.
+    let remediation_telemetry = bc_orchestrator::RemediateTelemetry {
+        progress: config.progress.clone(),
+        pricing: config.pricing.clone(),
+        cancel: config.cancel.clone(),
+    };
     let outcome = bc_orchestrator::run_scan(llm.clone(), tools, input, config, stop_after)
         .await
         .map_err(stringify)?;
+    // A canceled run keeps its local artifacts (the partial report says it
+    // is partial) but takes no action outside this machine: nothing is
+    // published, posted or remediated from a report the operator stopped.
+    let canceled = bc_pipeline_core::canceled(remediation_telemetry.cancel.as_ref());
+    let (publication, github, remediate) = if canceled.is_some() {
+        (None, None, None)
+    } else {
+        (publication, github, remediate)
+    };
 
     write_outputs(&outcome, md_path, sarif_path, &paths.csv).map_err(stringify)?;
     if let (Some(path), Some(plan)) = (
@@ -2303,8 +2619,15 @@ pub async fn run_with_publication(
             let delivery_requested = r.delivery.is_some();
             let target_test_requested = r.settings.target_tests.is_some();
             let out_json = r.out_json.clone();
-            let (result, patch) =
-                dispatch_remediation(llm, validate_tools, &repo_root, report, r).await;
+            let (result, patch) = dispatch_remediation(
+                llm,
+                validate_tools,
+                &repo_root,
+                report,
+                r,
+                remediation_telemetry.clone(),
+            )
+            .await;
             remediation_patch = patch;
             write_remediation_json(out_json.as_deref(), &result).map_err(stringify)?;
             if delivery_requested {
@@ -2329,6 +2652,16 @@ pub async fn run_with_publication(
         }
         _ => None,
     };
+    // A full scan that did not remediate still closes S10/S11, as
+    // Python's `_sp_done("s10", outcome="disabled")` does; a canceled one
+    // closes them as skipped by the cancellation.
+    let progress = remediation_telemetry.progress.as_ref();
+    if let Some(reason) = &canceled {
+        bc_orchestrator::remediation_canceled(progress, reason);
+    } else if remediation.is_none() && outcome.report.is_some() && outcome.stopped_after.is_none() {
+        bc_orchestrator::remediation_not_requested(progress);
+    }
+    drop(remediation_telemetry);
 
     // LAST, deliberately: `augment_report_outputs` above rebuilds
     // `report.sarif` from scratch and rewrites `report.md`, so anything
@@ -2613,7 +2946,18 @@ impl From<&bc_validation_scoring::GateResult> for GateResultExport {
 /// `RemediationRecordExport` mirroring `bc_stage_s10`'s own types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ValidationScoreExport {
-    raw_score: f64,
+    /// The numeric score, `null` when the panel was inconclusive
+    /// (`fix_status: "UNVERIFIABLE"`, `decision: "inconclusive"`): Python
+    /// reports no score there, and the `0.0` this used to carry read as
+    /// "scored and failed". A file written before this change carries a
+    /// number here, which still reads back.
+    raw_score: Option<f64>,
+    /// `fixed`/`partially_fixed`/`not_fixed`/`inconclusive`
+    /// (`bc_validation_scoring::Decision`), the label to branch on. Added
+    /// beside `fix_status`, which keeps its historical values for existing
+    /// consumers; defaulted (empty) when reading an older file.
+    #[serde(default)]
+    decision: String,
     fix_status: String,
     justification: String,
     gate_results: Vec<GateResultExport>,
@@ -2623,7 +2967,8 @@ struct ValidationScoreExport {
 impl From<&bc_validation_scoring::ValidationScore> for ValidationScoreExport {
     fn from(v: &bc_validation_scoring::ValidationScore) -> Self {
         ValidationScoreExport {
-            raw_score: v.raw_score,
+            raw_score: v.score(),
+            decision: v.decision().as_str().to_string(),
             fix_status: v.fix_status.as_str().to_string(),
             justification: v.justification.clone(),
             gate_results: v.gate_results.iter().map(GateResultExport::from).collect(),
@@ -2716,6 +3061,56 @@ impl RemediationOutcomeExport {
 struct RemediationExport {
     refused: Option<String>,
     results: Vec<RemediationOutcomeExport>,
+    /// Run-level counts and the exit code they imply. Defaulted when
+    /// reading a file written before it existed.
+    #[serde(default)]
+    totals: RemediationTotalsExport,
+    /// vvaharness v1.4.0's `rollup { cases, states, decisions }`.
+    #[serde(default)]
+    rollup: RollupExport,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RemediationTotalsExport {
+    attempted: usize,
+    fixed: usize,
+    not_fixed: usize,
+    failed: usize,
+    validation_failures: usize,
+    exit_code: u8,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RollupExport {
+    cases: usize,
+    states: std::collections::BTreeMap<String, usize>,
+    decisions: std::collections::BTreeMap<String, usize>,
+}
+
+impl From<&RemediationSummary> for RemediationTotalsExport {
+    fn from(s: &RemediationSummary) -> Self {
+        RemediationTotalsExport {
+            attempted: s.processed + s.failed,
+            fixed: s.fixed,
+            not_fixed: s.not_fixed,
+            failed: s.failed,
+            validation_failures: s.validation_failures,
+            exit_code: s.exit_code(),
+        }
+    }
+}
+
+impl From<&bc_validation_scoring::Rollup> for RollupExport {
+    fn from(r: &bc_validation_scoring::Rollup) -> Self {
+        let owned = |m: &std::collections::BTreeMap<&'static str, usize>| {
+            m.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+        RollupExport {
+            cases: r.cases,
+            states: owned(&r.states),
+            decisions: owned(&r.decisions),
+        }
+    }
 }
 
 /// Maps each `Some(_)` validation entry back to the stable finding id its
@@ -3094,9 +3489,12 @@ fn write_remediation_json(
             RemediationOutcomeExport::from_parts(o, validation)
         })
         .collect();
+    let summary = RemediationSummary::from(outcome);
     let export = RemediationExport {
         refused: outcome.refused.clone(),
         results,
+        totals: RemediationTotalsExport::from(&summary),
+        rollup: RollupExport::from(&summary.rollup),
     };
     let json = serde_json::to_string_pretty(&export)
         .expect("RemediationExport contains no non-serializable types");
@@ -3215,24 +3613,55 @@ pub fn run_gc(cli: &Cli) -> Result<ScanSummary, String> {
 /// config are already known-bad, so it's skipped entirely rather than run
 /// and reported as failed.
 async fn run_doctor(cli: &Cli) -> DoctorSummary {
-    let client_result = build_llm_client(cli);
+    let stack_result = build_llm_stack(cli);
+    let client_result = stack_result
+        .as_ref()
+        .map(|stack| stack.client.clone())
+        .map_err(Clone::clone);
     let checks = environment::run_checks(cli, &client_result);
     let blocking = environment::n_blocking(&checks);
     let checks_rendered = environment::render(&checks);
+    let models = model_policy::configured_models(&cli.model, &lenient_config_data(cli));
+    let models_rendered =
+        model_policy::render_capabilities(&models, &bc_llm_client::capabilities::today_utc());
+    let mut cache_probe = None;
     let probe = if blocking == 0 {
         // `blocking == 0` means every `required` check passed, including
         // the "gateway client" check `run_checks` derived from this SAME
-        // `client_result` — so it's provably `Ok` here.
-        let client = client_result
+        // `stack_result`, so it's provably `Ok` here.
+        let stack = stack_result
             .expect("blocking == 0 implies the gateway-client check already found this Ok");
-        Some(environment::probe_gateway(client.as_ref(), &cli.model).await)
+        let probe = environment::probe_gateway(stack.client.as_ref(), &cli.model).await;
+        if cli.cache_probe {
+            cache_probe = Some(if probe.status == environment::CheckStatus::Ok {
+                let dialect = match cli.dialect {
+                    Dialect::Openai => bc_llm_client::CacheDialect::OpenAi,
+                    Dialect::Anthropic => bc_llm_client::CacheDialect::Anthropic,
+                };
+                cache_probe::run(
+                    stack.client.as_ref(),
+                    &cli.model,
+                    dialect,
+                    &stack.settings.cache,
+                )
+                .await
+            } else {
+                cache_probe::CacheProbeOutcome::skipped(&cli.model)
+            });
+        }
+        Some(probe)
     } else {
+        cache_probe = cli
+            .cache_probe
+            .then(|| cache_probe::CacheProbeOutcome::skipped(&cli.model));
         None
     };
     DoctorSummary {
         checks_rendered,
         blocking,
+        models_rendered,
         probe,
+        cache_probe,
     }
 }
 
@@ -3269,6 +3698,17 @@ fn check_automatic_publication_mode(cli: &Cli) -> Result<(), String> {
 /// integration test can drive it directly with real `argv`-parsed `Cli`
 /// values, exercising the exact code path the compiled binary runs.
 pub async fn main_impl(cli: Cli) -> Result<ScanSummary, String> {
+    main_impl_with_cancel(cli, None).await
+}
+
+/// [`main_impl`] with the process's Ctrl-C [`cancel::Controller`]. A scan
+/// (and the remediation that follows it) arms it, making the first Ctrl-C
+/// a cooperative cancellation; every other mode leaves it unarmed, so a
+/// Ctrl-C there exits at once. `None` is a run nothing can cancel.
+pub async fn main_impl_with_cancel(
+    cli: Cli,
+    cancel: Option<cancel::Controller>,
+) -> Result<ScanSummary, String> {
     if cli.provider_publish.publish_provider_plan.is_none() && cli.provider_publish.requires_plan()
     {
         return Err("Provider publication flags require --publish-provider-plan".into());
@@ -3400,6 +3840,14 @@ pub async fn main_impl(cli: Cli) -> Result<ScanSummary, String> {
         })?;
         return post_fixes_only(&github, &path).await;
     }
+    // Every mode below calls a model: refuse a retired one before any
+    // token is spent, the preflight probe's included. `--doctor` and
+    // `--setup` report the same verdict as a check instead.
+    model_policy::enforce(
+        &cli.model,
+        &lenient_config_data(&cli),
+        cli.allow_unsupported_model,
+    )?;
     if let Some(path) = cli.remediate_from.clone() {
         // Needs a real gateway (S10 is an agentic loop) but no scan, so
         // the preflight probe still applies — an unreachable gateway
@@ -3408,7 +3856,8 @@ pub async fn main_impl(cli: Cli) -> Result<ScanSummary, String> {
         if !cli.skip_preflight {
             preflight::run(&cli, &client_result).await?;
         }
-        return remediate_from(&cli, &path, client_result?).await;
+        let cancel = cancel.as_ref().map(cancel::Controller::arm);
+        return remediate_from_with_cancel(&cli, &path, client_result?, cancel).await;
     }
     if let Some(manifest_path) = cli.repo_file.clone() {
         let summary = batch::run_batch(&cli, &manifest_path).await?;
@@ -3435,11 +3884,16 @@ pub async fn main_impl(cli: Cli) -> Result<ScanSummary, String> {
     }
 
     let publication = provider_publish::automatic::configure(&cli)?;
-    let client_result = build_llm_client(&cli);
+    let stack_result = build_llm_stack(&cli);
+    let client_result = stack_result
+        .as_ref()
+        .map(|stack| stack.client.clone())
+        .map_err(Clone::clone);
     if !cli.skip_preflight {
         preflight::run(&cli, &client_result).await?;
     }
-    let llm = client_result?;
+    let stack = stack_result?;
+    let llm = stack.client.clone();
     let tools: Arc<dyn ToolExecutor> = Arc::new(SandboxTools::new(repo_path(&cli).to_path_buf()));
     let github = build_github_client(&cli)?;
     let mut config = build_scan_config(&cli)?;
@@ -3486,12 +3940,35 @@ pub async fn main_impl(cli: Cli) -> Result<ScanSummary, String> {
         })
         .transpose()?;
 
-    // `None` when disabled (`--no-progress`, or stdout isn't a real
-    // terminal), matching every scan's behavior before this existed.
-    // Joined AFTER `run` returns so the bar has already cleared itself
-    // before the summary line prints below main_impl's own caller
-    // (`main.rs`'s `println!("{summary}")`).
-    let progress_handle = progress::wire(&mut config, progress::should_render(cli.no_progress));
+    // Past every argument check and utility mode: a scan is about to
+    // run, so it gets a run manifest (see `run_manifest`).
+    let manifest = run_manifest::begin(
+        &cli,
+        &config,
+        remediate.as_ref().map(|r| &r.settings),
+        stack.settings.openai_api,
+        &input.repo_name,
+        std::env::args_os()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect(),
+    );
+    // The render thread always runs (the manifest's telemetry needs the
+    // stream); the bar only when stdout is a terminal and `--no-progress`
+    // is absent, and never together with text progress lines. Joined
+    // AFTER `run` returns so the bar has already cleared itself before
+    // the summary line prints below main_impl's own caller (`main.rs`'s
+    // `println!("{summary}")`).
+    let mut observers = progress::Observers::choose(
+        progress::should_render(cli.no_progress),
+        progress_lines::from_cli(&cli),
+    );
+    if cli.s6_progress_file || config.step6.progress_file {
+        observers.s6_progress = s6_progress::resolve(repo_path(&cli));
+    }
+    let progress_handle = progress::wire(&mut config, observers);
+    // Armed only now, with the run manifest begun: from here a Ctrl-C has
+    // a partial report and a manifest worth waiting for.
+    config.cancel = cancel.as_ref().map(cancel::Controller::arm);
 
     let result = run_with_publication(
         input,
@@ -3506,14 +3983,30 @@ pub async fn main_impl(cli: Cli) -> Result<ScanSummary, String> {
         publication,
     )
     .await;
-    if let Some(handle) = progress_handle {
-        let _ = handle.join();
-    }
+    let telemetry = progress_handle.join().unwrap_or_default();
+    let git_sha = non_empty(&cli.git_sha)
+        .map(str::to_string)
+        .or_else(|| bc_orchestrator::head_sha(repo_path(&cli)));
+    let exit_code = i32::from(process_exit_code(
+        &result,
+        cli.remediation_exit_code,
+        cancel.as_ref().is_some_and(cancel::Controller::is_canceled),
+    ));
+    run_manifest::finish(
+        manifest,
+        &telemetry,
+        exit_code,
+        git_sha,
+        stack.responses_fallbacks(),
+    );
     result
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    /// Ctrl-C through the CLI's own scan and remediation wiring.
+    mod cancel_run_tests;
+
     use async_trait::async_trait;
     use bc_llm_client::{
         ChatRequest, ChatResponse, ContentBlock, LlmError, StopReason, ToolSpec, Usage,
@@ -3568,9 +4061,15 @@ pub(crate) mod tests {
             seed: None,
             top_p: None,
             step_timeout: None,
+            reasoning_effort: None,
+            openai_api: None,
+            no_cache_markers: false,
+            allow_unsupported_model: false,
             gateway_base_url: "http://127.0.0.1:0".to_string(),
             gateway_api_key: None,
             ca_cert: None,
+            client_cert: None,
+            client_key: None,
             dialect: Dialect::Openai,
             pricing_provider: None,
             stop_after: String::new(),
@@ -3631,7 +4130,12 @@ pub(crate) mod tests {
             baseline: None,
             config: None,
             remediate: false,
+            validate: None,
+            no_validate: false,
+            remediation_exit_code: true,
             target_tests: None,
+            api_spec: Default::default(),
+            api_spec_formats: Vec::new(),
             top: None,
             interactive: false,
             force: false,
@@ -3664,7 +4168,11 @@ pub(crate) mod tests {
             log_stderr: false,
             verbose: 0,
             no_progress: true,
+            progress_style: None,
+            s6_progress_file: false,
+            out_run_manifest: None,
             doctor: false,
+            cache_probe: false,
             stream_large_responses: false,
             skip_preflight: true,
             setup: false,
@@ -3674,6 +4182,58 @@ pub(crate) mod tests {
     }
 
     // ── clap: --repo / --repo-file mutual exclusion ─────────────────────
+
+    /// Every branch of the exit-code mapping `main.rs` and the run
+    /// manifest share.
+    #[test]
+    fn process_exit_code_covers_errors_health_and_remediation() {
+        let ok = |s: ScanSummary| -> Result<ScanSummary, String> { Ok(s) };
+        assert_eq!(process_exit_code(&Err("boom".to_string()), true, false), 1);
+        assert_eq!(
+            process_exit_code(&ok(ScanSummary::default()), true, false),
+            0
+        );
+
+        let unhealthy_doctor = ScanSummary {
+            doctor: Some(DoctorSummary {
+                checks_rendered: String::new(),
+                blocking: 1,
+                models_rendered: String::new(),
+                probe: None,
+                cache_probe: None,
+            }),
+            ..ScanSummary::default()
+        };
+        assert_eq!(process_exit_code(&ok(unhealthy_doctor), true, false), 1);
+        let unhealthy_setup = ScanSummary {
+            setup: Some(SetupSummary {
+                checks_rendered: String::new(),
+                blocking: 2,
+            }),
+            ..ScanSummary::default()
+        };
+        assert_eq!(process_exit_code(&ok(unhealthy_setup), true, false), 1);
+
+        let failed_remediation = ScanSummary {
+            remediation: Some(RemediationSummary {
+                failed: 1,
+                ..RemediationSummary::default()
+            }),
+            ..ScanSummary::default()
+        };
+        assert_eq!(
+            process_exit_code(&ok(failed_remediation.clone()), true, false),
+            1
+        );
+        // `--remediation-exit-code false` keeps the old always-0 behavior.
+        assert_eq!(process_exit_code(&ok(failed_remediation), false, false), 0);
+        // A canceled run is 130 whatever else happened, an error included.
+        assert_eq!(
+            process_exit_code(&ok(ScanSummary::default()), true, true),
+            130
+        );
+        assert_eq!(process_exit_code(&Err("boom".to_string()), true, true), 130);
+    }
 
     #[test]
     fn repo_alone_parses_fine() {
@@ -4114,7 +4674,7 @@ pub(crate) mod tests {
 
     /// Each `--out-*` flag moves ONLY its own format; everything else
     /// stays in the out-dir. Proven one format at a time, so a flag that
-    /// silently redirected a neighbour would fail here.
+    /// silently redirected a neighbor would fail here.
     #[test]
     fn each_out_flag_overrides_only_its_own_format() {
         let custom = PathBuf::from("/custom/x");
@@ -4177,16 +4737,16 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn ensure_dirs_reports_a_directory_it_cannot_create() {
-        use std::os::unix::fs::PermissionsExt;
+        // A path component is a regular file, so the directory cannot be
+        // created (ENOTDIR) by any user. A mode 000 directory would not
+        // stop root, which bypasses permission bits.
         let dir = tempfile::tempdir().unwrap();
         let unwritable = dir.path().join("locked");
-        std::fs::create_dir(&unwritable).unwrap();
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(&unwritable, "not a directory").unwrap();
         let paths = out_paths(&unwritable.join("nested"));
 
         let err = paths.ensure_dirs().unwrap_err();
 
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(err.contains("cannot create output directory"), "{err}");
         assert!(err.contains("nested"), "{err}");
     }
@@ -4194,6 +4754,163 @@ pub(crate) mod tests {
     #[test]
     fn build_llm_client_constructs_an_openai_client_by_default() {
         assert!(build_llm_client(&cli(Path::new("/repo"))).is_ok());
+    }
+
+    #[test]
+    fn the_model_default_is_the_reasoning_model_and_the_new_flags_parse() {
+        let base = ["bc-sast", "--repo", "/r", "--gateway-base-url", "http://h"];
+        let cli = Cli::try_parse_from(base).unwrap();
+        assert_eq!(cli.model, "gpt-5.6-luna");
+        assert_eq!(cli.reasoning_effort, None);
+        assert!(!cli.no_cache_markers && !cli.allow_unsupported_model && !cli.cache_probe);
+
+        let cli = Cli::try_parse_from(base.into_iter().chain([
+            "--reasoning-effort",
+            "XHigh",
+            "--openai-api",
+            "responses",
+            "--no-cache-markers",
+            "--allow-unsupported-model",
+            "--doctor",
+            "--cache-probe",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cli.reasoning_effort,
+            Some(bc_llm_client::ReasoningEffort::XHigh)
+        );
+        assert_eq!(cli.openai_api, Some(bc_llm_client::OpenAiApi::Responses));
+        assert!(cli.no_cache_markers && cli.allow_unsupported_model && cli.cache_probe);
+
+        for bad in [
+            &["--reasoning-effort", "extreme"][..],
+            &["--openai-api", "grpc"],
+            // Spends tokens, so only ever as part of an explicit doctor run.
+            &["--cache-probe"],
+        ] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(bad.iter().copied())).is_err());
+        }
+    }
+
+    #[test]
+    fn bc_openai_api_is_read_from_the_environment_below_the_flag() {
+        let _guard = ENV_LOCK.blocking_lock();
+        let prior = std::env::var("BC_OPENAI_API").ok();
+        std::env::set_var("BC_OPENAI_API", "chat");
+        let base = ["bc-sast", "--repo", "/r", "--gateway-base-url", "http://h"];
+        let from_env = Cli::try_parse_from(base).unwrap().openai_api;
+        let from_flag = Cli::try_parse_from(base.into_iter().chain(["--openai-api", "auto"]))
+            .unwrap()
+            .openai_api;
+        restore_env("BC_OPENAI_API", prior);
+        assert_eq!(from_env, Some(bc_llm_client::OpenAiApi::Chat));
+        assert_eq!(from_flag, Some(bc_llm_client::OpenAiApi::Auto));
+    }
+
+    #[test]
+    fn build_llm_stack_resolves_the_transport_and_shares_the_openai_learning() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.yaml");
+        std::fs::write(&config, "llm:\n  openai_api: chat\n  cache_ttl: 1h\n").unwrap();
+        let mut c = cli(dir.path());
+        c.config = Some(config.clone());
+        let stack = build_llm_stack(&c).unwrap();
+        assert_eq!(stack.settings.openai_api, bc_llm_client::OpenAiApi::Chat);
+        assert_eq!(stack.settings.cache.ttl, bc_llm_client::CacheTtl::OneHour);
+        assert_eq!(stack.responses_fallbacks(), Some(0));
+
+        c.dialect = Dialect::Anthropic;
+        assert_eq!(build_llm_stack(&c).unwrap().responses_fallbacks(), None);
+
+        std::fs::write(&config, "llm:\n  cache_ttl: 2h\n").unwrap();
+        let err = build_llm_stack(&c).err().unwrap();
+        assert!(err.starts_with("llm.cache_ttl: "), "{err}");
+    }
+
+    #[test]
+    fn build_scan_config_prices_one_hour_writes_only_on_the_anthropic_dialect() {
+        let dir = tempfile::tempdir().unwrap();
+        // Outside the scan target, or the trust gate refuses it.
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = config_dir.path().join("config.yaml");
+        std::fs::write(&config, "llm:\n  cache_ttl: 1h\n").unwrap();
+        let mut c = cli(dir.path());
+        c.config = Some(config);
+        assert_eq!(
+            build_scan_config(&c).unwrap().pricing.cache_ttl,
+            bc_llm_client::CacheTtl::FiveMinutes
+        );
+        c.dialect = Dialect::Anthropic;
+        assert_eq!(
+            build_scan_config(&c).unwrap().pricing.cache_ttl,
+            bc_llm_client::CacheTtl::OneHour
+        );
+    }
+
+    #[test]
+    fn a_misspelt_effort_in_the_config_fails_the_run_up_front() {
+        let dir = tempfile::tempdir().unwrap();
+        // Outside the scan target, or the trust gate refuses it.
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = config_dir.path().join("config.yaml");
+        std::fs::write(&config, "models:\n  deepdive:\n    effort: hihg\n").unwrap();
+        let mut c = cli(dir.path());
+        c.config = Some(config);
+        let err = build_scan_config(&c).err().unwrap();
+        assert!(err.contains("models.deepdive.effort"), "{err}");
+        let err = build_remediate_settings(&c).err().unwrap();
+        assert!(err.contains("models.deepdive.effort"), "{err}");
+    }
+
+    #[test]
+    fn the_effort_flag_and_role_config_reach_the_scan_and_remediation_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        // Outside the scan target, or the trust gate refuses it.
+        let config_dir = tempfile::tempdir().unwrap();
+        let config = config_dir.path().join("config.yaml");
+        std::fs::write(
+            &config,
+            "models:\n  verify:\n    effort: max\n    use_responses_api: true\n",
+        )
+        .unwrap();
+        let mut c = cli(dir.path());
+        c.config = Some(config);
+        c.reasoning_effort = Some(bc_llm_client::ReasoningEffort::Low);
+        let scan = build_scan_config(&c).unwrap();
+        assert_eq!(
+            scan.step6.reasoning_effort,
+            Some(bc_llm_client::ReasoningEffort::Max)
+        );
+        assert_eq!(
+            scan.step6.openai_api,
+            Some(bc_llm_client::OpenAiApi::Responses)
+        );
+        assert_eq!(
+            scan.step4.reasoning_effort,
+            Some(bc_llm_client::ReasoningEffort::Low)
+        );
+        let remediate = build_remediate_settings(&c).unwrap();
+        assert_eq!(
+            remediate.config.step10.reasoning_effort,
+            Some(bc_llm_client::ReasoningEffort::Low)
+        );
+        assert_eq!(
+            remediate.step11.reasoning_effort,
+            Some(bc_llm_client::ReasoningEffort::Low)
+        );
+    }
+
+    #[tokio::test]
+    async fn main_impl_refuses_a_retired_model_before_any_spend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cli(dir.path());
+        c.model = "claude-2.1".to_string();
+        // Preflight on and a gateway that does not exist: the gate has to
+        // refuse before the probe would have tried the network.
+        c.skip_preflight = false;
+        let err = main_impl(c).await.err().unwrap();
+        assert!(err.contains("claude-2.1 is retired"), "{err}");
+        assert!(err.contains("claude-sonnet-5"), "{err}");
     }
 
     #[test]
@@ -5009,15 +5726,14 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn write_findings_json_propagates_an_io_error() {
-        use std::os::unix::fs::PermissionsExt;
+        // A path component is a regular file (ENOTDIR for every user; a
+        // mode 000 directory would not stop root).
         let dir = tempfile::tempdir().unwrap();
         let unwritable = dir.path().join("locked");
-        std::fs::create_dir(&unwritable).unwrap();
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(&unwritable, "not a directory").unwrap();
         let path = unwritable.join("nested/findings.json");
         let report = sample_report(Some("sha"), vec![sample_finding()]);
         let result = write_findings_json(&path, Some(&report));
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err());
     }
 
@@ -5212,6 +5928,8 @@ pub(crate) mod tests {
         let path = write_remediation_export(
             dir.path(),
             &RemediationExport {
+                totals: Default::default(),
+                rollup: Default::default(),
                 refused: None,
                 results: vec![
                     processed_fix_outcome("fid1", Some("diff --git a/x b/x\n+fixed")),
@@ -5278,6 +5996,8 @@ pub(crate) mod tests {
         let path = write_remediation_export(
             dir.path(),
             &RemediationExport {
+                totals: Default::default(),
+                rollup: Default::default(),
                 refused: None,
                 results: vec![processed_fix_outcome("fid1", None)],
             },
@@ -5307,6 +6027,8 @@ pub(crate) mod tests {
         let path = write_remediation_export(
             dir.path(),
             &RemediationExport {
+                totals: Default::default(),
+                rollup: Default::default(),
                 refused: None,
                 results: vec![processed_fix_outcome(
                     "fid1",
@@ -5326,6 +6048,8 @@ pub(crate) mod tests {
         let path = write_remediation_export(
             dir.path(),
             &RemediationExport {
+                totals: Default::default(),
+                rollup: Default::default(),
                 refused: None,
                 results: Vec::new(),
             },
@@ -6135,6 +6859,7 @@ pub(crate) mod tests {
                 processed: 0,
                 failed: 0,
                 validated: None,
+                ..Default::default()
             }),
             remediation_patch: None,
             baseline: None,
@@ -6171,6 +6896,7 @@ pub(crate) mod tests {
                 processed: 1,
                 failed: 2,
                 validated: None,
+                ..Default::default()
             }),
             remediation_patch: None,
             baseline: None,
@@ -6395,6 +7121,8 @@ pub(crate) mod tests {
         let mut step1 = Step1Config::new("m");
         step1.retry_backoff_base = std::time::Duration::ZERO;
         ScanConfig {
+            autoexclude: Default::default(),
+            cancel: None,
             step0_enabled: false,
             step0: Step0Config::new(),
             step1,
@@ -6418,34 +7146,6 @@ pub(crate) mod tests {
 
     fn fast_input(dir: &Path) -> ScanInput {
         build_scan_input(&cli(dir))
-    }
-
-    // ── progress::wire ───────────────────────────────────────────────────
-    // Lives here (not in progress.rs's own test module) to reuse
-    // `fast_config()` rather than duplicating a full `ScanConfig` builder
-    // a second time just for these two cases.
-
-    #[test]
-    fn progress_wire_disabled_leaves_config_progress_unset_and_returns_no_handle() {
-        let mut config = fast_config();
-        let handle = progress::wire(&mut config, false);
-        assert!(handle.is_none());
-        assert!(config.progress.is_none());
-    }
-
-    #[test]
-    fn progress_wire_enabled_sets_config_progress_and_returns_a_joinable_handle() {
-        let mut config = fast_config();
-        let handle = progress::wire(&mut config, true);
-        assert!(config.progress.is_some());
-        // Dropping `config` (and with it the sink) disconnects the render
-        // thread's channel, so the handle joins promptly instead of
-        // blocking forever.
-        drop(config);
-        handle
-            .expect("wire(_, true) always returns a handle")
-            .join()
-            .expect("render thread must not panic");
     }
 
     // ── S10 remediation test fixtures ──────────────────────────────────
@@ -6962,11 +7662,11 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn run_refuses_an_output_directory_it_cannot_create_before_scanning() {
-        use std::os::unix::fs::PermissionsExt;
+        // A path component is a regular file (ENOTDIR for every user; a
+        // mode 000 directory would not stop root).
         let dir = setup_repo();
         let unwritable = dir.path().join("locked");
-        std::fs::create_dir(&unwritable).unwrap();
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(&unwritable, "not a directory").unwrap();
         let paths = out_paths(&unwritable.join("nested"));
 
         let result = run(
@@ -6982,7 +7682,6 @@ pub(crate) mod tests {
         )
         .await;
 
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let err = result.unwrap_err();
         assert!(err.contains("cannot create output directory"), "{err}");
     }
@@ -7016,15 +7715,17 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn run_propagates_a_write_remediation_json_failure() {
-        use std::os::unix::fs::PermissionsExt;
         // A real git repo, so the scan reaches a `FinalReport` and `run()`'s
         // remediate branch actually calls `write_remediation_json` instead
         // of skipping it (matching `run_propagates_a_write_findings_json_
-        // failure`'s rationale for its own target function).
+        // failure`'s rationale for its own target function). The output
+        // path runs through a regular file, outside the scanned repo, so
+        // its directory cannot be created (ENOTDIR) by any user; a mode
+        // 000 directory would not stop root.
         let dir = git_repo();
-        let unwritable = dir.path().join("locked");
-        std::fs::create_dir(&unwritable).unwrap();
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let unwritable = elsewhere.path().join("locked");
+        std::fs::write(&unwritable, "not a directory").unwrap();
         let paths = out_paths(&dir.path().join("out"));
         let out_json = unwritable.join("nested/remediation.json");
         let remediate = RemediateRun {
@@ -7063,7 +7764,6 @@ pub(crate) mod tests {
         )
         .await;
 
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err());
     }
 
@@ -7096,6 +7796,54 @@ pub(crate) mod tests {
 
         let summary = main_impl(c).await.unwrap();
         assert_eq!(summary.stopped_after, Some(StopAfter::S1));
+        // A scan ran, so it left a run manifest in the out-dir.
+        let manifest: bc_orchestrator::manifest::RunManifest = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("security-scan/run_manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.exit_code, 0);
+        let s1 = &manifest
+            .stages
+            .0
+            .iter()
+            .find(|(id, _)| id == "s1")
+            .unwrap()
+            .1;
+        assert_eq!(s1.outcome, "completed");
+        assert!(s1.duration_sec.is_some());
+    }
+
+    #[tokio::test]
+    async fn main_impl_writes_the_manifest_where_asked_even_for_a_failed_scan() {
+        // No mock mounted: S1's model call fails and the scan errors out
+        // after it started, which is still a run worth recording.
+        let server = wiremock::MockServer::start().await;
+        let dir = setup_repo();
+        let out = tempfile::tempdir().unwrap();
+        let mut c = cli(dir.path());
+        c.gateway_base_url = server.uri();
+        c.stop_after = "s1".to_string();
+        c.progress_style = Some(progress_lines::ProgressStyle::StageOnly);
+        c.s6_progress_file = true;
+        c.out_run_manifest = Some(out.path().join("m.json"));
+        let _ = main_impl(c).await;
+        let manifest: bc_orchestrator::manifest::RunManifest =
+            serde_json::from_str(&std::fs::read_to_string(out.path().join("m.json")).unwrap())
+                .unwrap();
+        assert!(manifest.stages.0.iter().any(|(id, _)| id == "s1"));
+        assert!(!dir.path().join("security-scan/run_manifest.json").exists());
+    }
+
+    #[tokio::test]
+    async fn main_impl_writes_no_manifest_for_an_argument_error_or_a_utility_mode() {
+        let dir = setup_repo();
+        let mut c = cli(dir.path());
+        c.stop_after = "s42".to_string();
+        assert!(main_impl(c).await.is_err());
+        let mut c = cli(dir.path());
+        c.estimate = true;
+        main_impl(c).await.unwrap();
+        assert!(!dir.path().join("security-scan/run_manifest.json").exists());
     }
 
     #[tokio::test]
@@ -7712,6 +8460,7 @@ pub(crate) mod tests {
                 processed: 0,
                 failed: 0,
                 validated: None,
+                ..Default::default()
             }),
             remediation_patch: None,
             baseline: None,
@@ -7743,6 +8492,7 @@ pub(crate) mod tests {
                 processed: 2,
                 failed: 1,
                 validated: None,
+                ..Default::default()
             }),
             remediation_patch: None,
             baseline: None,
@@ -7754,7 +8504,7 @@ pub(crate) mod tests {
         };
         assert!(s
             .to_string()
-            .contains("Remediation: 2 processed, 1 failed."));
+            .contains("Remediation: 2 processed, 1 failed. Outcome: 0 fixed, 0 not fixed."));
     }
 
     #[test]
@@ -7781,6 +8531,7 @@ pub(crate) mod tests {
                     not_fixed: 1,
                     unverifiable: 0,
                 }),
+                ..Default::default()
             }),
             remediation_patch: None,
             baseline: None,
@@ -7819,6 +8570,7 @@ pub(crate) mod tests {
                     not_fixed: 0,
                     unverifiable: 0,
                 }),
+                ..Default::default()
             }),
             remediation_patch: None,
             baseline: None,
@@ -7855,6 +8607,7 @@ pub(crate) mod tests {
                     not_fixed: 0,
                     unverifiable: 0,
                 }),
+                ..Default::default()
             }),
             remediation_patch: None,
             baseline: None,
@@ -7886,6 +8639,7 @@ pub(crate) mod tests {
                 processed: 1,
                 failed: 0,
                 validated: None,
+                ..Default::default()
             }),
             remediation_patch: None,
             baseline: None,
@@ -7906,15 +8660,14 @@ pub(crate) mod tests {
 
     #[test]
     fn write_remediation_json_propagates_an_io_error() {
-        use std::os::unix::fs::PermissionsExt;
+        // A path component is a regular file (ENOTDIR for every user; a
+        // mode 000 directory would not stop root).
         let dir = tempfile::tempdir().unwrap();
         let unwritable = dir.path().join("locked");
-        std::fs::create_dir(&unwritable).unwrap();
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::write(&unwritable, "not a directory").unwrap();
         let path = unwritable.join("nested/remediation.json");
         let outcome = bc_orchestrator::RemediateOutcome::default();
         let result = write_remediation_json(Some(&path), &outcome);
-        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.is_err());
     }
 
@@ -9288,7 +10041,15 @@ pub(crate) mod tests {
         run: RemediateRun,
     ) -> (bc_orchestrator::RemediateOutcome, Option<PathBuf>) {
         let read_tools: Arc<dyn ToolExecutor> = Arc::new(SandboxTools::new(repo.to_path_buf()));
-        dispatch_remediation(llm, read_tools, repo, report, run).await
+        dispatch_remediation(
+            llm,
+            read_tools,
+            repo,
+            report,
+            run,
+            bc_orchestrator::RemediateTelemetry::default(),
+        )
+        .await
     }
 
     /// No `git_sha`, so `stale_refusal` never pre-empts the isolation and
@@ -10171,7 +10932,10 @@ pub(crate) mod tests {
         .unwrap();
 
         let run_id = bc_checkpoint::run_id_for(dir.path());
-        assert!(store.load(&run_id, "remediate_1").is_some());
+        // Steps are engine-keyed digests, so count the S10 rows instead of
+        // naming one: pruning against an empty live set returns them all.
+        let saved = store.prune_stale(&run_id, bc_stage_s10::REMEDIATE_STEP_PREFIX, &[]);
+        assert_eq!(saved.len(), 1, "{saved:?}");
     }
 
     // ── `-i`/`--interactive` dispatch (`remediate_interactively`) ───────
@@ -10793,6 +11557,7 @@ pub(crate) mod tests {
                 failed: 0,
                 validated: None,
                 validation_failures: 0,
+                ..Default::default()
             }),
             ..Default::default()
         }
@@ -11284,23 +12049,145 @@ pub(crate) mod tests {
         let healthy = DoctorSummary {
             checks_rendered: String::new(),
             blocking: 0,
-            probe: Some(ok_probe),
+            models_rendered: "  [model] m: family=(unknown".to_string(),
+            probe: Some(ok_probe.clone()),
+            cache_probe: None,
         };
         assert!(healthy.healthy());
         assert!(healthy.to_string().contains('\u{2713}'));
+        assert!(healthy.to_string().contains("[model] m: family="));
 
         let failed_probe = DoctorSummary {
             checks_rendered: String::new(),
             blocking: 0,
+            models_rendered: String::new(),
             probe: Some(environment::Check {
                 name: "live probe".to_string(),
                 status: environment::CheckStatus::Fail,
                 detail: "connection refused".to_string(),
                 required: false,
             }),
+            cache_probe: None,
         };
         assert!(!failed_probe.healthy());
         assert!(failed_probe.to_string().contains('\u{2717}'));
+
+        // A cache probe that could not reach a verdict fails the doctor;
+        // one that did is healthy whatever the verdict says.
+        let unfinished_cache_probe = DoctorSummary {
+            cache_probe: Some(cache_probe::CacheProbeOutcome::skipped("m")),
+            ..healthy.clone()
+        };
+        assert!(!unfinished_cache_probe.healthy());
+        assert!(unfinished_cache_probe
+            .to_string()
+            .ends_with("[cache-probe] \u{2717} skipped: the live probe did not reach the model"));
+    }
+
+    /// A gateway that answers every call with the same cache accounting:
+    /// what `--doctor --cache-probe` reads back through the real client.
+    async fn cache_probe_gateway(dialect_path: &str, body: Value) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(dialect_path))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn doctor_cache_probe_runs_through_the_real_client_after_the_live_probe() {
+        let server = cache_probe_gateway(
+            "/v1/messages",
+            json!({
+                "id": "msg_1", "type": "message", "role": "assistant",
+                "model": "claude-opus-5",
+                "content": [{"type": "text", "text": "PONG"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 12, "output_tokens": 2,
+                          "cache_creation_input_tokens": 0,
+                          "cache_read_input_tokens": 9000},
+            }),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cli(dir.path());
+        c.dialect = Dialect::Anthropic;
+        c.gateway_base_url = server.uri();
+        c.model = "claude-opus-5".to_string();
+        c.doctor = true;
+        c.cache_probe = true;
+        let summary = run_doctor(&c).await;
+        assert!(summary.healthy(), "{summary}");
+        let outcome = summary.cache_probe.as_ref().unwrap();
+        assert_eq!(
+            outcome.result.as_ref().unwrap().verdict,
+            bc_llm_client::CacheProbeVerdict::AlreadyWarm
+        );
+        let text = summary.to_string();
+        assert!(
+            text.contains("[model] claude-opus-5: family=claude-opus-5"),
+            "{text}"
+        );
+        assert!(text.contains("real tokens were spent"), "{text}");
+        // The live probe plus the probe's two calls, each carrying the
+        // cache policy's marker on the filler system prompt.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let probe_body: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(
+            probe_body.to_string().contains("cache_control"),
+            "{probe_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_skips_the_cache_probe_when_the_live_probe_fails_or_a_check_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing listens on port 0: the live probe fails.
+        let mut c = cli(dir.path());
+        c.doctor = true;
+        c.cache_probe = true;
+        let summary = run_doctor(&c).await;
+        assert!(!summary.cache_probe.as_ref().unwrap().completed());
+
+        let bad_pem = dir.path().join("bad.pem");
+        std::fs::write(&bad_pem, "not a pem file").unwrap();
+        c.ca_cert = Some(bad_pem);
+        let summary = run_doctor(&c).await;
+        assert!(summary.probe.is_none());
+        assert!(!summary.cache_probe.as_ref().unwrap().completed());
+
+        // Not asked for: nothing is reported either way.
+        c.cache_probe = false;
+        assert!(run_doctor(&c).await.cache_probe.is_none());
+    }
+
+    #[tokio::test]
+    async fn doctor_uses_an_openai_cache_dialect_for_the_openai_client() {
+        let server = cache_probe_gateway(
+            "/v1/chat/completions",
+            json!({
+                "id": "c1", "object": "chat.completion", "model": "gpt-4o",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": "PONG"}}],
+                "usage": {"prompt_tokens": 9000, "completion_tokens": 1,
+                          "prompt_tokens_details": {"cached_tokens": 8000}},
+            }),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = cli(dir.path());
+        c.gateway_base_url = format!("{}/v1", server.uri());
+        c.model = "gpt-4o".to_string();
+        c.doctor = true;
+        c.cache_probe = true;
+        let summary = run_doctor(&c).await;
+        assert_eq!(
+            summary.cache_probe.unwrap().result.unwrap().verdict,
+            bc_llm_client::CacheProbeVerdict::OpenAiImplicitWorking
+        );
     }
 
     #[tokio::test]

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TEST FIXTURE ONLY: a hand-written OData CSDL (EDMX) document for bc-xml
+     round-trip tests. It does not describe a real service. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:Reference Uri="https://oasis-tcs.github.io/odata-vocabularies/vocabularies/Org.OData.Core.V1.xml">
+    <edmx:Include Namespace="Org.OData.Core.V1" Alias="Core"/>
+  </edmx:Reference>
+  <edmx:DataServices>
+    <Schema Namespace="Example.Trips" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="Person">
+        <Key>
+          <PropertyRef Name="UserName"/>
+        </Key>
+        <Property Name="UserName" Type="Edm.String" Nullable="false"/>
+        <Property Name="FirstName" Type="Edm.String" Nullable="false"/>
+        <Property Name="Emails" Type="Collection(Edm.String)"/>
+        <Property Name="Gender" Type="Example.Trips.PersonGender"/>
+        <NavigationProperty Name="Friends" Type="Collection(Example.Trips.Person)"/>
+        <NavigationProperty Name="Trips" Type="Collection(Example.Trips.Trip)" ContainsTarget="true"/>
+      </EntityType>
+      <EntityType Name="Trip">
+        <Key>
+          <PropertyRef Name="TripId"/>
+        </Key>
+        <Property Name="TripId" Type="Edm.Int32" Nullable="false"/>
+        <Property Name="Name" Type="Edm.String">
+          <Annotation Term="Core.Description" String="Name &amp; purpose of the trip"/>
+        </Property>
+        <Property Name="Budget" Type="Edm.Single" Nullable="false"/>
+        <Property Name="StartsAt" Type="Edm.DateTimeOffset" Nullable="false"/>
+      </EntityType>
+      <EnumType Name="PersonGender">
+        <Member Name="Male" Value="0"/>
+        <Member Name="Female" Value="1"/>
+        <Member Name="Unknown" Value="2"/>
+      </EnumType>
+      <Function Name="GetFavoriteAirline" IsBound="true" IsComposable="true">
+        <Parameter Name="person" Type="Example.Trips.Person"/>
+        <ReturnType Type="Edm.String"/>
+      </Function>
+      <Action Name="ResetDataSource"/>
+      <EntityContainer Name="Container">
+        <EntitySet Name="People" EntityType="Example.Trips.Person">
+          <NavigationPropertyBinding Path="Friends" Target="People"/>
+        </EntitySet>
+        <ActionImport Name="ResetDataSource" Action="Example.Trips.ResetDataSource"/>
+        <Annotation Term="Core.Description">
+          <String>Trip planning service (test fixture)</String>
+        </Annotation>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

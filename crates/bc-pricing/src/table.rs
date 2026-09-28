@@ -38,11 +38,11 @@ impl fmt::Display for Unpriced {
 impl std::error::Error for Unpriced {}
 
 /// Provenance recorded in the vendored data file, so a report can say
-/// which capture of the upstream catalogue a cost figure came from.
+/// which capture of the upstream catalog a cost figure came from.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TableMeta {
-    /// Where the catalogue was fetched from.
+    /// Where the catalog was fetched from.
     pub source: String,
     /// The upstream license identifier.
     pub source_license: String,
@@ -82,7 +82,7 @@ pub struct Tier {
 /// What one provider charges for one model.
 ///
 /// `input` and `output` are required, because every priced entry in the
-/// upstream catalogue publishes both and an entry missing either cannot
+/// upstream catalog publishes both and an entry missing either cannot
 /// be half priced honestly. The cache rates are optional, because plenty
 /// of models have no prompt cache to charge for.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,7 +124,7 @@ impl ModelPrice {
     /// rate. That is the direction both of this crate's dialects
     /// document: Anthropic publishes long context pricing as applying to
     /// prompts above 200K tokens and bills at or below 200K at the
-    /// standard rate, and the upstream catalogue's own legacy field for
+    /// standard rate, and the upstream catalog's own legacy field for
     /// the same thing is named `context_over_200k`. Rounding a boundary
     /// call the other way would overcharge in a report the operator is
     /// going to reconcile against a real invoice.
@@ -146,25 +146,40 @@ impl ModelPrice {
     /// cache writes are never folded into the input rate, which for a
     /// cache read is typically a tenfold overcharge and for a cache write
     /// an undercharge.
+    ///
+    /// One-hour cache writes ([`Call::long_ttl_cache_writes`]) are
+    /// charged at [`LONG_TTL_WRITE_MULTIPLIER`] times the applicable
+    /// input rate: Anthropic's published price, which the upstream
+    /// catalog does not carry (its `cache_write` is the five-minute
+    /// rate, 1.25x input). A model with no published cache-write rate at
+    /// all has no prompt cache to write to, so its one-hour writes are
+    /// left unrated too rather than priced by assumption.
     pub fn cost_of(&self, call: &Call) -> CallCost {
         let tier = self.tier_for(call.context_tokens());
         let (input, output, cache_read, cache_write) = match tier {
             Some(tier) => (tier.input, tier.output, tier.cache_read, tier.cache_write),
             None => (self.input, self.output, self.cache_read, self.cache_write),
         };
+        let long_writes = call.long_ttl_cache_write_tokens();
+        let short_writes = call.cache_write_tokens() - long_writes;
+        let long_rate = cache_write.map(|_| input * LONG_TTL_WRITE_MULTIPLIER);
         let (read_cost, read_unrated) = charge(cache_read, call.cache_read_tokens());
-        let (write_cost, write_unrated) = charge(cache_write, call.cache_write_tokens());
+        let (short_cost, short_unrated) = charge(cache_write, short_writes);
+        let (long_cost, long_unrated) = charge(long_rate, long_writes);
 
         CallCost {
             input: extend(input, call.input_tokens()),
             output: extend(output, call.output_tokens()),
             cache_read: read_cost,
-            cache_write: write_cost,
+            cache_write: short_cost + long_cost,
             tier_applied: tier.map(|tier| tier.above),
-            unrated_tokens: read_unrated + write_unrated,
+            unrated_tokens: read_unrated + short_unrated + long_unrated,
         }
     }
 }
+
+/// Anthropic bills a one-hour cache write at twice the base input rate.
+pub const LONG_TTL_WRITE_MULTIPLIER: Rate = 2;
 
 /// `rate` picodollars per token times `tokens` tokens, exactly.
 fn extend(rate: Rate, tokens: u64) -> Money {
@@ -184,7 +199,7 @@ fn charge(rate: Option<Rate>, tokens: u64) -> (Money, u64) {
 /// Prices keyed by provider, then by model id.
 ///
 /// The provider dimension is load bearing and is never collapsed. In the
-/// captured catalogue, 775 model ids are published by more than one
+/// captured catalog, 775 model ids are published by more than one
 /// provider with different cost objects, spanning 4,244 provider and
 /// model entries. `claude-sonnet-4-5` alone is 3.00 dollars per million
 /// input tokens direct from Anthropic and 3.75 through at least one
@@ -304,6 +319,33 @@ mod tests {
                 cache_write: Some(7_500_000),
             }],
         }
+    }
+
+    #[test]
+    fn one_hour_cache_writes_bill_at_twice_the_input_rate() {
+        // 100K tokens written, 40K of them with the one-hour lifetime.
+        let call = Call::from_usage(0, 0, 0, 100_000).long_ttl_cache_writes(40_000);
+        let cost = tiered().cost_of(&call);
+        // 60K at 3.75/M (five-minute) + 40K at 6.00/M (2 x 3.00 input).
+        assert_eq!(cost.cache_write.to_usd_string(4), "0.4650");
+        assert_eq!(cost.unrated_tokens, 0);
+    }
+
+    #[test]
+    fn one_hour_writes_follow_the_tier_input_rate() {
+        let call = Call::from_usage(250_000, 0, 0, 100_000).long_ttl_cache_writes(100_000);
+        let cost = tiered().cost_of(&call);
+        assert_eq!(cost.tier_applied, Some(200_000));
+        // 100K at 2 x 6.00/M.
+        assert_eq!(cost.cache_write.to_usd_string(4), "1.2000");
+    }
+
+    #[test]
+    fn one_hour_writes_on_a_model_without_a_cache_are_unrated() {
+        let price = ModelPrice::flat(ONE_DOLLAR_PER_MILLION, TEN_DOLLARS_PER_MILLION);
+        let cost = price.cost_of(&Call::from_usage(0, 0, 0, 300).long_ttl_cache_writes(100));
+        assert_eq!(cost.cache_write, Money::ZERO);
+        assert_eq!(cost.unrated_tokens, 300);
     }
 
     #[test]

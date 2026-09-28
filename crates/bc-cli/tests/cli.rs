@@ -1142,9 +1142,15 @@ fn cli(repo: &std::path::Path, gateway_base_url: &str) -> bc_cli::Cli {
         seed: None,
         top_p: None,
         step_timeout: None,
+        reasoning_effort: None,
+        openai_api: None,
+        no_cache_markers: false,
+        allow_unsupported_model: false,
         gateway_base_url: gateway_base_url.to_string(),
         gateway_api_key: None,
         ca_cert: None,
+        client_cert: None,
+        client_key: None,
         dialect: bc_cli::Dialect::Openai,
         pricing_provider: None,
         stop_after: String::new(),
@@ -1205,7 +1211,12 @@ fn cli(repo: &std::path::Path, gateway_base_url: &str) -> bc_cli::Cli {
         baseline: None,
         config: None,
         remediate: false,
+        validate: None,
+        no_validate: false,
+        remediation_exit_code: true,
         target_tests: None,
+        api_spec: Default::default(),
+        api_spec_formats: Vec::new(),
         top: None,
         interactive: false,
         force: false,
@@ -1238,7 +1249,11 @@ fn cli(repo: &std::path::Path, gateway_base_url: &str) -> bc_cli::Cli {
         log_stderr: false,
         verbose: 0,
         no_progress: true,
+        progress_style: None,
+        s6_progress_file: false,
+        out_run_manifest: None,
         doctor: false,
+        cache_probe: false,
         stream_large_responses: false,
         skip_preflight: true,
         setup: false,
@@ -1358,6 +1373,8 @@ fn fast_config() -> bc_orchestrator::ScanConfig {
     let mut step7 = bc_stage_s7::Step7Config::new("m");
     step7.semantic = false;
     bc_orchestrator::ScanConfig {
+        autoexclude: Default::default(),
+        cancel: None,
         step0_enabled: false,
         step0: bc_stage_s0::Step0Config::new(),
         step1,
@@ -1403,11 +1420,12 @@ async fn run_completes_a_full_scan_with_fakes_linked_as_a_normal_dependency() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_refuses_an_unwritable_output_directory_when_linked_as_a_normal_dependency() {
-    use std::os::unix::fs::PermissionsExt;
+    // A path component is a regular file, so the output directory cannot
+    // be created (ENOTDIR) by any user. A mode 000 directory would not
+    // stop root, which bypasses permission bits.
     let dir = setup_repo();
     let unwritable = dir.path().join("locked");
-    std::fs::create_dir(&unwritable).unwrap();
-    std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::write(&unwritable, "not a directory").unwrap();
 
     let input = bc_cli::build_scan_input(&cli(dir.path(), "unused"));
     let result = bc_cli::run(
@@ -1423,7 +1441,6 @@ async fn run_refuses_an_unwritable_output_directory_when_linked_as_a_normal_depe
     )
     .await;
 
-    std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o755)).unwrap();
     let err = result.unwrap_err();
     assert!(err.contains("cannot create output directory"), "{err}");
 }
@@ -2942,4 +2959,152 @@ async fn a_missing_baseline_exits_non_zero_through_the_real_binary() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("cannot read baseline"), "stderr: {stderr}");
+}
+
+/// A gateway whose S3 reply takes `delay`: long enough for a test to
+/// deliver SIGINT while that call is in flight.
+async fn slow_s3_gateway(delay: std::time::Duration) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("security-focused codebase mapper"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_reply(
+            r#"{"language":"python","modules":[],"entry_points":[],"unsafe_sinks":[],"call_graph":{},"notes":""}"#,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("application-security threat modeler"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(openai_reply(
+            r#"{"system_context":"ctx","assets":[],"trust_boundaries":[],"threats":[],"open_questions":[]}"#,
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("vulnerability research strategist"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_reply(
+                    "garbage, s3 degrades to its deterministic catchall sweep",
+                ))
+                .set_delay(delay),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Whether `server` has received the slow S3 strategist request.
+/// wiremock records a request on arrival, before its response delay, so
+/// this is true exactly while that call is in flight.
+async fn s3_call_arrived(server: &MockServer) -> bool {
+    let requests = server.received_requests().await.unwrap_or_default();
+    requests.iter().any(|request| {
+        String::from_utf8_lossy(&request.body).contains("vulnerability research strategist")
+    })
+}
+
+/// Starts a scan against `server` and delivers `signals` SIGINTs once its
+/// slow S3 call is in flight, returning its output and how long it ran.
+async fn scan_interrupted(
+    server: &MockServer,
+    repo: &std::path::Path,
+    state: &std::path::Path,
+    signals: usize,
+) -> (std::process::Output, std::time::Duration) {
+    // stderr goes to a file so the test can see each press acknowledged
+    // while the binary is still running.
+    let log_dir = tempfile::tempdir().unwrap();
+    let stderr_path = log_dir.path().join("stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).unwrap();
+    let started = std::time::Instant::now();
+    let child = Command::new(env!("CARGO_BIN_EXE_bc-sast"))
+        .arg("--repo")
+        .arg(repo)
+        .arg("--gateway-base-url")
+        .arg(server.uri())
+        .arg("--model")
+        .arg("test-model")
+        .arg("--skip-preflight")
+        .arg("--no-progress")
+        .env("BC_STATE_DIR", state)
+        .stdout(std::process::Stdio::piped())
+        .stderr(stderr_file)
+        .spawn()
+        .unwrap();
+    // Wait for the slow S3 call itself rather than a fixed time: an
+    // instrumented binary on a busy CI runner can take far longer than
+    // usual to get there.
+    let limit = std::time::Duration::from_secs(60);
+    let timed_out = format!("the scan never reached S3 within {limit:?}");
+    while !s3_call_arrived(server).await {
+        assert!(started.elapsed() < limit, "{timed_out}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let unacknowledged = format!("a Ctrl-C went unacknowledged for {limit:?}");
+    for sent in 1..=signals {
+        let status = Command::new("kill")
+            .arg("-INT")
+            .arg(child.id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        // Two SIGINTs that reach the runtime in the same instant are seen
+        // as one, so the next press waits until this one was acted on.
+        while acknowledged_presses(&stderr_path) < sent {
+            assert!(started.elapsed() < limit, "{unacknowledged}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    let mut output = child.wait_with_output().unwrap();
+    output.stderr = std::fs::read(&stderr_path).unwrap();
+    (output, started.elapsed())
+}
+
+/// How many Ctrl-C presses the binary has reported on stderr so far.
+fn acknowledged_presses(stderr_path: &std::path::Path) -> usize {
+    let stderr = std::fs::read_to_string(stderr_path).unwrap();
+    stderr.matches("[cancel] Ctrl-C:").count()
+}
+
+/// The first Ctrl-C cancels cooperatively: the in-flight S3 call is left to
+/// finish, every later stage is skipped, the partial report and the run
+/// manifest are still written and say so, and the process exits 130.
+#[tokio::test]
+async fn a_first_ctrl_c_cancels_the_scan_but_still_writes_a_marked_partial_report() {
+    let server = slow_s3_gateway(std::time::Duration::from_secs(4)).await;
+    let dir = setup_repo();
+    let state = tempfile::tempdir().unwrap();
+    let (output, _) = scan_interrupted(&server, dir.path(), state.path(), 1).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(130), "stderr: {stderr}");
+    assert!(
+        stderr.contains("[cancel] Ctrl-C: stopping"),
+        "stderr: {stderr}"
+    );
+    let out_dir = dir.path().join("security-scan");
+    let md = std::fs::read_to_string(out_dir.join("report.md")).unwrap();
+    assert!(md.contains("**CANCELED**"), "{md}");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out_dir.join("run_manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["exit_code"], 130);
+    assert_eq!(manifest["canceled"], true);
+}
+
+/// A second Ctrl-C does not wait for the call in flight: the process exits
+/// 130 at once, long before the slow reply would have arrived.
+#[tokio::test]
+async fn a_second_ctrl_c_exits_at_once() {
+    let delay = std::time::Duration::from_secs(20);
+    let server = slow_s3_gateway(delay).await;
+    let dir = setup_repo();
+    let state = tempfile::tempdir().unwrap();
+    let (output, elapsed) = scan_interrupted(&server, dir.path(), state.path(), 2).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(130), "stderr: {stderr}");
+    assert!(stderr.contains("exiting now"), "stderr: {stderr}");
+    assert!(elapsed < delay, "took {elapsed:?}");
 }

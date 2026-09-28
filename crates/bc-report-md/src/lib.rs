@@ -7,6 +7,7 @@
 mod augment;
 mod baseline;
 mod chains;
+mod diagnostics;
 mod dropped;
 mod executive;
 mod findings;

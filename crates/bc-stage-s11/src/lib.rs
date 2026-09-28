@@ -61,23 +61,28 @@
 //!   read-only executor per finding so the diff they answer from is that
 //!   finding's own; `step_validate.fact_tools` turns them off for a model
 //!   that copes badly with eight tools.
-//! - **No `effort`/`max_budget_usd` knobs**: this port's
-//!   [`bc_llm_agentic::AgenticConfig`] has no reasoning-effort dial to
-//!   port a value into, and `max_budget_usd` was already decided as a
-//!   dropped no-op knob back at S6's port, whose module comment records
-//!   why Python's own analogous backends never enforced it either.
+//! - **`effort` is ported, `max_budget_usd` is not**: the panel's
+//!   reasoning effort is [`Step11Config::reasoning_effort`] (`high` by
+//!   default, Python's `DEFAULT_EFFORT`, from `step_validate.effort`),
+//!   while `max_budget_usd` was already decided as a dropped no-op knob
+//!   back at S6's port, whose module comment records why Python's own
+//!   analogous backends never enforced it either.
 
+mod checkpoint;
+mod evidence;
 mod hints;
 mod prompts;
 
+pub use checkpoint::{validation_step_key, VALIDATE_STEP_PREFIX};
 pub use hints::hints_path;
 
+use bc_checkpoint::CheckpointStore;
 use bc_llm_agentic::{run_agentic, AgenticConfig};
 use bc_llm_client::{LlmClient, LlmError, ToolExecutor};
 use bc_model::RankedFinding;
 use bc_stage_s10::RemediationRecord;
 use bc_validation_scoring::{
-    score_fix, Evidence, GateName, GateResult, GateStatus, SynthesisConfidence, ValidationScore,
+    score_fix, GateName, GateResult, GateStatus, SynthesisConfidence, ValidationScore,
 };
 use serde_json::Value;
 
@@ -112,6 +117,20 @@ pub struct Step11Config {
     /// [`bc_llm_client::ChatRequest::seed`] (OpenAI dialect only). `None`
     /// (the default) sends no seed.
     pub seed: Option<u64>,
+    /// Reasoning-effort tier for every persona's turns, forwarded to
+    /// [`bc_llm_client::ChatRequest::reasoning_effort`]. Defaults to
+    /// `high`, the Python original's `DEFAULT_EFFORT` for the validation
+    /// agent (`validation/constants/artifacts.py`) and the shipped
+    /// `step_validate.effort`; `bc-cli` layers `step_validate.effort`,
+    /// `--reasoning-effort` and `models.validate.orchestrator.effort`
+    /// over it, in that order. A model that takes no effort parameter
+    /// has it dropped by the capability table, so this is inert there.
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+    /// Per-role OpenAI transport pin (Python's
+    /// `models.<role>.use_responses_api`), forwarded to
+    /// [`bc_llm_client::ChatRequest::openai_api`]. `None` (the default)
+    /// keeps the client-wide `--openai-api` choice.
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
     /// Per-turn wall-clock deadline in seconds, overriding the shared
     /// gateway client's own 300 s default. `None` (the default) keeps it.
     pub timeout_secs: Option<u64>,
@@ -170,6 +189,21 @@ pub struct Step11Config {
     /// the executor does not advertise — so the toggle stays a one-line
     /// change rather than a two-key ritual.
     pub fact_tools: bool,
+    /// Whether a two-way tie one step apart on the severity scale
+    /// (`pass`/`partial`, `partial`/`fail`) is scored as
+    /// [`SynthesisConfidence::Split`] (`true`, the default and this port's
+    /// long-standing behavior: the conservative status stands and scores
+    /// normally) or, as vvaharness does for every tie, marked
+    /// [`SynthesisConfidence::Flagged`] so the whole fix is inconclusive
+    /// (`false`). `step_validate.split_ties_score`. See
+    /// [`synthesize_one_gate`] for why this port scores such ties.
+    pub split_ties_score: bool,
+    /// The API dialect and gateway host the panel is reached through,
+    /// folded into the `--resume` checkpoint key (see
+    /// [`Step11Config::engine_key`]) together with every persona model.
+    /// Empty by default; the CLI fills both from the resolved gateway.
+    pub dialect: String,
+    pub base_host: String,
 }
 
 impl Step11Config {
@@ -204,6 +238,8 @@ impl Step11Config {
             temperature: None,
             top_p: None,
             seed: None,
+            reasoning_effort: Some(bc_llm_client::ReasoningEffort::High),
+            openai_api: None,
             timeout_secs: None,
             max_findings: Some(20),
             allow_repo_hints: false,
@@ -212,6 +248,9 @@ impl Step11Config {
             cross_repo_analyzer_model: None,
             cross_repo_analyzer: false,
             fact_tools: true,
+            split_ties_score: true,
+            dialect: String::new(),
+            base_host: String::new(),
         }
     }
 }
@@ -246,30 +285,6 @@ fn str_field(v: &Value, key: &str) -> String {
         .to_string()
 }
 
-fn parse_evidence(v: &Value) -> Vec<Evidence> {
-    v.get("evidence")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_object)
-                .map(|e| Evidence {
-                    file: e
-                        .get("file")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    line: e.get("line").and_then(Value::as_i64),
-                    snippet: e
-                        .get("snippet")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Parses one persona's raw JSON response into a set of [`GateResult`]s.
 /// An entry whose `gate_name` doesn't match one of the 4 known names is
 /// DROPPED (not passed through as a placeholder) — this naturally shows
@@ -290,7 +305,7 @@ fn coerce_gates(data: &Value) -> Vec<GateResult> {
                 gate_name: name,
                 status: GateStatus::parse(&str_field(g, "status")),
                 summary: str_field(g, "summary"),
-                evidence: parse_evidence(g),
+                evidence: evidence::parse_evidence(g),
                 details: str_field(g, "details"),
                 // One persona's own opinion, pre-synthesis: there is no
                 // panel to be confident about yet. Python's
@@ -504,6 +519,23 @@ fn synthesize_n(persona_gates: &[Vec<GateResult>]) -> Vec<GateResult> {
         .collect()
 }
 
+/// Applies [`Step11Config::split_ties_score`]: with it off, every
+/// [`SynthesisConfidence::Split`] gate is relabeled
+/// [`SynthesisConfidence::Flagged`], which [`score_fix`] resolves to
+/// `UNVERIFIABLE`, matching vvaharness's "any tie is inconclusive".
+fn apply_tie_policy(gates: Vec<GateResult>, split_ties_score: bool) -> Vec<GateResult> {
+    if split_ties_score {
+        return gates;
+    }
+    gates
+        .into_iter()
+        .map(|g| match g.confidence {
+            Some(SynthesisConfidence::Split) => with_confidence(&g, SynthesisConfidence::Flagged),
+            _ => g,
+        })
+        .collect()
+}
+
 /// One line per synthesized gate, naming every persona's own vote, the
 /// status the panel settled on, and the confidence label that decides
 /// whether the fix can be scored at all — e.g.
@@ -599,6 +631,8 @@ fn agentic_config(
     cfg.temperature = config.temperature;
     cfg.top_p = config.top_p;
     cfg.seed = config.seed;
+    cfg.reasoning_effort = config.reasoning_effort;
+    cfg.openai_api = config.openai_api;
     cfg.timeout_secs = config.timeout_secs;
     cfg
 }
@@ -716,7 +750,14 @@ pub async fn validate_finding(
     record: &RemediationRecord,
     config: &Step11Config,
 ) -> Result<ValidationScore, LlmError> {
-    let diff = record.diff.as_deref().unwrap_or("");
+    // The panel only ever sees the REDACTED diff, as in Python, where the
+    // validator reads the persisted (already redacted) `diff.patch`. The
+    // diff of a hardcoded-secret fix contains the secret it removed; the
+    // persona needs to see that the literal went away, not what it was
+    // (the secret-exposure prompt rule tells it exactly that). Redacted
+    // structure-aware, so `DiffTouched`/`ChangedLines` still parse it.
+    let redacted_diff = bc_redact::redact_diff(record.diff.as_deref().unwrap_or(""));
+    let diff = redacted_diff.as_str();
     let cvss_rating = finding.finding.cvss_rating.as_deref();
     let hints = hints::load_hints(repo, config.allow_repo_hints);
     // Python's `affected_files` comes from the PATCH's own
@@ -844,7 +885,7 @@ pub async fn validate_finding(
         vec![architect_gates?, pentester_gates?]
     };
 
-    let synthesized = synthesize_n(&persona_gates);
+    let synthesized = apply_tie_policy(synthesize_n(&persona_gates), config.split_ties_score);
     let lines = vote_lines(persona_names, &persona_gates, &synthesized);
     for (gate, line) in synthesized.iter().zip(lines) {
         if lacks_consensus(gate) {
@@ -854,6 +895,40 @@ pub async fn validate_finding(
         }
     }
     Ok(score_fix(&synthesized))
+}
+
+/// [`validate_finding`] behind a `--resume` checkpoint, the S11
+/// counterpart of `bc_stage_s10::remediate_one_checkpointed`.
+///
+/// With `resume` set, a score saved under this finding's
+/// [`validation_step_key`] (same finding, same redacted diff, same panel
+/// and models) is returned without running a single persona. A freshly
+/// computed score is saved whenever a store is given, whether or not this
+/// run resumed, so a later `--resume` has it. A failed validation saves
+/// nothing.
+#[allow(clippy::too_many_arguments)]
+pub async fn validate_finding_checkpointed(
+    client: &dyn LlmClient,
+    tools: &dyn ToolExecutor,
+    repo: &std::path::Path,
+    finding: &RankedFinding,
+    record: &RemediationRecord,
+    config: &Step11Config,
+    checkpoint: Option<&dyn CheckpointStore>,
+    run_id: &str,
+    resume: bool,
+) -> Result<ValidationScore, LlmError> {
+    let step = validation_step_key(config, record);
+    if resume {
+        if let Some(cached) = checkpoint.and_then(|s| checkpoint::load_score(s, run_id, &step)) {
+            return Ok(cached);
+        }
+    }
+    let score = validate_finding(client, tools, repo, finding, record, config).await?;
+    if let Some(store) = checkpoint {
+        checkpoint::save_score(store, run_id, &step, &score);
+    }
+    Ok(score)
 }
 
 #[cfg(test)]

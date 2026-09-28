@@ -16,6 +16,7 @@ path = "src/main.rs"
 tempfile = { workspace = true }
 bc-pathjail = { path = "../bc-pathjail" }
 bc-target-tests = { path = "../bc-target-tests" }
+bc-api-spec = { path = "../bc-api-spec" }
 bc-llm-agentic = { path = "../bc-llm-agentic" }
 bc-model = { path = "../bc-model" }
 bc-cvss = { path = "../bc-cvss" }
@@ -48,6 +49,7 @@ bc-report-md = { path = "../bc-report-md" }
 bc-sarif = { path = "../bc-sarif" }
 bc-csv = { path = "../bc-csv" }
 bc-redact = { path = "../bc-redact" }
+bc-metrics = { path = "../bc-metrics" }
 bc-checkpoint = { path = "../bc-checkpoint" }
 bc-diffcapture = { path = "../bc-diffcapture" }
 bc-interactive = { path = "../bc-interactive" }
@@ -58,7 +60,8 @@ regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha1 = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "process", "time", "io-util"] }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "process", "time", "io-util", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 indicatif = { workspace = true }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate `crates/bc-pricing/data/models-dev-prices.json`.
 
-The crate embeds a trimmed copy of the models.dev catalogue with
+The crate embeds a trimmed copy of the models.dev catalog with
 `include_str!`, so a price refresh has to arrive as a reviewable diff in
 version control rather than as silent drift from a network fetch at scan
 time. This script produces that diff.
@@ -9,7 +9,7 @@ time. This script produces that diff.
 Usage
 -----
 
-Fetch the live catalogue and rewrite the vendored file in place::
+Fetch the live catalog and rewrite the vendored file in place::
 
     python3 crates/bc-pricing/scripts/refresh_prices.py
 
@@ -33,7 +33,7 @@ Standard library only, by the project's dependency policy in
 What gets trimmed and why
 -------------------------
 
-The upstream catalogue is roughly 4.3 MB and mostly describes things a
+The upstream catalog is roughly 4.3 MB and mostly describes things a
 cost calculation does not use: display names, descriptions, modalities,
 knowledge cutoffs, context limits, tool-call and reasoning capability
 flags. Only four rate classes survive, matching the four token counts the
@@ -79,9 +79,28 @@ RATE_KEYS = ("input", "output", "cache_read", "cache_write")
 # USD per million tokens -> picodollars per token.
 RATE_SCALE = Decimal(10) ** 6
 
+# Models a provider has published prices for that the upstream catalog
+# did not yet list at capture time, in upstream's own USD-per-million
+# shape. Applied only where upstream has no entry for that (provider,
+# model), so once upstream lists the model its published figures win and
+# the entry here can be deleted. Each needs its public price source.
+# Empty because upstream now lists every model this repo has needed to
+# price by hand. Keep the mechanism: the next model to ship ahead of the
+# catalog goes here with its public price source, and leaves again once
+# upstream carries it.
+SUPPLEMENT: dict[str, dict[str, dict]] = {}
+
+
+# models.dev sits behind a CDN that answers urllib's default
+# `Python-urllib/<version>` User-Agent with 403. Identifying the client
+# is both what gets a 200 back and the courteous thing to send to a
+# service this script reads for free.
+USER_AGENT = "bc-sast-price-refresh/1.0 (+https://github.com/BinChicken-AppSec/bc-sast)"
+
 
 def fetch(url: str) -> str:
-    with urllib.request.urlopen(url, timeout=120) as response:  # noqa: S310
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})  # noqa: S310
+    with urllib.request.urlopen(request, timeout=120) as response:  # noqa: S310
         return response.read().decode("utf-8")
 
 
@@ -135,12 +154,12 @@ def trim_model(cost: dict) -> dict | None:
     return entry
 
 
-def build(catalogue: dict, captured: str) -> dict:
+def build(catalog: dict, captured: str) -> dict:
     providers: dict[str, dict] = {}
-    for provider_id in sorted(catalogue):
+    for provider_id in sorted(catalog):
         models: dict[str, dict] = {}
-        for model_id in sorted(catalogue[provider_id].get("models") or {}):
-            cost = catalogue[provider_id]["models"][model_id].get("cost")
+        for model_id in sorted(catalog[provider_id].get("models") or {}):
+            cost = catalog[provider_id]["models"][model_id].get("cost")
             if not cost:
                 continue
             entry = trim_model(cost)
@@ -148,6 +167,15 @@ def build(catalogue: dict, captured: str) -> dict:
                 models[model_id] = entry
         if models:
             providers[provider_id] = models
+    for provider_id, supplement in SUPPLEMENT.items():
+        models = providers.setdefault(provider_id, {})
+        for model_id, cost in supplement.items():
+            if model_id not in models:
+                entry = trim_model(cost)
+                if entry is not None:
+                    models[model_id] = entry
+        providers[provider_id] = dict(sorted(models.items()))
+    providers = dict(sorted(providers.items()))
     return {
         "meta": {
             "source": SOURCE_URL,
@@ -221,9 +249,9 @@ def main(argv: list[str]) -> int:
     # parse_float=Decimal keeps the upstream text exactly as published, so
     # the scaling step sees the real decimal rather than a float that has
     # already lost the last digit.
-    catalogue = json.loads(raw, parse_float=Decimal)
+    catalog = json.loads(raw, parse_float=Decimal)
     captured = args.captured or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-    rendered = render(build(catalogue, captured))
+    rendered = render(build(catalog, captured))
 
     if args.out == "-":
         sys.stdout.write(rendered)

@@ -11,7 +11,7 @@ pub const MARKER_PREFIX: &str = "<!-- bc:finding-id=";
 pub const MARKER_SUFFIX: &str = " -->";
 
 /// A second, independent hidden marker recording WHERE a comment's
-/// finding was, so a later run can recognise the same vulnerability by
+/// finding was, so a later run can recognize the same vulnerability by
 /// position when its content hash has moved. See [`Locator`].
 pub const LOC_MARKER_PREFIX: &str = "<!-- bc:loc=";
 
@@ -20,7 +20,7 @@ pub fn marker(finding_id: &str) -> String {
 }
 
 /// Where a finding was, as recorded in a posted comment: enough to
-/// recognise the same vulnerability across runs that report it at
+/// recognize the same vulnerability across runs that report it at
 /// slightly different bounds.
 ///
 /// Content-derived identity ([`bc_sarif::finding_id_v2`]) removed the

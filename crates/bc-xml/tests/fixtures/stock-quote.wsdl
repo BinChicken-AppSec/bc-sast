@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- TEST FIXTURE ONLY: hand-written for bc-xml round-trip tests. It does
+     not describe a real service and is not used by the product. -->
+<wsdl:definitions name="StockQuote"
+    targetNamespace="http://example.com/stockquote.wsdl"
+    xmlns:tns="http://example.com/stockquote.wsdl"
+    xmlns:xsd1="http://example.com/stockquote.xsd"
+    xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+    xmlns:wsdl="http://schemas.xmlsoap.org/wsdl/"
+    xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+
+  <wsdl:documentation>Quotes &amp; history for a ticker symbol.</wsdl:documentation>
+
+  <wsdl:types>
+    <xsd:schema targetNamespace="http://example.com/stockquote.xsd"
+        elementFormDefault="qualified">
+      <xsd:element name="TradePriceRequest">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element name="tickerSymbol" type="xsd:string"/>
+            <xsd:element name="asOf" type="xsd:dateTime" minOccurs="0"/>
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="TradePrice">
+        <xsd:complexType>
+          <xsd:all>
+            <xsd:element name="price" type="xsd:decimal"/>
+          </xsd:all>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:simpleType name="Currency">
+        <xsd:restriction base="xsd:string">
+          <xsd:pattern value="[A-Z]{3}"/>
+        </xsd:restriction>
+      </xsd:simpleType>
+    </xsd:schema>
+  </wsdl:types>
+
+  <wsdl:message name="GetLastTradePriceInput">
+    <wsdl:part name="body" element="xsd1:TradePriceRequest"/>
+  </wsdl:message>
+  <wsdl:message name="GetLastTradePriceOutput">
+    <wsdl:part name="body" element="xsd1:TradePrice"/>
+  </wsdl:message>
+
+  <wsdl:portType name="StockQuotePortType">
+    <wsdl:operation name="GetLastTradePrice">
+      <wsdl:input message="tns:GetLastTradePriceInput"/>
+      <wsdl:output message="tns:GetLastTradePriceOutput"/>
+    </wsdl:operation>
+  </wsdl:portType>
+
+  <wsdl:binding name="StockQuoteSoapBinding" type="tns:StockQuotePortType">
+    <soap:binding style="document" transport="http://schemas.xmlsoap.org/soap/http"/>
+    <wsdl:operation name="GetLastTradePrice">
+      <soap:operation soapAction="http://example.com/GetLastTradePrice"/>
+      <wsdl:input><soap:body use="literal"/></wsdl:input>
+      <wsdl:output><soap:body use="literal"/></wsdl:output>
+    </wsdl:operation>
+  </wsdl:binding>
+
+  <wsdl:service name="StockQuoteService">
+    <wsdl:port name="StockQuotePort" binding="tns:StockQuoteSoapBinding">
+      <soap:address location="https://example.com/stockquote?a=1&amp;b=2"/>
+    </wsdl:port>
+  </wsdl:service>
+</wsdl:definitions>

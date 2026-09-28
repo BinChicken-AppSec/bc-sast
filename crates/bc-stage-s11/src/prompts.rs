@@ -115,11 +115,56 @@ did it gain? Use it instead of eyeballing hunk headers.\n\
 trust boundary. Start `instance_coverage` here.\n\
 - PatternScan(pattern_set) — \"secret_exposure\" or \"insecure_value\" swept \
 over the whole repo, skipping vendor/test/binary files. Use it to find \
-sibling instances the fix missed.\n\
+sibling instances the fix missed. Match records carry only file and line, \
+never the matched text; the final record is a summary of counts, limits and \
+truncation. Treat a truncated scan or skipped files as incomplete coverage \
+and inspect the affected paths yourself.\n\
 - TestInventory() — test files and which carry negative/adversarial test \
 markers.\n\
 Reach for Read/Grep/Glob for what these cannot answer, and cite file:line \
 from what you actually read either way.";
+
+/// `validation/claude_config/rules/adversarial-review.md`'s
+/// "Secret-Exposure Evidence" section (new in vvaharness v1.4.0),
+/// adapted to this port's tool names.
+///
+/// The persisted diff a persona reads is redacted (see
+/// `bc_redact::redact_diff`), so for a hardcoded-credential finding the
+/// removed value is deliberately absent. Without this rule a persona
+/// tries to recover it: it greps for the plaintext it guesses was there,
+/// or copies a candidate into its report. Both put the secret back into a
+/// transcript this pipeline has just spent effort keeping it out of.
+///
+/// The `PatternScan` half is conditional on `fact_tools`, like
+/// [`FACT_TOOLS`] itself: naming a tool the persona was not given
+/// invites it to call it, or to claim a scan that never ran. Python's
+/// wording names the tool in both branches; this port's does not, for
+/// the same reason `FACT_TOOLS` is omitted entirely when it is off.
+fn secret_exposure_evidence(fact_tools: bool) -> String {
+    let scan = if fact_tools {
+        "- Call PatternScan(\"secret_exposure\"). Its match records contain only \
+         paths and line numbers; its final summary record reports counts, limits \
+         and truncation. Treat truncation or skipped files as incomplete coverage \
+         and inspect the affected paths with the read-only tools."
+    } else {
+        "- You have no deterministic pattern scanner: use Read, Grep and Glob with \
+         credential names or PEM delimiters, never with the removed plaintext \
+         value. Do not claim that any pattern scan ran."
+    };
+    format!(
+        "SECRET-EXPOSURE EVIDENCE. For hardcoded credential, API-key, token, \
+         password, private-key, connection-string and OAuth-secret findings, the \
+         diff below is intentionally redacted. Never reconstruct the removed value \
+         or place it in a tool query.\n\
+         - Inspect each reported location in the patched tree and decide whether a \
+         literal credential remains and whether the replacement uses the \
+         framework's normal config-time secret source.\n\
+         {scan}\n\
+         - Evidence and details may include safe paths, line numbers, counts and \
+         non-secret replacement code. Never copy a secret candidate or tool-output \
+         snippet into your report."
+    )
+}
 
 /// The gate list, deliberately WITHOUT the numeric weights.
 ///
@@ -178,6 +223,7 @@ pub fn security_architect_system(fact_tools: bool) -> String {
          queries, template auto-escaping, built-in CSRF tokens).\n\n\
          {CRITERIA_INSTRUCTIONS}\n\n\
          {EVIDENCE_REQUIREMENTS}\n\n\
+         {secrets}\n\n\
          {facts}\
          {}\n\n\
          {GROUNDING}\n\n\
@@ -185,7 +231,8 @@ pub fn security_architect_system(fact_tools: bool) -> String {
          that validates against this JSON Schema:\n{GATE_JSON_SCHEMA}\n\n\
          {ANTI_MANIPULATION}",
         signal_to_noise("Real attack vectors and architectural weaknesses"),
-        facts = fact_tools_block(fact_tools)
+        facts = fact_tools_block(fact_tools),
+        secrets = secret_exposure_evidence(fact_tools)
     )
 }
 
@@ -210,6 +257,7 @@ pub fn penetration_tester_system(fact_tools: bool) -> String {
          coercion bypassing the fix.\n\n\
          {CRITERIA_INSTRUCTIONS}\n\n\
          {EVIDENCE_REQUIREMENTS}\n\n\
+         {secrets}\n\n\
          {facts}\
          {}\n\n\
          {GROUNDING}\n\n\
@@ -219,7 +267,8 @@ pub fn penetration_tester_system(fact_tools: bool) -> String {
          {}",
         signal_to_noise("Real exploitability gaps and production failure modes"),
         bypass_hints_block(),
-        facts = fact_tools_block(fact_tools)
+        facts = fact_tools_block(fact_tools),
+        secrets = secret_exposure_evidence(fact_tools)
     )
 }
 
@@ -262,6 +311,7 @@ pub fn cross_repo_analyzer_system(fact_tools: bool) -> String {
          data-flow and sanitization tracing at component boundaries.\n\n\
          {CROSS_REPO_CRITERIA_INSTRUCTIONS}\n\n\
          {EVIDENCE_REQUIREMENTS}\n\n\
+         {secrets}\n\n\
          {facts}\
          {}\n\n\
          {GROUNDING}\n\n\
@@ -269,7 +319,8 @@ pub fn cross_repo_analyzer_system(fact_tools: bool) -> String {
          that validates against this JSON Schema:\n{GATE_JSON_SCHEMA}\n\n\
          {ANTI_MANIPULATION}",
         signal_to_noise("Real cross-repo inconsistencies"),
-        facts = fact_tools_block(fact_tools)
+        facts = fact_tools_block(fact_tools),
+        secrets = secret_exposure_evidence(fact_tools)
     )
 }
 
@@ -412,7 +463,7 @@ pub fn build_user(p: &ValidationPrompt) -> String {
     prompt.push_str("=== END FINDING ===\n");
 
     // The remediator's own account of what it did. Kept in its own
-    // clearly-labelled block, separate from the finding, so a persona
+    // clearly-labeled block, separate from the finding, so a persona
     // cannot mistake it for part of the original report — and the
     // remediator's VERDICT is deliberately absent (see `GROUNDING`).
     let mut claim = String::new();
@@ -545,6 +596,40 @@ mod tests {
         assert!(sys.contains("security_best_practices"));
         assert!(sys.contains("with status \"skip\""));
         assert_shared_rules(&sys, "Real cross-repo inconsistencies");
+    }
+
+    #[test]
+    fn every_persona_gets_the_secret_exposure_evidence_rule() {
+        for fact_tools in [true, false] {
+            for sys in [
+                security_architect_system(fact_tools),
+                penetration_tester_system(fact_tools),
+                cross_repo_analyzer_system(fact_tools),
+            ] {
+                assert!(sys.contains("SECRET-EXPOSURE EVIDENCE"), "{sys}");
+                assert!(sys.contains("Never reconstruct the removed value"), "{sys}");
+                assert!(
+                    sys.contains("Never copy a secret candidate or tool-output snippet"),
+                    "{sys}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_secret_rule_names_pattern_scan_only_when_the_persona_has_it() {
+        let with = security_architect_system(true);
+        assert!(
+            with.contains("Call PatternScan(\"secret_exposure\")"),
+            "{with}"
+        );
+        assert!(with.contains("never the matched text"), "{with}");
+        let without = security_architect_system(false);
+        assert!(!without.contains("PatternScan"), "{without}");
+        assert!(
+            without.contains("Do not claim that any pattern scan ran"),
+            "{without}"
+        );
     }
 
     #[test]

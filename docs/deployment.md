@@ -402,7 +402,7 @@ calls to exactly two places:
 
 | Destination | When | Why |
 |---|---|---|
-| Your **AI gateway / model endpoint** (`--gateway-base-url`) | Every stage that makes a model call | The only LLM traffic. TLS verification is always on and cannot be disabled; `--ca-cert` adds a trust anchor for a private/self-signed gateway without weakening it. |
+| Your **AI gateway / model endpoint** (`--gateway-base-url`) | Every stage that makes a model call | The only LLM traffic. TLS verification is always on and cannot be disabled; `--ca-cert` adds a trust anchor for a private/self-signed gateway without weakening it. A gateway that authenticates callers by certificate takes `--client-cert` (and `--client-key` for a separate key file, env `BC_GATEWAY_CLIENT_CERT`/`BC_GATEWAY_CLIENT_KEY`); an unloadable certificate stops the run rather than connecting without mTLS. See [Gateway TLS and credentials](configuration.md#gateway-tls-and-credentials). |
 | The **GitHub REST API** (`--github-api-base-url`, default `https://api.github.com`) | Only when `--diff-scope`, `--github-token`, `--post-comments-from` or `--post-fixes-from` is in play | Fetching a PR diff, and posting/updating review comments. Set `--github-api-base-url https://<host>/api/v3` for GitHub Enterprise Server; Actions runners already export `GITHUB_API_URL`. |
 
 Three optional additions, each only if you turn it on:

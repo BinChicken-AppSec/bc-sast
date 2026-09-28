@@ -24,8 +24,9 @@ const PROFILES: &[BuiltinProfile] = &[
         name: "discovered-offline",
         // v2 added lockfile-pinned dependency provisioning; a package with no
         // pin the build can install from is now refused rather than tested
-        // against an empty dependency tree.
-        version: 2,
+        // against an empty dependency tree. v3 added the API specification
+        // step and its write allowances.
+        version: 3,
         json: include_str!("policies/discovered-offline.json"),
     },
     BuiltinProfile {
@@ -35,7 +36,8 @@ const PROFILES: &[BuiltinProfile] = &[
     },
     BuiltinProfile {
         name: "generate",
-        version: 2,
+        // v3 added the API specification step.
+        version: 3,
         json: include_str!("policies/generate.json"),
     },
     BuiltinProfile {
@@ -45,18 +47,21 @@ const PROFILES: &[BuiltinProfile] = &[
     },
     BuiltinProfile {
         name: "integration",
-        version: 1,
+        // v2 added the API specification step.
+        version: 2,
         json: include_str!("policies/integration.json"),
     },
     // E2E is the cumulative full-scope alias, not an instruction to add every test type.
     BuiltinProfile {
         name: "e2e",
-        version: 1,
+        // v2 added the API specification step.
+        version: 2,
         json: include_str!("policies/comprehensive.json"),
     },
     BuiltinProfile {
         name: "comprehensive",
-        version: 1,
+        // v2 added the API specification step.
+        version: 2,
         json: include_str!("policies/comprehensive.json"),
     },
 ];
@@ -70,6 +75,9 @@ pub(super) fn load(name: &str) -> Result<TargetTestingConfig, String> {
         .map_err(|e| format!("invalid built-in target-test profile {name:?}: {e}"))?;
     if let Some(execution) = &config.execution {
         execution.validate()?;
+    }
+    if let Some(api_spec) = &config.api_spec {
+        api_spec.validate()?;
     }
     if let Some(catalog) = &config.discovered_execution {
         super::discovered_execution::validate_catalog(catalog)?;
@@ -116,8 +124,21 @@ mod tests {
             assert!(config.execution.is_none());
             assert!(config.discovered_execution.is_none());
         }
+        // The API specification step belongs to the generating levels
+        // above unit scope, and only they carry its write allowances.
+        for (name, enabled) in [
+            ("discover", false),
+            ("unit", false),
+            ("integration", true),
+            ("comprehensive", true),
+            ("e2e", true),
+            ("generate", true),
+            ("discovered-offline", true),
+        ] {
+            assert_eq!(load(name).unwrap().api_spec.is_some(), enabled, "{name}");
+        }
         let config = load("discovered-offline").unwrap();
-        assert_eq!(config.profile.unwrap().version, 2);
+        assert_eq!(config.profile.unwrap().version, 3);
         for ecosystem in config.discovered_execution.unwrap() {
             ecosystem.validate().unwrap();
             // Every executable ecosystem carries an install the build owns.

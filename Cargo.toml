@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "Apache-2.0"
 publish = false
@@ -78,6 +78,20 @@ fancy-regex = "=0.18.0"
 # an identity-grouping hash, not a security control). 0.11.0 published
 # 2026-03-27, >=30 days old at time of vetting.
 sha1 = "=0.11.0"
+# RustCrypto org (github.com/RustCrypto/hashes, the same repository and
+# `digest` 0.11 trait crate as `sha1` above, so no new transitive
+# maintainers), created 2016, 977M+ all-time / 264M+ recent downloads, MIT
+# OR Apache-2.0. Two uses, both needing SHA-256 rather than the `sha1`
+# already here: `bc-llm-openai` hashes caller-supplied cache routing
+# material into OpenAI's `prompt_cache_key`, so no repository name or
+# prompt content leaves the process in the clear; and `bc-cli`'s run
+# manifest fingerprints the config, its local overlay and the injected
+# input files, matching the Python original's `hashlib.sha256` so a
+# reader can compare digests across tools. Adds one crate: its
+# `digest`/`cpufeatures`/`cfg-if` dependencies are the ones `sha1` already
+# pulls in. 0.11.0 published 2026-03-25, >=30 days old at time of vetting
+# (2026-09-25).
+sha2 = "=0.11.0"
 # The de facto standard Rust SQLite binding (rusqlite org, created 2014,
 # 83M+ downloads, MIT). Needed for `bc-checkpoint`'s Phase-2 persistent
 # `CheckpointStore` (`--resume` support for S10 remediation runs), matching
@@ -191,6 +205,15 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 # ScanEvent channel. Not a port, as the Python original has no equivalent UI.
 # 0.18.6 published 2026-07-01, >=30 days old at time of vetting.
 indicatif = "=0.18.6"
+# bytecodealliance/rustix, created 2021-10-29, 1.16B+ all-time / 262M+
+# recent downloads, Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT.
+# Already in the lockfile at this exact version (via `tempfile`), so this
+# adds no crate to the build, only the `process` feature. Used by
+# `bc-config` for a safe `geteuid()`, needed by the `config.local.yaml`
+# ownership check (the std library exposes a file's owner uid but not the
+# process's effective uid), instead of `unsafe` libc FFI. 1.1.4 published
+# 2026-02-22, >=30 days old at time of vetting.
+rustix = { version = "=1.1.4", features = ["process"] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

@@ -58,16 +58,14 @@ not measured performance claims or screenshots of a dashboard.
   [implementation notes](../implementation-notes.md). These illustrations
   do not establish end-to-end validation, complete security or compliance.
 
-## Generation and review
+## Provenance
 
-Created with the built-in image-generation tool. Original specifications
-are in [prompts.json](prompts.json); follow-up edits are recorded in
-[edit-prompts.json](edit-prompts.json). The final overview subtitle is
-"Assess code changes in context". The final testing graphic omits the
-generator's extra explanatory paragraphs to avoid implying unauthorized
-execution during discovery.
+These six images are AI-generated, and each carries C2PA provenance
+metadata recording that. They were reviewed by hand for accuracy against
+the documentation they illustrate.
 
-All six final images were visually inspected for labels, branding removal
-and workflow consistency. PNG dimensions and local documentation links
-were checked. No application code changed, and no application tests,
-provider calls or target-code execution were needed for this artwork.
+One review note worth keeping: the testing graphic deliberately omits the
+explanatory text the generator added around it, which read as though
+discovery executes target code. It does not. `--target-tests` is opt-in and
+the profiles that ship authorize no execution at all, as
+[target testing](../target-testing.md) sets out.

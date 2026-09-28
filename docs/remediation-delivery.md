@@ -3,7 +3,10 @@
 `--remediation-delivery patch|branch|zip` selects how the combined proposal
 leaves BC SAST. It does not select test depth or authorize test execution.
 Generated tests, extensions to existing tests, approved supporting files,
-and accepted production fixes travel together.
+the reviewed API specification and any references it moved with, and
+accepted production fixes travel together. A deleted file is carried as a
+deletion, and a moved file (such as a relocated API specification) as a
+Git rename in the patch.
 
 The default remains `patch`, preserving the existing review-and-apply
 workflow. Explicit `branch` and `zip` delivery require a full scan followed
@@ -90,7 +93,12 @@ still requires platform validation.
 ## Assurance and results
 
 Delivery does not weaken remediation gates. A blocked proposal is not
-published as an approved result. Delivery failure returns a nonzero exit status after saving available
+published as an approved result. Delivery is withheld when S11 graded any
+fix below `Fixed`, when a validation errored, or when an S10 call failed;
+the same outcomes also set the process exit code of a `--remediate` run
+(`1` for a failure, `3` when nothing validated as fixed, see
+[outputs](outputs.md#exit-codes)), unless `--remediation-exit-code false`
+is passed. Delivery failure returns a nonzero exit status after saving available
 remediation evidence. A delivery receipt is written only after delivery
 succeeds, so inspect the run status as well as any
 `security-scan/delivery.json` before consuming artifacts.

@@ -138,10 +138,13 @@ pub fn fact_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "PatternScan".to_string(),
-            description: "Run a deterministic regex pattern set over the repository, skipping \
+            description: "Return bounded, secret-free match metadata and a scan summary for \
+                a deterministic regex pattern set swept over the repository, skipping \
                 vendor/test/binary files. Sets: \"secret_exposure\" (hardcoded credentials), \
                 \"insecure_value\" (disabled TLS verification, debug/anonymous-auth flags). \
-                Returns file/line/snippet hits; snippets are redacted."
+                Match records carry only file and line, never the matched text. The final \
+                item is a summary reporting counts, limits, and whether results were \
+                truncated."
                 .to_string(),
             parameters: json!({
                 "type": "object",

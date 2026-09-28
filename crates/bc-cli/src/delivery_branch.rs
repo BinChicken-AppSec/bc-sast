@@ -397,7 +397,7 @@ pub async fn publish(worktree: &Path, remote: &str, branch: &str) -> Result<Bran
         if let Ok(content) = std::str::from_utf8(&bytes) {
             if bc_redact::redact(content) != content {
                 return Err(
-                    "changed file contains a recognised sensitive value; publication blocked"
+                    "changed file contains a recognized sensitive value; publication blocked"
                         .into(),
                 );
             }
@@ -775,7 +775,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             refuses(repo.path()).await,
-            "changed file contains a recognised sensitive value; publication blocked"
+            "changed file contains a recognized sensitive value; publication blocked"
         );
         std::fs::remove_file(repo.path().join("tests/leaked.txt")).unwrap();
 

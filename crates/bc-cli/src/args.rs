@@ -74,20 +74,29 @@ pub struct Cli {
     #[arg(long)]
     pub repo_name: Option<String>,
 
-    /// Model identifier passed to every pipeline stage.
-    #[arg(long, default_value = "gpt-4o")]
+    /// Model identifier passed to every pipeline stage, unless a
+    /// `--config` names a role's own `models.<role>.id`. The default is
+    /// a reasoning model, reached over the OpenAI Responses API under the
+    /// default `--openai-api auto`.
+    #[arg(long, default_value = DEFAULT_MODEL)]
     pub model: String,
 
     /// Sampling temperature for EVERY stage, unless a `--config` sets
     /// that stage's own `models.<role>.temperature` (which wins).
     ///
     /// Omitting this sends no `temperature` at all, leaving the
-    /// provider's default — `1.0` for both dialects, i.e. maximally
-    /// divergent between two scans of the same repo. `--temperature 0` is
-    /// the single biggest lever on run-to-run stability; see
-    /// `docs/configuration.md`'s reproducible profile for the rest, and
-    /// note that S4 clamps `runs > 1` to `1` at temperature 0 (N
-    /// identical samples cannot vote).
+    /// provider's default, `1.0` for both dialects. On a model that
+    /// accepts it, `--temperature 0` is the single biggest lever on
+    /// run-to-run stability; see `docs/configuration.md`'s reproducible
+    /// profile, and note that S4 clamps `runs > 1` to `1` at temperature
+    /// 0 (N identical samples cannot vote).
+    ///
+    /// Reasoning models reject sampling: on GPT-5.x (the default model
+    /// included) `temperature`, `top_p` and `seed` are dropped, with a
+    /// once-per-model warning, unless the role's effort is `none`; the
+    /// o-series and Claude Opus 4.7 and later drop them always, and any
+    /// Claude request that thinks drops them too. See
+    /// `docs/llm-transport.md`.
     #[arg(long)]
     pub temperature: Option<f64>,
 
@@ -117,6 +126,17 @@ pub struct Cli {
     #[arg(long)]
     pub step_timeout: Option<u64>,
 
+    /// Reasoning-effort tier for EVERY role (`none`, `minimal`, `low`,
+    /// `medium`, `high`, `xhigh`, `max`), unless a `--config` sets that
+    /// role's own `models.<role>.effort` (which wins, as for
+    /// `--temperature`). Omitting it sends none and leaves each model at
+    /// its provider's default, except S11, which defaults to `high`
+    /// (`step_validate.effort`). A tier the model does not support is
+    /// clamped to the nearest one it does, and a model that takes no
+    /// effort at all gets none.
+    #[arg(long, value_name = "TIER", value_parser = parse_reasoning_effort)]
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+
     /// AI-gateway base URL (OpenAI-compatible or Anthropic-compatible).
     #[arg(
         long,
@@ -136,9 +156,47 @@ pub struct Cli {
     #[arg(long)]
     pub ca_cert: Option<PathBuf>,
 
+    /// Client certificate (PEM) to present to the gateway for mutual TLS.
+    /// May also contain the private key, in which case `--client-key` is
+    /// not needed. A missing or unloadable file stops the run rather than
+    /// quietly connecting without mTLS.
+    #[arg(long, env = "BC_GATEWAY_CLIENT_CERT")]
+    pub client_cert: Option<PathBuf>,
+
+    /// Private key (PEM) for `--client-cert`, when it is a separate file.
+    /// Refused without `--client-cert`.
+    #[arg(long, env = "BC_GATEWAY_CLIENT_KEY")]
+    pub client_key: Option<PathBuf>,
+
     /// Which wire dialect the gateway speaks.
     #[arg(long, value_enum, default_value_t = Dialect::Openai)]
     pub dialect: Dialect,
+
+    /// Which OpenAI API shape the OpenAI dialect speaks: `chat` (Chat
+    /// Completions), `responses` (the Responses API), or `auto` (the
+    /// Responses API for known reasoning models, Chat Completions for
+    /// everything else, learning per model from how the gateway
+    /// answers). Defaults to `auto`, then `llm.openai_api` in a
+    /// `--config`; this flag and `BC_OPENAI_API` win over the config. A
+    /// role's `models.<role>.use_responses_api` pins that role alone.
+    /// Ignored under `--dialect anthropic`.
+    #[arg(long, env = "BC_OPENAI_API", value_name = "API", value_parser = parse_openai_api)]
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
+
+    /// Send no prompt-cache markers at all: no Anthropic `cache_control`
+    /// and no OpenAI `prompt_cache_key`. The kill switch for a gateway
+    /// that rejects them; same as `llm.cache_markers: false`, and wins
+    /// over a config that turns them on.
+    #[arg(long)]
+    pub no_cache_markers: bool,
+
+    /// Run even when a configured model is retired (no longer served by
+    /// its provider). Without it, a retired `--model` or
+    /// `models.<role>.id` stops the run before any token is spent. Meant
+    /// for a private gateway that serves its own model under a retired
+    /// name.
+    #[arg(long)]
+    pub allow_unsupported_model: bool,
 
     /// Price this run's tokens at this provider's published rates, using
     /// the provider ids from <https://models.dev> (`openai`, `anthropic`,
@@ -428,7 +486,7 @@ pub struct Cli {
     /// millions of tokens between two of them. Tripping it does not abort
     /// the scan: it stops starting new stage-4-through-7 work, lets
     /// in-flight work finish, and falls through to build the best report
-    /// available, same as `--max-scan-seconds`. Chunks never analysed and
+    /// available, same as `--max-scan-seconds`. Chunks never analyzed and
     /// findings never verified are reported as such — in the report's
     /// `## Scan Health` section and, for findings, as `UNCONFIRMED`
     /// entries under `## Dropped Findings`; an unverified finding is
@@ -615,6 +673,46 @@ pub struct Cli {
     )]
     pub remediate: bool,
 
+    /// Run (`--validate`, `--validate true`) or skip (`--validate false`)
+    /// S11's fix-validation panel after `--remediate`, overriding
+    /// `step_validate.enabled` in `--config`. Unset keeps the config's
+    /// choice, and without one S11 runs: in this port its `Not Fixed`/
+    /// `UNVERIFIABLE` grade is what rolls back a patch it finds bad, so it
+    /// defaults ON (vvaharness v1.4.0 defaults it off; see
+    /// docs/validation.md). Takes an explicit value for the same reason
+    /// `--remediate` does: `action.yml` always passes its inputs.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set,
+        conflicts_with = "no_validate"
+    )]
+    pub validate: Option<bool>,
+
+    /// Skip S11 validation after `--remediate`; the same as
+    /// `--validate false`. Patches S10's own gates kept are then left in
+    /// place without an independent grade.
+    #[arg(long)]
+    pub no_validate: bool,
+
+    /// Whether a `--remediate` run's outcome sets the process exit code:
+    /// `1` when an S10 agentic call or an S11 validation failed, `3` when
+    /// S11 validated nothing as fixed and failed at least one fix (see
+    /// docs/outputs.md). On by default, matching vvaharness. `false`
+    /// restores the old behavior of exiting `0` whenever the scan itself
+    /// succeeded; the GitHub Action passes its `fail-on-remediation` input
+    /// here, which defaults to `false` so an existing workflow does not
+    /// start failing. A plain scan's exit code never depends on this.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
+    pub remediation_exit_code: bool,
+
     /// Select a built-in testing level: discover, unit, integration, e2e,
     /// or comprehensive (the default when this flag has no value). Existing
     /// tests are inspected first. Requires full scan plus isolated remediation.
@@ -622,6 +720,27 @@ pub struct Cli {
     /// preloaded, ecosystem-specific containers. Other levels do not execute.
     #[arg(long, visible_alias = "testing-level", value_name = "LEVEL", num_args = 0..=1, default_missing_value = "comprehensive", requires = "remediate", conflicts_with_all = ["remediate_from", "diff_scope", "stop_after", "interactive", "remediate_in_place", "resume"])]
     pub target_tests: Option<String>,
+
+    /// API specification step of `--target-tests`: `auto` (the default)
+    /// creates a missing OpenAPI, GraphQL, AsyncAPI, OpenRPC or WSDL
+    /// document at the framework's conventional location, or completes,
+    /// repairs or relocates an existing one, as an independently reviewed
+    /// proposal delivered with the generated tests; OData 4 CSDL is
+    /// repaired but never created; Protocol Buffers, RAML, API Blueprint
+    /// and legacy OData 2 and 3 documents are checked and reported only.
+    /// It runs for
+    /// generating levels when discovery finds API evidence or an existing
+    /// description. `off` skips it, and the artifact records that. The
+    /// step is static: it never sends a request to the application.
+    #[arg(long, value_enum, value_name = "MODE", default_value = "auto")]
+    pub api_spec: crate::target_testing::ApiSpecMode,
+
+    /// API description standards the API specification step considers, as
+    /// a comma-separated list (for example `openapi`). The default is every
+    /// standard the selected profile allows; the list can only narrow that
+    /// set, never add to it.
+    #[arg(long, value_name = "LIST", value_delimiter = ',', value_parser = crate::target_testing::parse_api_spec_format)]
+    pub api_spec_formats: Vec<bc_api_spec::FormatId>,
 
     /// Deliver full-scan remediation as a patch (default), a newly pushed
     /// branch containing one commit, or an updated source ZIP for CI upload.
@@ -918,6 +1037,37 @@ pub struct Cli {
     #[arg(long)]
     pub no_progress: bool,
 
+    /// Print plain-text `[progress]` lines to stderr in this style
+    /// instead of the terminal progress bar: `compact` (stage start/done
+    /// lines, S4 chunk progress and summary), `verbose` (compact plus
+    /// running findings counts and per-stage tokens), `summary_only` (the
+    /// S4 summary block) or `stage_only` (numbered stage lines only).
+    /// Meant for CI and any log nothing redraws in place, where the bar
+    /// hides itself. Also switched on by `scan_progress.enabled: true` in
+    /// `--config` or `BC_SCAN_PROGRESS_ENABLED=1`; this flag's style wins
+    /// over `scan_progress.style`. Ported from the Python original's
+    /// `scan_progress` (its `llm_debug` style is deliberately not).
+    #[arg(long, value_enum)]
+    pub progress_style: Option<crate::progress_lines::ProgressStyle>,
+
+    /// Keep `<state-dir>/s6_progress/<run_id>/s6_progress.json` up to date
+    /// while S6 verifies: `status`, `total`, `completed`, `remaining`, a
+    /// count per outcome and `updated_at`, rewritten atomically after each
+    /// finding, so another process can watch a long verification pass.
+    /// Same as `step6_verify.progress_file: true` in `--config`. Ported
+    /// from the Python original's `--s6-progress-file`.
+    #[arg(long)]
+    pub s6_progress_file: bool,
+
+    /// Where to write the run manifest: a JSON record of the whole
+    /// invocation (tool version, scrubbed command line, config and input
+    /// file hashes, model routing, per-stage outcome/duration/tokens/cost
+    /// through S11, totals). Defaults to `<out-dir>/run_manifest.json`.
+    /// Written only when a scan actually ran, never for an argument error
+    /// or a utility mode (`--doctor`, `--gc`, ...). See `docs/outputs.md`.
+    #[arg(long)]
+    pub out_run_manifest: Option<PathBuf>,
+
     /// Run environment-readiness diagnostics (gateway client/credentials,
     /// `git` on PATH, `--config` load) and, if none of those are
     /// blocking, one minimal live request through the gateway — then
@@ -928,6 +1078,15 @@ pub struct Cli {
     /// backends — see `environment.rs`'s own module doc comment.
     #[arg(long)]
     pub doctor: bool,
+
+    /// With `--doctor`: also run a live prompt-cache diagnostic against
+    /// `--model`. Sends two real calls through the configured client that
+    /// share a synthetic system prompt of roughly 10,000 tokens, then
+    /// classifies whether the second one read what the first one wrote.
+    /// SPENDS REAL TOKENS (about 20,000 prompt tokens plus two short
+    /// replies). Ported from `vvaharness doctor --cache-probe`.
+    #[arg(long, requires = "doctor")]
+    pub cache_probe: bool,
 
     /// Send any model call asking for at least 21,333 output tokens as a
     /// server-sent-event STREAM, reassembled into exactly the response a
@@ -980,6 +1139,22 @@ pub struct Cli {
     pub setup: bool,
 }
 
+/// `--model`'s default: a reasoning model, so the default run gets the
+/// Responses API and its default effort rather than a legacy chat model.
+pub const DEFAULT_MODEL: &str = "gpt-5.6-luna";
+
+/// `--reasoning-effort`'s parser: the library's own spelling rules, so a
+/// flag and a `models.<role>.effort` accept exactly the same words.
+fn parse_reasoning_effort(raw: &str) -> Result<bc_llm_client::ReasoningEffort, String> {
+    raw.parse()
+}
+
+/// `--openai-api` / `BC_OPENAI_API`'s parser, likewise shared with
+/// `llm.openai_api`.
+fn parse_openai_api(raw: &str) -> Result<bc_llm_client::OpenAiApi, String> {
+    raw.parse()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Dialect {
     Openai,
@@ -1024,6 +1199,53 @@ impl From<StopAfterArg> for StopAfter {
 pub(crate) mod test_support {
     use super::*;
 
+    /// Whether permission bits actually deny this process, probed with a
+    /// mode 000 file. They do not for root (CAP_DAC_OVERRIDE), so a test
+    /// whose scenario only a permission denial can produce runs that part
+    /// only when this is true, and otherwise says on stderr that it was
+    /// skipped. Branch-free, so it is fully covered for every user.
+    #[cfg(unix)]
+    pub(crate) fn permissions_enforced(test: &str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, "x").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let enforced = std::fs::read(&probe).is_err();
+        let notes = [
+            format!("SKIPPED (permissions not enforced for this user): {test}\n"),
+            String::new(),
+        ];
+        eprint!("{}", notes[usize::from(enforced)]);
+        enforced
+    }
+
+    /// Moves the directory `staged` (built at a short path) to a new
+    /// location whose own path is 100 bytes short of Linux's `PATH_MAX`,
+    /// and returns it. An entry inside it with a name of 100 bytes or more
+    /// is then listed by `read_dir`, but its full path is refused with
+    /// ENAMETOOLONG before any permission check, so no user, root
+    /// included, can stat, open or list it through that path.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn bury_near_path_max(staged: &Path) -> PathBuf {
+        const TARGET: usize = 4096 - 100;
+        let mut deep = staged.parent().unwrap().canonicalize().unwrap();
+        while TARGET.saturating_sub(deep.as_os_str().len() + 1) > 255 {
+            deep.push("d".repeat(200));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let buried = deep.join("r".repeat(TARGET - deep.as_os_str().len() - 1));
+        std::fs::rename(staged, &buried).unwrap();
+        buried
+    }
+
+    /// A regular file nobody can open for reading: a write-only sysctl.
+    /// The kernel checks a sysctl's mode bits itself, without the
+    /// CAP_DAC_OVERRIDE bypass a chmod 000 file gets, so the open fails
+    /// with "Permission denied" for root as well. Only ever read.
+    #[cfg(target_os = "linux")]
+    pub(crate) const UNREADABLE_FILE: &str = "/proc/sys/vm/drop_caches";
+
     pub(crate) fn minimal_cli(repo: &Path) -> Cli {
         Cli {
             repo: Some(repo.to_path_buf()),
@@ -1038,9 +1260,15 @@ pub(crate) mod test_support {
             seed: None,
             top_p: None,
             step_timeout: None,
+            reasoning_effort: None,
+            openai_api: None,
+            no_cache_markers: false,
+            allow_unsupported_model: false,
             gateway_base_url: "http://127.0.0.1:0".to_string(),
             gateway_api_key: None,
             ca_cert: None,
+            client_cert: None,
+            client_key: None,
             dialect: Dialect::Openai,
             pricing_provider: None,
             stop_after: String::new(),
@@ -1101,7 +1329,12 @@ pub(crate) mod test_support {
             baseline: None,
             config: None,
             remediate: false,
+            validate: None,
+            no_validate: false,
+            remediation_exit_code: true,
             target_tests: None,
+            api_spec: Default::default(),
+            api_spec_formats: Vec::new(),
             top: None,
             interactive: false,
             force: false,
@@ -1134,7 +1367,11 @@ pub(crate) mod test_support {
             log_stderr: false,
             verbose: 0,
             no_progress: true,
+            progress_style: None,
+            s6_progress_file: false,
+            out_run_manifest: None,
             doctor: false,
+            cache_probe: false,
             stream_large_responses: false,
             skip_preflight: true,
             setup: false,

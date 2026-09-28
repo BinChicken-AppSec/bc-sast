@@ -139,6 +139,19 @@ pub struct ScopeEntry {
     pub files: Vec<String>,
 }
 
+/// One stage's terminal outcome and how long its body ran, mirroring a
+/// Python `StageRecord` (`util/stage_telemetry.py`) minus the label.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct StageTiming {
+    /// `completed`, `completed_with_errors`, `cached`, `skipped`,
+    /// `disabled` or `error` (`bc_pipeline_core::StageStatus::as_str`).
+    pub outcome: String,
+    /// `None` for a stage that ran no timed body (cached, skipped,
+    /// disabled): an unknown duration, not a zero one.
+    #[serde(default)]
+    pub duration_sec: Option<f64>,
+}
+
 /// Coverage + verification stats rendered at the top of the report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ScanMetrics {
@@ -188,6 +201,15 @@ pub struct ScanMetrics {
     /// the normal case: the scan finished everything it set out to do.
     #[serde(default)]
     pub budget_stop: String,
+    /// `true` when the operator canceled the run (Ctrl-C) and the scan
+    /// stopped starting new work, the same fall-through a budget stop
+    /// takes. [`ScanMetrics::budget_stop`] then names the point it
+    /// stopped at. Rendered by `bc_report_md`'s `## Scan Health` as a
+    /// cancellation rather than a budget, so a partial report is never
+    /// mistaken for a finished one. Net-new versus Python, whose Ctrl-C
+    /// abandons the run and writes no report.
+    #[serde(default)]
+    pub canceled: bool,
     #[serde(default)]
     pub loc_in_scope_by_language: BTreeMap<String, i64>,
     #[serde(default)]
@@ -206,8 +228,41 @@ pub struct ScanMetrics {
     pub completion_tokens: Option<i64>,
     #[serde(default)]
     pub total_tokens: Option<i64>,
+    /// Cache-read tokens summed over every phase. Kept out of
+    /// `prompt_tokens`/`total_tokens` (`util/tokens.py:54-61`: a cache
+    /// read is ~10% of the input rate and would otherwise dominate the
+    /// headline) but reported here so the run total is not silently
+    /// smaller than the per-phase `cache_read` buckets add up to. `None`
+    /// when no backend reported usage at all.
+    #[serde(default)]
+    pub cache_read_tokens: Option<i64>,
+    /// Cache-write tokens summed over every phase. Already included in
+    /// `prompt_tokens` (they are billable input), broken out here so a
+    /// reader can see how much of the prompt figure they are. `None` when
+    /// no backend reported usage at all.
+    #[serde(default)]
+    pub cache_write_tokens: Option<i64>,
     #[serde(default)]
     pub tokens_by_phase: Option<BTreeMap<String, Value>>,
+    /// Model replies the transport gave up on as truncated (VVAH-E005)
+    /// across the scan: the Rust counterpart of Python's
+    /// `COUNTERS["llm_truncated_replies"]`. A truncation the doubled-
+    /// budget retry fixed is not counted. Each one is a chunk or session
+    /// whose result was lost, so a non-zero value explains a gap.
+    #[serde(default)]
+    pub llm_truncated_replies: i64,
+    /// What the pipeline's guards, repairs and caps did, stage by stage
+    /// (see [`crate::PipelineDiagnostics`]). Rendered as `### Pipeline
+    /// Diagnostics` only when something in it is noteworthy.
+    #[serde(default)]
+    pub pipeline_diagnostics: crate::PipelineDiagnostics,
+    /// Per-stage outcome and wall-clock duration for the stages that ran
+    /// before this report was assembled (S0-S8), keyed by stage id
+    /// (`"s4"`). Ported from Python's `STAGES` recorder
+    /// (`util/stage_telemetry.py`). S9-S11 run after the report exists,
+    /// so their timings are in the run manifest only.
+    #[serde(default)]
+    pub stage_timings: BTreeMap<String, StageTiming>,
     /// What this run's model calls cost, in US dollars, summed one
     /// already-priced call at a time (see `bc_orchestrator::pricing` for
     /// why per call and not per phase). A lower bound whenever
@@ -386,6 +441,36 @@ mod tests {
         .unwrap();
         assert_eq!(d.detail, "");
         assert_eq!(d.canonical_idx, None);
+    }
+
+    #[test]
+    fn scan_metrics_telemetry_fields_default_when_absent_and_round_trip() {
+        // A report written before these fields existed still loads.
+        let old: ScanMetrics = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(old.cache_read_tokens, None);
+        assert_eq!(old.llm_truncated_replies, 0);
+        assert!(old.stage_timings.is_empty());
+
+        let mut m = ScanMetrics {
+            cache_read_tokens: Some(9),
+            cache_write_tokens: Some(4),
+            llm_truncated_replies: 2,
+            ..Default::default()
+        };
+        m.stage_timings.insert(
+            "s4".to_string(),
+            StageTiming {
+                outcome: "completed".to_string(),
+                duration_sec: Some(1.5),
+            },
+        );
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["stage_timings"]["s4"]["duration_sec"], 1.5);
+        let back: ScanMetrics = serde_json::from_value(json).unwrap();
+        assert_eq!(back, m);
+        let timing: StageTiming =
+            serde_json::from_value(serde_json::json!({"outcome": "cached"})).unwrap();
+        assert_eq!(timing.duration_sec, None);
     }
 
     #[test]

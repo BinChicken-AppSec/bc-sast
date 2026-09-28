@@ -24,57 +24,140 @@
 //! says.
 
 use std::path::Path;
+use std::sync::LazyLock;
 
 use bc_model::{AppProfile, ContextPackage, ThreatModel};
+
+use crate::inventory::IdInventory;
 
 use crate::wire::{
     actor_str, control_kind_str, ep_kind_str, impact_str, likelihood_str, sensitivity_str,
 };
 
-// A plain (non-`\`-continued) multi-line literal below — every physical
-// source newline is a real character in the compiled string, so each
-// line's own leading whitespace survives verbatim (this matters a lot
-// here: the embedded JSON example's nesting was previously flattened to
-// zero indentation by `\`-continuation eating it — confirmed by compiling
-// and diffing against Python). `bc_prompts::EXCLUSION_RULES` already uses
-// this exact style for the same reason.
-pub const SYSTEM: &str = "You are a vulnerability research strategist. You receive a structured
+// Plain multi-line raw literals below: every physical source newline is a
+// real character in the compiled string, so each line's own leading
+// whitespace survives verbatim (the numbered list's hanging indent and the
+// embedded JSON example's nesting both matter).
+//
+// Upstream v1.3 template, with two slots filled per run: rule 4 and the
+// `threat_id` line of the response example. S2 can legitimately produce no
+// threats (a parse failure there degrades the scan rather than aborting
+// it), and the MUST-cite form then contradicts the prompt itself: an
+// observed run refused outright ("I cannot invent threat ids"), losing the
+// whole LLM ranking pass. The example varies too, because models copy
+// schema exemplars: showing `"threat_id": "T3"` while saying no ids exist
+// produced invented ids.
+const SYSTEM_HEAD: &str = r#"You are a vulnerability research strategist. You receive a structured
 map of a codebase — NOT the source code itself — and produce a prioritized
 hunting plan.
+
+GROUNDING RULE (read first): the FILE INVENTORY block lists every file that
+exists, each with an id like F001. Entry points have ids like E001 and sinks
+like K001. You MUST reference files and entry points by id ONLY. Never write a
+file path. Never invent an id. If the work you want to do needs a file that is
+not in the inventory, say so in "rationale" — do not guess a path.
 
 Your job:
 1. Rank attack surfaces by risk. Unauth-reachable entry points + unsafe sinks
    in the same data flow path = highest priority.
-2. Hunt for VARIANTS of known CVEs. If CVE-X is a heap overflow in parser.c,
+2. Hunt for VARIANTS of known CVEs. If CVE-X is a heap overflow in a parser,
    look for sibling parsers with the same pattern.
 3. Account for design controls. A bug behind strong auth ranks lower than the
    same bug pre-auth.
-4. Tie every chunk to a THREAT. The THREAT MODEL section lists ranked threats
+4. "#;
+
+const THREAT_RULE: &str = r#"Tie every chunk to a THREAT. The THREAT MODEL section lists ranked threats
    T1..Tn. Each chunk MUST cite the threat_id it tests. Every threat should be
    covered by at least one chunk; if a threat has no plausible code surface,
-   omit it — do NOT invent a chunk.
+   omit it — do NOT invent a chunk."#;
+
+const NO_THREAT_RULE: &str = r#"No ranked threats are available for this run: any THREAT MODEL
+   section carries background context only, and no threat ids exist. Omit
+   "threat_id" from every chunk, or set it to null. Do NOT invent threat ids,
+   and do NOT refuse to produce chunks over the missing threat list — rank by
+   the entry points, sinks and call graph you were given."#;
+
+const SYSTEM_MIDDLE: &str = r#"
 5. Chunk the work. Each chunk = a coherent set of files to deep-dive together.
    Use the CALL GRAPH section: when caller -> callee crosses files, put BOTH
-   files in the same chunk so the entry-point and its sink are reviewed
-   together. Tag size: small (<2k loc), medium (<8k), large (more).
-6. For LARGE chunks, name the entry-point functions to anchor a sliding window.
+   file ids in the same chunk so the entry point and its sink are reviewed
+   together.
+6. For chunks you expect to be large, name the entry-point ids to anchor a
+   sliding window. Chunk size is computed by the caller — do not report it.
 
 Respond with ONLY a JSON object, no prose:
 {
-  \"rationale\": \"one paragraph explaining your ranking\",
-  \"chunks\": [
+  "rationale": "one paragraph explaining your ranking, plus any file you
+                needed that was not in the inventory",
+  "chunks": [
     {
-      \"id\": \"chunk-01\",
-      \"size\": \"small|medium|large\",
-      \"risk_rank\": 1,
-      \"files\": [\"src/parser.c\", \"src/parser.h\"],
-      \"focus_entry_points\": [\"parse_request\"],
-      \"hypothesis\": \"Specific reasoning about what to hunt and why\",
-      \"threat_id\": \"T3\",
-      \"related_cves\": [\"CVE-2024-1234\"]
+      "id": "chunk-01",
+      "risk_rank": 1,
+      "file_ids": ["F014", "F015"],
+      "focus_entry_point_ids": ["E007"],
+      "hypothesis": "Specific reasoning about what to hunt and why","#;
+
+const THREAT_ID_EXAMPLE: &str = "\n      \"threat_id\": \"T3\",";
+
+const SYSTEM_TAIL: &str = r#"
+      "related_cves": ["CVE-2024-1234"]
     }
   ]
-}";
+}"#;
+
+/// The strategist system prompt when S2 produced at least one ranked
+/// threat: every chunk must cite one.
+pub static SYSTEM: LazyLock<String> = LazyLock::new(|| {
+    [
+        SYSTEM_HEAD,
+        THREAT_RULE,
+        SYSTEM_MIDDLE,
+        THREAT_ID_EXAMPLE,
+        SYSTEM_TAIL,
+    ]
+    .concat()
+});
+
+/// The variant for a run with no ranked threats: no `threat_id` rule to
+/// violate and no exemplar id to copy.
+pub static SYSTEM_NO_THREATS: LazyLock<String> =
+    LazyLock::new(|| [SYSTEM_HEAD, NO_THREAT_RULE, SYSTEM_MIDDLE, SYSTEM_TAIL].concat());
+
+/// Which system prompt `ctx` calls for. Tests the THREATS, not the model:
+/// S2 legitimately returns a threat model with an empty list, and keying on
+/// the model alone would hand the strategist a must-cite rule with no ids
+/// to cite.
+pub fn system_prompt_for(ctx: &ContextPackage) -> &'static str {
+    if ctx
+        .threat_model
+        .as_ref()
+        .is_some_and(|tm| !tm.threats.is_empty())
+    {
+        SYSTEM.as_str()
+    } else {
+        SYSTEM_NO_THREATS.as_str()
+    }
+}
+
+/// Caps on what the decompose prompt carries from the threat model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThreatCaps {
+    pub assets: usize,
+    pub boundaries: usize,
+    pub threats: usize,
+    pub context_chars: usize,
+}
+
+impl Default for ThreatCaps {
+    fn default() -> Self {
+        ThreatCaps {
+            assets: crate::DEFAULT_MAX_PROMPT_ASSETS,
+            boundaries: crate::DEFAULT_MAX_PROMPT_BOUNDARIES,
+            threats: crate::DEFAULT_MAX_PROMPT_THREATS,
+            context_chars: crate::DEFAULT_MAX_PROMPT_THREAT_CONTEXT_CHARS,
+        }
+    }
+}
 
 /// Ported from `AppProfile.to_prompt_block()`. Deliberately duplicated
 /// byte-for-byte in `bc-stage-s2`/`bc-stage-s8`'s own `prompts.rs` rather
@@ -467,12 +550,35 @@ fn threat_model_compact_prompt_block(
 /// the strategist only needs structural anchors for risk ranking, since
 /// the deterministic taint/catch-all passes that run after S3 preserve
 /// full-file coverage regardless of what the LLM says.
-pub fn to_decompose_prompt_block(ctx: &ContextPackage, repo_root: &Path) -> String {
-    let mut lines = vec![
+///
+/// Upstream v1.3 puts the FILE INVENTORY (see [`IdInventory`]) and the
+/// threat model FIRST: without an authoritative file list up front the
+/// model invented paths that shared a basename with a real file elsewhere
+/// in the tree. `inv` must be built from the same `ctx`, and it is the
+/// value the reply's ids are later resolved against.
+pub fn to_decompose_prompt_block(
+    ctx: &ContextPackage,
+    repo_root: &Path,
+    inv: &IdInventory,
+    caps: ThreatCaps,
+) -> String {
+    let mut lines = inv.render(repo_root);
+    lines.push(String::new());
+    if let Some(tm) = &ctx.threat_model {
+        lines.push(threat_model_compact_prompt_block(
+            tm,
+            caps.assets,
+            caps.boundaries,
+            caps.threats,
+            caps.context_chars,
+        ));
+        lines.push(String::new());
+    }
+    lines.extend([
         format!("REPO: {}  LANG: {}", ctx.repo_root, ctx.language),
         String::new(),
         format!("MODULES ({}):", ctx.modules.len()),
-    ];
+    ]);
     for m in &ctx.modules {
         lines.push(format!("  - {} ({} loc): {}", m.name, m.loc, m.purpose));
     }
@@ -562,9 +668,6 @@ pub fn to_decompose_prompt_block(ctx: &ContextPackage, repo_root: &Path) -> Stri
         lines.push(app_profile_prompt_block(ap));
         lines.push(String::new());
     }
-    if let Some(tm) = &ctx.threat_model {
-        lines.push(threat_model_compact_prompt_block(tm, 8, 12, 12, 2500));
-    }
     if !ctx.notes.is_empty() {
         let notes: String = ctx.notes.chars().take(3000).collect();
         lines.push(format!("OPUS NOTES:\n{notes}"));
@@ -593,6 +696,96 @@ mod tests {
         assert!(SYSTEM.contains("\n   in the same data flow path = highest priority."));
         assert!(SYSTEM.contains("{\n  \"rationale\""));
         assert!(SYSTEM.contains("\"chunks\": [\n    {\n      \"id\": \"chunk-01\","));
+    }
+
+    #[test]
+    fn the_two_system_prompts_differ_only_in_the_threat_rule_and_example() {
+        assert!(SYSTEM.contains("4. Tie every chunk to a THREAT."));
+        assert!(SYSTEM.contains("why\",\n      \"threat_id\": \"T3\",\n      \"related_cves\""));
+        assert!(SYSTEM_NO_THREATS.contains("4. No ranked threats are available"));
+        assert!(!SYSTEM_NO_THREATS.contains("\"threat_id\": \"T3\""));
+        assert!(SYSTEM_NO_THREATS
+            .contains("why\",\n      \"related_cves\": [\"CVE-2024-1234\"]\n    }\n  ]\n}"));
+        for s in [SYSTEM.as_str(), SYSTEM_NO_THREATS.as_str()] {
+            assert!(s.contains("GROUNDING RULE (read first)"));
+            assert!(s.contains("\"file_ids\": [\"F014\", \"F015\"]"));
+        }
+    }
+
+    #[test]
+    fn system_prompt_for_keys_on_non_empty_threats_not_on_the_model() {
+        let mut ctx = minimal_ctx();
+        assert_eq!(system_prompt_for(&ctx), SYSTEM_NO_THREATS.as_str());
+        ctx.threat_model = Some(ThreatModel::default());
+        assert_eq!(system_prompt_for(&ctx), SYSTEM_NO_THREATS.as_str());
+        ctx.threat_model = Some(ThreatModel {
+            threats: vec![Threat {
+                id: "T1".to_string(),
+                threat: "t".to_string(),
+                actor: Actor::RemoteUnauth,
+                surface: "s".to_string(),
+                asset: "a".to_string(),
+                impact: Impact::High,
+                likelihood: Likelihood::Likely,
+                controls: String::new(),
+                evidence: String::new(),
+            }],
+            ..Default::default()
+        });
+        assert_eq!(system_prompt_for(&ctx), SYSTEM.as_str());
+    }
+
+    fn render(ctx: &ContextPackage, root: &Path) -> String {
+        to_decompose_prompt_block(ctx, root, &IdInventory::build(ctx), ThreatCaps::default())
+    }
+
+    #[test]
+    fn to_decompose_prompt_block_leads_with_the_inventory_then_the_threat_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = minimal_ctx();
+        ctx.all_files = vec!["a.py".to_string()];
+        ctx.threat_model = Some(ThreatModel {
+            system_context: "ctx".to_string(),
+            ..Default::default()
+        });
+        let block = render(&ctx, dir.path());
+        assert!(block.starts_with("FILE INVENTORY (authoritative"));
+        let inv_at = block.find("  F001  a.py").unwrap();
+        let tm_at = block.find("THREAT MODEL:").unwrap();
+        let repo_at = block.find("REPO: /repo").unwrap();
+        assert!(inv_at < tm_at && tm_at < repo_at);
+    }
+
+    #[test]
+    fn to_decompose_prompt_block_applies_the_configured_threat_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = minimal_ctx();
+        ctx.threat_model = Some(ThreatModel {
+            system_context: "x".repeat(50),
+            threats: (0..3)
+                .map(|i| Threat {
+                    id: format!("T{i}"),
+                    threat: "t".to_string(),
+                    actor: Actor::RemoteUnauth,
+                    surface: "s".to_string(),
+                    asset: "a".to_string(),
+                    impact: Impact::High,
+                    likelihood: Likelihood::Likely,
+                    controls: String::new(),
+                    evidence: String::new(),
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let caps = ThreatCaps {
+            assets: 1,
+            boundaries: 1,
+            threats: 2,
+            context_chars: 10,
+        };
+        let block = to_decompose_prompt_block(&ctx, dir.path(), &IdInventory::build(&ctx), caps);
+        assert!(block.contains("Ranked threats (2/3):"));
+        assert!(block.contains(&format!("System context:\n{}\n", "x".repeat(10))));
     }
 
     fn minimal_ctx() -> ContextPackage {
@@ -1095,7 +1288,7 @@ mod tests {
             purpose: "handles auth".to_string(),
         }];
         ctx.all_files = vec!["a.py".to_string(), "b.py".to_string()];
-        let block = to_decompose_prompt_block(&ctx, dir.path());
+        let block = render(&ctx, dir.path());
         assert!(block.contains("MODULES (1):"));
         assert!(block.contains("  - auth (10 loc): handles auth"));
         // Neither the repo-wide file inventory nor per-module file
@@ -1114,7 +1307,7 @@ mod tests {
             ctx.call_graph
                 .insert(format!("caller{i}.py::f"), vec![format!("callee{i}.py::g")]);
         }
-        let block = to_decompose_prompt_block(&ctx, dir.path());
+        let block = render(&ctx, dir.path());
         assert!(block.contains("FUNCTION SITES"));
         assert!(block.contains("CALL GRAPH (5 edges"));
         assert!(!block.contains("truncated"));
@@ -1132,7 +1325,7 @@ mod tests {
                 notes: String::new(),
             })
             .collect();
-        let block = to_decompose_prompt_block(&ctx, dir.path());
+        let block = render(&ctx, dir.path());
         assert!(block.contains("DESIGN CONTROLS (45):"));
         assert!(block.contains("C39"));
         assert!(!block.contains("C40"));
@@ -1171,7 +1364,7 @@ mod tests {
             pii: false,
             source: "cmdb".to_string(),
         });
-        let block = to_decompose_prompt_block(&ctx, dir.path());
+        let block = render(&ctx, dir.path());
         assert!(block.contains("  - network: internal_handler @ a.py"));
         assert!(!block.contains("internal_handler @ a.py [UNAUTH-REACHABLE]"));
         assert!(block.contains("KNOWN CVEs (1)"));
@@ -1186,7 +1379,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = minimal_ctx();
         ctx.notes = "n".repeat(3100);
-        let block = to_decompose_prompt_block(&ctx, dir.path());
+        let block = render(&ctx, dir.path());
         let notes_section = block.split("OPUS NOTES:\n").nth(1).unwrap();
         assert_eq!(notes_section.len(), 3000);
     }
@@ -1196,7 +1389,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = minimal_ctx();
         ctx.compliance_guidance = "Prioritize PCI-DSS Req 6 findings.".to_string();
-        let block = to_decompose_prompt_block(&ctx, dir.path());
+        let block = render(&ctx, dir.path());
         assert!(block.contains("COMPLIANCE GUIDANCE:\nPrioritize PCI-DSS Req 6 findings."));
     }
 
@@ -1212,15 +1405,16 @@ mod tests {
                     description: "d".to_string(),
                     sensitivity: Sensitivity::High,
                 };
-                10
+                25
             ],
             ..Default::default()
         });
-        let block = to_decompose_prompt_block(&ctx, dir.path());
+        let block = render(&ctx, dir.path());
         assert!(block.contains("THREAT MODEL:"));
         // The compact renderer's "kept/total" counter is the observable
-        // signature that distinguishes it from the uncapped renderer.
-        assert!(block.contains("Assets (8/10):"));
+        // signature that distinguishes it from the uncapped renderer; the
+        // default asset cap is `max_prompt_assets`' 20.
+        assert!(block.contains("Assets (20/25):"));
     }
 
     #[test]
@@ -1233,7 +1427,7 @@ mod tests {
             "a.py".to_string(),
             std::collections::BTreeSet::from([1i64]),
         )]);
-        let block = to_decompose_prompt_block(&ctx, dir.path());
+        let block = render(&ctx, dir.path());
         assert!(block.contains("PRIORITIZE THESE FILES (1)"));
         assert!(block.contains("  - a.py"));
     }
@@ -1246,7 +1440,7 @@ mod tests {
         let mut ctx = minimal_ctx();
         ctx.all_files = vec!["a.py".to_string(), "b.py".to_string()];
         ctx.diff_scope_active = true;
-        let block = to_decompose_prompt_block(&ctx, dir.path());
+        let block = render(&ctx, dir.path());
         assert!(block.contains("PRIORITIZE THESE FILES (0)"));
     }
 
@@ -1254,7 +1448,7 @@ mod tests {
     fn to_decompose_prompt_block_omits_optional_sections_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = minimal_ctx();
-        let block = to_decompose_prompt_block(&ctx, dir.path());
+        let block = render(&ctx, dir.path());
         assert!(!block.contains("FUNCTION SITES"));
         assert!(!block.contains("SIGNATURES"));
         assert!(!block.contains("CALL GRAPH"));

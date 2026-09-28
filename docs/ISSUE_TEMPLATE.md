@@ -17,7 +17,7 @@ reported in a repository you scanned.
 
 - `bc-sast` version or commit:
 - How you ran it (container, `cargo run`, the composite action):
-- Model and gateway (for example gpt-4o via api.openai.com):
+- Model and gateway (for example gpt-5.6-luna via api.openai.com):
 - Target language and framework, if relevant:
 
 ## Logs

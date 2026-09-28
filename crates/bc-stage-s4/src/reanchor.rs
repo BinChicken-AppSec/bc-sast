@@ -51,7 +51,7 @@ const C_CPP_EXTENSIONS: &[&str] = &[
     "c", "h", "cc", "cpp", "cxx", "c++", "hpp", "hh", "hxx", "h++",
 ];
 
-/// Release functions recognised as a release site. Deliberately just the
+/// Release functions recognized as a release site. Deliberately just the
 /// libc pair: a project-specific `xfree`/`g_free`/`my_release` wrapper
 /// cannot be told apart from an ordinary one-argument call without
 /// knowing the project, and guessing wrong re-anchors a good finding.
@@ -72,7 +72,7 @@ struct Anchor {
 }
 
 /// Whether this finding is a temporal one. Both halves matter: the class
-/// alone misses a double-free the model labelled `other`, and the CWE
+/// alone misses a double-free the model labeled `other`, and the CWE
 /// alone misses the (common) finding that carries no CWE at all.
 fn is_temporal(finding: &Finding) -> bool {
     if matches!(
@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_declaration_initialised_from_the_freed_pointer_is_a_use() {
+    fn a_later_declaration_initialized_from_the_freed_pointer_is_a_use() {
         // `char *r = p;` — the mention is the init_declarator's VALUE,
         // not its declarator, so it is a read of the dangling pointer.
         assert_eq!(

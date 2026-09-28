@@ -15,10 +15,10 @@ use std::sync::LazyLock;
 use bc_model::{Actor, Chunk, ContextPackage, EntryPoint, Threat};
 use regex::Regex;
 
-use crate::pack::count_loc;
-use crate::source::is_source;
+use crate::pack::confined_loc;
 use crate::wire::actor_str;
 use crate::Step3Config;
+use bc_repo_analysis::is_source;
 
 static TOKEN_RX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[a-z0-9]+").unwrap());
 
@@ -115,12 +115,16 @@ fn is_config_file(rel: &str) -> bool {
     name.contains("config") || name.contains("policy") || name.contains("settings")
 }
 
+/// The text the routing regexes read. `controls` is deliberately excluded
+/// (upstream v1.3): it describes MITIGATIONS, the opposite of where to
+/// hunt, so a threat whose controls mention "JWT signature validation"
+/// pulled in every file containing "jwt". `evidence` is excluded because it
+/// carries the `baseline: BL-*` provenance prefix.
 fn threat_text(t: &Threat) -> String {
     [
         t.threat.as_str(),
         t.surface.as_str(),
         t.asset.as_str(),
-        t.controls.as_str(),
         actor_str(t.actor),
     ]
     .into_iter()
@@ -141,13 +145,55 @@ fn matches_threat_surface(ep: &EntryPoint, t: &Threat) -> bool {
     !surface_tokens.is_disjoint(&tok(&ep.function))
 }
 
+/// Must match the pattern S2 writes these evidence strings with. A threat
+/// S2 emitted to satisfy a mandatory baseline disposition carries
+/// `"baseline: BL-<AREA>-<ID>"` evidence.
+static BASELINE_EVIDENCE_RX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^baseline:\s*(BL-[A-Z]+-\w+)").unwrap());
+
+/// A path-shaped token inside a threat's `surface` (`routes/b2bOrder.ts`,
+/// `lib/insecurity.ts::decode(token)`). Requires a file extension, so prose
+/// surfaces ("npm dependencies", "terraform/ IaC") yield nothing.
+static SURFACE_PATH_RX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\w./\\-]+\.[A-Za-z0-9]{1,6}").unwrap());
+
+fn surface_names_a_real_file(t: &Threat, all_files: &HashSet<&str>) -> bool {
+    SURFACE_PATH_RX.find_iter(&t.surface).any(|m| {
+        let mut cand = m.as_str().replace('\\', "/");
+        while let Some(rest) = cand.strip_prefix("./") {
+            cand = rest.to_string();
+        }
+        let suffix = format!("/{cand}");
+        all_files.contains(cand.as_str()) || all_files.iter().any(|f| f.ends_with(&suffix))
+    })
+}
+
+/// A baseline disposition that pins itself to no code surface in this repo
+/// (upstream v1.3 `_is_unmatched_baseline_threat`). These, and only these,
+/// are exempt from a dedicated fallback chunk and from the threat-coverage
+/// denominator: a chunk for one would select noise through the routing
+/// regexes for no recall benefit, and it would otherwise count as
+/// permanently uncovered. The baseline marker alone is NOT the test: S2
+/// asks for it on every disposed checklist item, so a threat naming a
+/// concrete file carries it too, and exempting on the marker stripped the
+/// coverage guarantee from most real threats.
+pub fn is_unmatched_baseline_threat(t: &Threat, all_files: &HashSet<&str>) -> bool {
+    BASELINE_EVIDENCE_RX.is_match(&t.evidence) && !surface_names_a_real_file(t, all_files)
+}
+
+/// Appends to `chosen` in order, skipping duplicates and anything outside
+/// the inventory, and stops at `max_files`.
 fn add_candidates(
     seq: impl IntoIterator<Item = String>,
     all_file_set: &HashSet<&str>,
     chosen: &mut Vec<String>,
     seen: &mut HashSet<String>,
+    max_files: usize,
 ) {
     for f in seq {
+        if chosen.len() >= max_files {
+            return;
+        }
         if all_file_set.contains(f.as_str()) && seen.insert(f.clone()) {
             chosen.push(f);
         }
@@ -173,6 +219,27 @@ fn candidate_files_for_threat(
     let mut chosen: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
+    // Order matters under truncation (upstream v1.3): entry-point hits are
+    // the strongest signal (the threat's surface names a function that IS
+    // this entry point), so they go first and survive truncation; their
+    // call-graph neighbors (the files those entry points call into or are
+    // called from) come next. The regex and specialist heuristics, with no
+    // direct evidence tying them to this threat, come last and are the
+    // first to be cut at `max_files`.
+    let ep_hits: Vec<String> = ctx
+        .entry_points
+        .iter()
+        .filter(|ep| matches_threat_surface(ep, t))
+        .map(|ep| ep.file.clone())
+        .collect();
+    let adj = crate::grouping::file_call_graph(ctx);
+    let neighbors: Vec<String> = ep_hits
+        .iter()
+        .flat_map(|f| adj.get(f).into_iter().flatten().cloned())
+        .collect();
+    add_candidates(ep_hits, &all_file_set, &mut chosen, &mut seen, max_files);
+    add_candidates(neighbors, &all_file_set, &mut chosen, &mut seen, max_files);
+
     if t.actor == Actor::SupplyChain || THREAT_IAC_RX.is_match(&txt) {
         add_candidates(
             specialist_files
@@ -183,6 +250,7 @@ fn candidate_files_for_threat(
             &all_file_set,
             &mut chosen,
             &mut seen,
+            max_files,
         );
         add_candidates(
             source_or_config
@@ -192,6 +260,7 @@ fn candidate_files_for_threat(
             &all_file_set,
             &mut chosen,
             &mut seen,
+            max_files,
         );
     }
     if THREAT_LLM_RX.is_match(&txt) {
@@ -203,6 +272,7 @@ fn candidate_files_for_threat(
             &all_file_set,
             &mut chosen,
             &mut seen,
+            max_files,
         );
     }
     if matches!(t.actor, Actor::RemoteUnauth | Actor::RemoteAuth) || THREAT_AUTHZ_RX.is_match(&txt)
@@ -216,6 +286,7 @@ fn candidate_files_for_threat(
             &all_file_set,
             &mut chosen,
             &mut seen,
+            max_files,
         );
         add_candidates(
             source_or_config
@@ -225,6 +296,7 @@ fn candidate_files_for_threat(
             &all_file_set,
             &mut chosen,
             &mut seen,
+            max_files,
         );
     }
     if THREAT_CRYPTO_RX.is_match(&txt) {
@@ -237,6 +309,7 @@ fn candidate_files_for_threat(
             &all_file_set,
             &mut chosen,
             &mut seen,
+            max_files,
         );
     }
     if THREAT_DESER_RX.is_match(&txt) {
@@ -249,6 +322,7 @@ fn candidate_files_for_threat(
             &all_file_set,
             &mut chosen,
             &mut seen,
+            max_files,
         );
     }
     if THREAT_BATCH_RX.is_match(&txt) {
@@ -261,6 +335,7 @@ fn candidate_files_for_threat(
             &all_file_set,
             &mut chosen,
             &mut seen,
+            max_files,
         );
     }
     if THREAT_CONFIG_RX.is_match(&txt) {
@@ -272,19 +347,22 @@ fn candidate_files_for_threat(
             &all_file_set,
             &mut chosen,
             &mut seen,
+            max_files,
         );
     }
 
-    let ep_hits: Vec<String> = ctx
-        .entry_points
-        .iter()
-        .filter(|ep| matches_threat_surface(ep, t))
-        .map(|ep| ep.file.clone())
-        .collect();
-    add_candidates(ep_hits, &all_file_set, &mut chosen, &mut seen);
-
-    chosen.truncate(max_files);
     chosen
+}
+
+/// What the fallback pass produced and what its ceilings cut.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FallbackResult {
+    pub chunks: Vec<Chunk>,
+    /// Threats with a candidate chunk that `max_threat_fallback_chunks`
+    /// suppressed.
+    pub capped: usize,
+    /// Candidate files dropped to keep a chunk within `risk_chunk_loc`.
+    pub files_trimmed: usize,
 }
 
 /// Append one chunk per uncovered threat whose surface signals resolve to
@@ -292,22 +370,27 @@ fn candidate_files_for_threat(
 /// plausible code surface, matching the SYSTEM prompt's own "omit it"
 /// instruction for the LLM-authored pass this backstops. Returns the new
 /// chunks (appended to the manifest by the caller), each carrying a
-/// non-null `threat_id`.
+/// non-null `threat_id`, plus what the ceilings suppressed.
+///
+/// Upstream v1.3 bounds the pass three ways: at most
+/// `max_threat_fallback_chunks` chunks (a suppressed candidate is counted,
+/// not silently skipped), each chunk trimmed at build time to
+/// `risk_chunk_loc` (keeping at least one file; trimmed rather than split
+/// afterwards, so the chunk ceiling stays a real ceiling on S4 calls), and
+/// no chunk for a baseline disposition that names no code surface
+/// ([`is_unmatched_baseline_threat`]).
 pub fn add_threat_surface_fallback_chunks(
     existing_chunks: &[Chunk],
     ctx: &ContextPackage,
     config: &Step3Config,
-) -> Vec<Chunk> {
+) -> FallbackResult {
     if !config.threat_surface_fallbacks {
-        return Vec::new();
+        return FallbackResult::default();
     }
     let Some(tm) = &ctx.threat_model else {
-        return Vec::new();
+        return FallbackResult::default();
     };
-    if tm.threats.is_empty() {
-        return Vec::new();
-    }
-
+    let all_files: HashSet<&str> = ctx.all_files.iter().map(String::as_str).collect();
     let covered: HashSet<&str> = existing_chunks
         .iter()
         .filter_map(|c| c.threat_id.as_deref())
@@ -316,10 +399,19 @@ pub fn add_threat_surface_fallback_chunks(
         .threats
         .iter()
         .filter(|t| !t.id.is_empty() && !covered.contains(t.id.as_str()))
+        .filter(|t| !is_unmatched_baseline_threat(t, &all_files))
         .collect();
     if missing.is_empty() {
-        return Vec::new();
+        return FallbackResult::default();
     }
+    let max_chunks = crate::cap_or_default(
+        config.max_threat_fallback_chunks,
+        crate::DEFAULT_MAX_THREAT_FALLBACK_CHUNKS,
+    );
+    // Read the way the splitter reads it, NOT through `cap_or_default`:
+    // `risk_chunk_loc: 0` documents "off", and mapping it onto a default
+    // budget would override the operator's off switch.
+    let loc_budget = config.risk_chunk_loc.max(0);
 
     // Matches Python's `int(getattr(step3, "threat_fallback_max_files", 12)
     // or 12)`: an explicit `0` is falsy in Python and falls back to 12,
@@ -352,15 +444,32 @@ pub fn add_threat_surface_fallback_chunks(
     }
 
     let mut used_ids: HashSet<String> = existing_chunks.iter().map(|c| c.id.clone()).collect();
-    let mut out: Vec<Chunk> = Vec::new();
+    let mut result = FallbackResult::default();
     let mut added: i64 = 0;
 
     for t in missing {
-        let files = candidate_files_for_threat(t, ctx, &specialist_files, max_files);
-        if files.is_empty() {
+        let candidates = candidate_files_for_threat(t, ctx, &specialist_files, max_files);
+        if candidates.is_empty() {
             continue;
         }
-        let loc: i64 = files.iter().map(|f| count_loc(&repo_root.join(f))).sum();
+        if result.chunks.len() >= max_chunks {
+            result.capped += 1;
+            continue;
+        }
+        // Fewest-files-dropped order is kept (the candidate list is already
+        // ranked), and the first file always survives so a single oversize
+        // file is still reviewed.
+        let mut files: Vec<String> = Vec::new();
+        let mut loc: i64 = 0;
+        for f in candidates {
+            let f_loc = confined_loc(repo_root, &f);
+            if !files.is_empty() && loc_budget > 0 && loc + f_loc > loc_budget {
+                result.files_trimmed += 1;
+                continue;
+            }
+            files.push(f);
+            loc += f_loc;
+        }
 
         let mut cid = format!("threat-{}-fallback", t.id.to_lowercase());
         if used_ids.contains(&cid) {
@@ -385,7 +494,7 @@ pub fn add_threat_surface_fallback_chunks(
             .collect();
 
         added += 1;
-        out.push(Chunk {
+        result.chunks.push(Chunk {
             id: cid,
             size: bc_repo_analysis::size_for(loc.max(0) as usize),
             risk_rank: base_rank + added,
@@ -403,10 +512,11 @@ pub fn add_threat_surface_fallback_chunks(
             source_ref: String::new(),
             sink_ref: String::new(),
             sink_cwe: Vec::new(),
+            shard_id: String::new(),
         });
     }
 
-    out
+    result
 }
 
 #[cfg(test)]
@@ -477,6 +587,7 @@ mod tests {
             source_ref: String::new(),
             sink_ref: String::new(),
             sink_cwe: Vec::new(),
+            shard_id: String::new(),
         }
     }
 
@@ -571,7 +682,9 @@ mod tests {
         });
         let mut cfg = Step3Config::new("m");
         cfg.threat_surface_fallbacks = false;
-        assert!(add_threat_surface_fallback_chunks(&[], &ctx, &cfg).is_empty());
+        assert!(add_threat_surface_fallback_chunks(&[], &ctx, &cfg)
+            .chunks
+            .is_empty());
     }
 
     #[test]
@@ -579,7 +692,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ctx_with_root(dir.path());
         let cfg = Step3Config::new("m");
-        assert!(add_threat_surface_fallback_chunks(&[], &ctx, &cfg).is_empty());
+        assert!(add_threat_surface_fallback_chunks(&[], &ctx, &cfg)
+            .chunks
+            .is_empty());
     }
 
     #[test]
@@ -588,7 +703,9 @@ mod tests {
         let mut ctx = ctx_with_root(dir.path());
         ctx.threat_model = Some(ThreatModel::default());
         let cfg = Step3Config::new("m");
-        assert!(add_threat_surface_fallback_chunks(&[], &ctx, &cfg).is_empty());
+        assert!(add_threat_surface_fallback_chunks(&[], &ctx, &cfg)
+            .chunks
+            .is_empty());
     }
 
     #[test]
@@ -600,7 +717,9 @@ mod tests {
             ..Default::default()
         });
         let cfg = Step3Config::new("m");
-        assert!(add_threat_surface_fallback_chunks(&[], &ctx, &cfg).is_empty());
+        assert!(add_threat_surface_fallback_chunks(&[], &ctx, &cfg)
+            .chunks
+            .is_empty());
     }
 
     #[test]
@@ -615,7 +734,9 @@ mod tests {
         });
         let cfg = Step3Config::new("m");
         let existing = vec![chunk("chunk-01", 1, Some("T1"))];
-        assert!(add_threat_surface_fallback_chunks(&existing, &ctx, &cfg).is_empty());
+        assert!(add_threat_surface_fallback_chunks(&existing, &ctx, &cfg)
+            .chunks
+            .is_empty());
     }
 
     #[test]
@@ -632,7 +753,9 @@ mod tests {
             ..Default::default()
         });
         let cfg = Step3Config::new("m");
-        assert!(add_threat_surface_fallback_chunks(&[], &ctx, &cfg).is_empty());
+        assert!(add_threat_surface_fallback_chunks(&[], &ctx, &cfg)
+            .chunks
+            .is_empty());
     }
 
     // ── add_threat_surface_fallback_chunks: real chunk emission ─────────
@@ -649,7 +772,7 @@ mod tests {
             ..Default::default()
         });
         let cfg = Step3Config::new("m");
-        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg).chunks;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "threat-t1-fallback");
         assert_eq!(out[0].threat_id, Some("T1".to_string()));
@@ -677,7 +800,7 @@ mod tests {
             ..Default::default()
         });
         let cfg = Step3Config::new("m");
-        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg).chunks;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].files, vec!["settings.yaml".to_string()]);
     }
@@ -704,7 +827,7 @@ mod tests {
             ..Default::default()
         });
         let cfg = Step3Config::new("m");
-        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg).chunks;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].files, vec!["auth.py".to_string()]);
         assert_eq!(out[0].focus_entry_points, vec!["handle_login".to_string()]);
@@ -726,7 +849,7 @@ mod tests {
         let mut spec_chunk = chunk("spec-access-control-01", 1, None);
         spec_chunk.specialist = Some("access-control".to_string());
         spec_chunk.files = vec!["authz.py".to_string()];
-        let out = add_threat_surface_fallback_chunks(&[spec_chunk], &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&[spec_chunk], &ctx, &cfg).chunks;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].files, vec!["authz.py".to_string()]);
     }
@@ -743,7 +866,7 @@ mod tests {
         });
         let cfg = Step3Config::new("m");
         let existing = vec![chunk("chunk-01", 5, None)];
-        let out = add_threat_surface_fallback_chunks(&existing, &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&existing, &ctx, &cfg).chunks;
         assert_eq!(out[0].risk_rank, 6);
     }
 
@@ -765,7 +888,7 @@ mod tests {
             ..Default::default()
         });
         let cfg = Step3Config::new("m");
-        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg).chunks;
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].risk_rank, 1);
         assert_eq!(out[1].risk_rank, 2);
@@ -787,7 +910,7 @@ mod tests {
             ..Default::default()
         });
         let cfg = Step3Config::new("m");
-        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg).chunks;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].files, vec!["app/prompt_builder.py".to_string()]);
     }
@@ -810,7 +933,7 @@ mod tests {
         let mut spec_chunk = chunk("spec-crypto-01", 1, None);
         spec_chunk.specialist = Some("crypto".to_string());
         spec_chunk.files = vec!["crypto_utils.py".to_string()];
-        let out = add_threat_surface_fallback_chunks(&[spec_chunk], &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&[spec_chunk], &ctx, &cfg).chunks;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].files, vec!["crypto_utils.py".to_string()]);
     }
@@ -833,7 +956,7 @@ mod tests {
         let mut spec_chunk = chunk("spec-deserialization-01", 1, None);
         spec_chunk.specialist = Some("deserialization".to_string());
         spec_chunk.files = vec!["loader.py".to_string()];
-        let out = add_threat_surface_fallback_chunks(&[spec_chunk], &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&[spec_chunk], &ctx, &cfg).chunks;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].files, vec!["loader.py".to_string()]);
     }
@@ -856,7 +979,7 @@ mod tests {
         let mut spec_chunk = chunk("spec-batch-etl-01", 1, None);
         spec_chunk.specialist = Some("batch-etl".to_string());
         spec_chunk.files = vec!["ingest.py".to_string()];
-        let out = add_threat_surface_fallback_chunks(&[spec_chunk], &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&[spec_chunk], &ctx, &cfg).chunks;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].files, vec!["ingest.py".to_string()]);
     }
@@ -876,7 +999,7 @@ mod tests {
             chunk("threat-t1-fallback", 1, None),
             chunk("threat-t1-fallback-2", 2, None),
         ];
-        let out = add_threat_surface_fallback_chunks(&existing, &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&existing, &ctx, &cfg).chunks;
         assert_eq!(out[0].id, "threat-t1-fallback-3");
     }
 
@@ -893,7 +1016,7 @@ mod tests {
         let cfg = Step3Config::new("m");
         // Pre-existing chunk already claims the id this fallback would use.
         let existing = vec![chunk("threat-t1-fallback", 1, None)];
-        let out = add_threat_surface_fallback_chunks(&existing, &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&existing, &ctx, &cfg).chunks;
         assert_eq!(out[0].id, "threat-t1-fallback-2");
     }
 
@@ -914,7 +1037,7 @@ mod tests {
         });
         let mut cfg = Step3Config::new("m");
         cfg.threat_fallback_max_files = 2;
-        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg).chunks;
         assert_eq!(out[0].files.len(), 2);
     }
 
@@ -935,7 +1058,7 @@ mod tests {
         });
         let mut cfg = Step3Config::new("m");
         cfg.threat_fallback_max_files = 0;
-        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        let out = add_threat_surface_fallback_chunks(&[], &ctx, &cfg).chunks;
         assert_eq!(out[0].files.len(), 12);
     }
 
@@ -944,5 +1067,197 @@ mod tests {
         let cfg = Step3Config::new("m");
         assert!(cfg.threat_surface_fallbacks);
         assert_eq!(cfg.threat_fallback_max_files, 12);
+    }
+
+    // ── upstream v1.3 bounds and exemptions ──────────────────────────────
+
+    fn baseline(id: &str, surface: &str) -> Threat {
+        Threat {
+            evidence: "baseline: BL-AUTH-01 disposition".to_string(),
+            ..threat(
+                id,
+                "session fixation config weakness",
+                Actor::LocalUser,
+                surface,
+            )
+        }
+    }
+
+    #[test]
+    fn a_baseline_threat_naming_no_real_file_is_exempt() {
+        let all: HashSet<&str> = ["routes/b2b.ts", "server.ts"].into_iter().collect();
+        assert!(is_unmatched_baseline_threat(
+            &baseline("T1", "npm dependencies"),
+            &all
+        ));
+        assert!(is_unmatched_baseline_threat(
+            &baseline("T1", "lib/missing.ts"),
+            &all
+        ));
+        // A surface naming a real file (exactly, by suffix, or with ./ or
+        // backslashes) keeps the coverage guarantee despite the marker.
+        for surface in [
+            "routes/b2b.ts::b2bOrder",
+            "b2b.ts",
+            "./server.ts",
+            r"routes\b2b.ts",
+        ] {
+            assert!(
+                !is_unmatched_baseline_threat(&baseline("T1", surface), &all),
+                "{surface}"
+            );
+        }
+        // No marker at all: never exempt, whatever the surface says.
+        let plain = threat("T2", "t", Actor::LocalUser, "npm dependencies");
+        assert!(!is_unmatched_baseline_threat(&plain, &all));
+        // The marker must lead the evidence and carry a well-formed id.
+        let mut late = baseline("T3", "npm dependencies");
+        late.evidence = "see baseline: BL-AUTH-01".to_string();
+        assert!(!is_unmatched_baseline_threat(&late, &all));
+        late.evidence = "baseline: none".to_string();
+        assert!(!is_unmatched_baseline_threat(&late, &all));
+    }
+
+    #[test]
+    fn unmatched_baseline_threats_get_no_fallback_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "settings.yaml", "x: 1\n");
+        let mut ctx = ctx_with_root(dir.path());
+        ctx.all_files = vec!["settings.yaml".to_string()];
+        ctx.threat_model = Some(ThreatModel {
+            threats: vec![baseline("T1", "global configuration policy")],
+            ..Default::default()
+        });
+        let cfg = Step3Config::new("m");
+        assert!(add_threat_surface_fallback_chunks(&[], &ctx, &cfg)
+            .chunks
+            .is_empty());
+    }
+
+    fn config_threats(n: usize) -> Vec<Threat> {
+        (0..n)
+            .map(|i| threat(&format!("T{i}"), "feature flag abuse", Actor::LocalUser, ""))
+            .collect()
+    }
+
+    #[test]
+    fn the_chunk_ceiling_counts_what_it_suppresses() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "settings.yaml", "x: 1\n");
+        let mut ctx = ctx_with_root(dir.path());
+        ctx.all_files = vec!["settings.yaml".to_string()];
+        ctx.threat_model = Some(ThreatModel {
+            threats: config_threats(4),
+            ..Default::default()
+        });
+        let mut cfg = Step3Config::new("m");
+        cfg.max_threat_fallback_chunks = 3;
+        let result = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        assert_eq!(result.chunks.len(), 3);
+        assert_eq!(result.capped, 1);
+        // `0` means the default ceiling (50), not "none".
+        cfg.max_threat_fallback_chunks = 0;
+        let result = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        assert_eq!((result.chunks.len(), result.capped), (4, 0));
+    }
+
+    #[test]
+    fn a_fallback_chunk_is_trimmed_to_risk_chunk_loc_but_keeps_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a_config.yaml", &"x: 1\n".repeat(8));
+        write(dir.path(), "b_config.yaml", &"x: 1\n".repeat(8));
+        write(dir.path(), "c_config.yaml", "x: 1\n");
+        let mut ctx = ctx_with_root(dir.path());
+        ctx.all_files = vec![
+            "a_config.yaml".to_string(),
+            "b_config.yaml".to_string(),
+            "c_config.yaml".to_string(),
+        ];
+        ctx.threat_model = Some(ThreatModel {
+            threats: config_threats(1),
+            ..Default::default()
+        });
+        let mut cfg = Step3Config::new("m");
+        cfg.risk_chunk_loc = 10;
+        let result = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        // 8 LOC fits, the next 8 would reach 16 > 10 and is skipped, the
+        // 1-LOC file still fits.
+        assert_eq!(
+            result.chunks[0].files,
+            vec!["a_config.yaml".to_string(), "c_config.yaml".to_string()]
+        );
+        assert_eq!(result.files_trimmed, 1);
+        // A first file over the budget alone is still kept.
+        cfg.risk_chunk_loc = 2;
+        let result = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        assert_eq!(result.chunks[0].files, vec!["a_config.yaml".to_string()]);
+        // `risk_chunk_loc: 0` is the documented off switch: no trim.
+        cfg.risk_chunk_loc = 0;
+        let result = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        assert_eq!(result.chunks[0].files.len(), 3);
+        assert_eq!(result.files_trimmed, 0);
+    }
+
+    #[test]
+    fn entry_point_hits_and_their_call_graph_neighbors_rank_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_with_root(dir.path());
+        ctx.all_files = vec![
+            "auth/policy.py".to_string(),
+            "handlers.py".to_string(),
+            "db.py".to_string(),
+        ];
+        ctx.entry_points = vec![EntryPoint {
+            file: "handlers.py".to_string(),
+            function: "reset_password".to_string(),
+            kind: EntryPointKind::Network,
+            reachable_from_unauth: true,
+        }];
+        ctx.call_graph.insert(
+            "handlers.py::reset_password".to_string(),
+            vec!["db.py::update_user".to_string()],
+        );
+        ctx.threat_model = Some(ThreatModel {
+            threats: vec![threat(
+                "T1",
+                "account takeover",
+                Actor::RemoteUnauth,
+                "reset_password",
+            )],
+            ..Default::default()
+        });
+        let mut cfg = Step3Config::new("m");
+        cfg.threat_fallback_max_files = 2;
+        let result = add_threat_surface_fallback_chunks(&[], &ctx, &cfg);
+        // The authz path regex would pick `auth/policy.py`, but the entry
+        // point and its callee come first and fill the two-file cap.
+        assert_eq!(
+            result.chunks[0].files,
+            vec!["handlers.py".to_string(), "db.py".to_string()]
+        );
+    }
+
+    #[test]
+    fn controls_text_no_longer_routes_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ctx_with_root(dir.path());
+        ctx.all_files = vec!["lib/crypto_util.py".to_string()];
+        let mut t = threat("T1", "data tampering", Actor::LocalUser, "");
+        t.controls = "HMAC signature validation".to_string();
+        let crypto_chunk = Chunk {
+            specialist: Some("crypto".to_string()),
+            files: vec!["lib/crypto_util.py".to_string()],
+            ..chunk("spec-crypto-01", 1, None)
+        };
+        ctx.threat_model = Some(ThreatModel {
+            threats: vec![t],
+            ..Default::default()
+        });
+        let cfg = Step3Config::new("m");
+        assert!(
+            add_threat_surface_fallback_chunks(&[crypto_chunk], &ctx, &cfg)
+                .chunks
+                .is_empty()
+        );
     }
 }

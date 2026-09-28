@@ -336,13 +336,23 @@ pub fn capture_git_diff(root: &Path, files: &[String]) -> Option<String> {
     if safe.is_empty() {
         return Some(String::new());
     }
+    // Intent-to-add only paths that exist. `git add -N` on a deleted,
+    // tracked path stages the deletion, and a staged change is invisible to
+    // the worktree-to-index `git diff` below, so a deleted file used to
+    // vanish from the patch (and a moved file showed up only as a new one).
+    // Left unstaged, the deletion is exported, and Git pairs it with its new
+    // location as a rename.
+    let present: Vec<&String> = safe
+        .iter()
+        .filter(|path| std::fs::symlink_metadata(root.join(path)).is_ok())
+        .collect();
     let add = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
         .arg("add")
         .arg("-N")
         .arg("--")
-        .args(&safe)
+        .args(&present)
         .output()
         .ok()?;
     if !add.status.success() {
@@ -581,18 +591,20 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn snapshot_skips_an_existing_file_it_cannot_read_rather_than_calling_it_absent() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("secret.py");
-        std::fs::write(&path, "x\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let snap = snapshot_files(dir.path(), &["secret.py".to_string()]);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        // Not `Some(&None)`: that would mean "delete me on revert".
-        assert_eq!(snap.get("secret.py"), None);
+        // `drop_caches` is a regular file nobody can open for reading. The
+        // kernel checks a sysctl's mode bits itself, without the
+        // CAP_DAC_OVERRIDE bypass a chmod 000 file gets, so the read fails
+        // for root as well. Its directory stands in for the repository.
+        let root = Path::new("/proc/sys/vm");
+        let files = ["drop_caches".to_string(), "no-such-sysctl".to_string()];
+        let snap = snapshot_files(root, &files);
+        // Not `Some(&None)`: that would mean "delete me on revert". A
+        // genuinely absent sibling is the contrast that does get it.
+        assert_eq!(snap.get("drop_caches"), None);
+        assert_eq!(snap.get("no-such-sysctl"), Some(&None));
     }
 
     #[test]
@@ -912,49 +924,56 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn revert_restoring_content_propagates_a_write_error() {
-        use std::os::unix::fs::PermissionsExt;
+        // The file is replaced by a directory after the snapshot, so the
+        // restoring write fails (EISDIR) for every user. A read-only file
+        // would not stop root, which bypasses permission bits.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.py");
         std::fs::write(&path, "before\n").unwrap();
         let files = vec!["a.py".to_string()];
         let snap = snapshot_files(dir.path(), &files);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
         let err = revert(dir.path(), &files, &snap).unwrap_err();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(err.starts_with("cannot revert a.py:"), "unexpected: {err}");
     }
 
     #[cfg(unix)]
     #[test]
     fn revert_deleting_a_new_file_propagates_a_removal_error() {
-        use std::os::unix::fs::PermissionsExt;
+        // What appeared at the path is a non-empty directory, which
+        // `remove_file` refuses for every user. A read-only parent
+        // directory would not stop root, which bypasses permission bits.
         let dir = tempfile::tempdir().unwrap();
         let files = vec!["new.py".to_string()];
         let snap = snapshot_files(dir.path(), &files); // records None (didn't exist)
-        std::fs::write(dir.path().join("new.py"), "created by the agent\n").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::create_dir(dir.path().join("new.py")).unwrap();
+        std::fs::write(dir.path().join("new.py/inner"), "created by the agent\n").unwrap();
         let err = revert(dir.path(), &files, &snap).unwrap_err();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             err.starts_with("cannot remove new.py:"),
             "unexpected: {err}"
         );
+        assert!(dir.path().join("new.py/inner").exists());
     }
 
     #[cfg(unix)]
     #[test]
     fn revert_tier_2_untracked_removal_propagates_an_error() {
-        use std::os::unix::fs::PermissionsExt;
+        // The untracked path is a non-empty directory (so it is untracked
+        // content rather than invisible to `git ls-files`), which
+        // `remove_file` refuses for every user. A read-only worktree would
+        // not stop root, which bypasses permission bits.
         let dir = git_repo();
-        std::fs::write(dir.path().join("evil.py"), "malicious\n").unwrap();
+        std::fs::create_dir(dir.path().join("evil.py")).unwrap();
+        std::fs::write(dir.path().join("evil.py/payload"), "malicious\n").unwrap();
         let empty_snapshot = Snapshot::default();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
         let err = revert(dir.path(), &["evil.py".to_string()], &empty_snapshot).unwrap_err();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             err.starts_with("cannot remove evil.py:"),
             "unexpected: {err}"
         );
+        assert!(dir.path().join("evil.py/payload").exists());
     }
 
     #[test]
@@ -978,6 +997,24 @@ mod tests {
         std::fs::write(dir.path().join("new.py"), "print('new')\n").unwrap();
         let diff = capture_git_diff(dir.path(), &["new.py".to_string()]).unwrap();
         assert!(diff.contains("+print('new')"));
+    }
+
+    #[test]
+    fn capture_git_diff_exports_a_deleted_file_and_pairs_a_move_as_a_rename() {
+        let dir = git_repo();
+        std::fs::create_dir(dir.path().join("moved")).unwrap();
+        std::fs::rename(dir.path().join("app.py"), dir.path().join("moved/app.py")).unwrap();
+        let files = ["app.py".to_string(), "moved/app.py".to_string()];
+        let diff = capture_git_diff(dir.path(), &files).unwrap();
+        assert!(diff.contains("rename from app.py"), "{diff}");
+        assert!(diff.contains("rename to moved/app.py"), "{diff}");
+        // A deletion on its own is exported too, and `git add -N` with no
+        // existing path is harmless.
+        let dir = git_repo();
+        std::fs::remove_file(dir.path().join("app.py")).unwrap();
+        let diff = capture_git_diff(dir.path(), &["app.py".to_string()]).unwrap();
+        assert!(diff.contains("deleted file mode"), "{diff}");
+        assert!(diff.contains("-print('hi')"), "{diff}");
     }
 
     #[test]

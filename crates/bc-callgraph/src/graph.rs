@@ -530,6 +530,14 @@ struct ScoredPath {
     path: Vec<String>,
 }
 
+/// The semantic half of a `"<cwe>:<family>"` sink family key.
+fn sink_semantic(sink_family: &str) -> &str {
+    sink_family
+        .split_once(':')
+        .map(|(_, s)| s)
+        .unwrap_or(sink_family)
+}
+
 /// Apply confidence-weighted ranking (highest score first) and a global
 /// path-count cap: keep the top 5 paths per source function, then the
 /// top-scoring paths overall up to an adaptive global budget — but
@@ -537,6 +545,17 @@ struct ScoredPath {
 /// never drop the last surviving path for a
 /// [`PROTECTED_SEMANTIC_FAMILIES`] sink family even once the budget is
 /// otherwise exhausted.
+///
+/// Two upstream v1.3 changes: a **family floor** admits the best path of
+/// EVERY sink family before anything else competes for the budget (with
+/// protected families first when the floor alone exceeds it), so a
+/// high-scoring family can no longer crowd a whole vulnerability class out
+/// of the seed; and a path over budget whose `(source, sink_family)` pair
+/// is already represented is dropped. This port had kept those while the
+/// source was under the per-source limit, letting the budget leak by up
+/// to five paths per source. Upstream also admits every NEW pair past the
+/// budget; that is deliberately not ported, because on a large repository
+/// sources times families is unbounded and the cap would stop capping.
 fn filter_paths_by_budget(
     taint_paths: Vec<Vec<String>>,
     sources: &BTreeMap<String, Vec<CallSite>>,
@@ -603,6 +622,7 @@ fn filter_paths_by_budget(
         });
     }
 
+    // Stable, so equal scores keep their discovery order.
     scored_paths.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
@@ -620,8 +640,42 @@ fn filter_paths_by_budget(
     let mut kept_pairs: BTreeSet<(String, String)> = BTreeSet::new();
     let mut protected_family_kept: BTreeSet<String> = BTreeSet::new();
 
-    for sp in scored_paths {
+    // Family floor: the best-scoring path of each sink family, in score
+    // order, or protected families first if the floor alone overflows.
+    let mut floor: Vec<usize> = Vec::new();
+    let mut floor_families: BTreeSet<&str> = BTreeSet::new();
+    for (i, sp) in scored_paths.iter().enumerate() {
+        if floor_families.insert(sp.sink_family.as_str()) {
+            floor.push(i);
+        }
+    }
+    if floor.len() > global_budget {
+        floor.sort_by_key(|&i| {
+            !PROTECTED_SEMANTIC_FAMILIES.contains(&sink_semantic(&scored_paths[i].sink_family))
+        });
+        floor.truncate(global_budget);
+    }
+    let mut floor_kept = vec![false; scored_paths.len()];
+    for &i in &floor {
+        let sp = &scored_paths[i];
+        floor_kept[i] = true;
+        kept_paths.push(sp.path.clone());
+        *kept_by_source.entry(sp.src_fn.clone()).or_insert(0) += 1;
+        kept_pairs.insert((sp.src_fn.clone(), sp.sink_family.clone()));
+        let semantic = sink_semantic(&sp.sink_family);
+        if PROTECTED_SEMANTIC_FAMILIES.contains(&semantic) {
+            protected_family_kept.insert(semantic.to_string());
+        }
+    }
+
+    for (i, sp) in scored_paths.into_iter().enumerate() {
+        if floor_kept[i] {
+            continue;
+        }
         let pair = (sp.src_fn.clone(), sp.sink_family.clone());
+        if kept_paths.len() >= global_budget && kept_pairs.contains(&pair) {
+            continue;
+        }
         // The per-source cap limits how many times one source repeats
         // itself, not which vulnerability CLASSES it is allowed to
         // report. A path whose (source, sink-family) pair has not been
@@ -639,14 +693,12 @@ fn filter_paths_by_budget(
         {
             continue;
         }
-        if kept_paths.len() >= global_budget && !kept_pairs.contains(&pair) {
-            let sink_semantic = sp
-                .sink_family
-                .split_once(':')
-                .map(|(_, s)| s)
-                .unwrap_or(&sp.sink_family);
-            let protected = PROTECTED_SEMANTIC_FAMILIES.contains(&sink_semantic)
-                && !protected_family_kept.contains(sink_semantic);
+        let semantic = sink_semantic(&sp.sink_family).to_string();
+        if kept_paths.len() >= global_budget {
+            // Over budget, the pair is new (an existing one was dropped
+            // above): only a protected family's first path gets through.
+            let protected = PROTECTED_SEMANTIC_FAMILIES.contains(&semantic.as_str())
+                && !protected_family_kept.contains(&semantic);
             if !protected {
                 break;
             }
@@ -654,14 +706,9 @@ fn filter_paths_by_budget(
 
         kept_paths.push(sp.path);
         *kept_by_source.entry(sp.src_fn).or_insert(0) += 1;
-        let sink_semantic = sp
-            .sink_family
-            .split_once(':')
-            .map(|(_, s)| s.to_string())
-            .unwrap_or_else(|| sp.sink_family.clone());
         kept_pairs.insert(pair);
-        if PROTECTED_SEMANTIC_FAMILIES.contains(&sink_semantic.as_str()) {
-            protected_family_kept.insert(sink_semantic);
+        if PROTECTED_SEMANTIC_FAMILIES.contains(&semantic.as_str()) {
+            protected_family_kept.insert(semantic);
         }
     }
     kept_paths
@@ -2257,10 +2304,122 @@ mod tests {
         }
         let sinks = BTreeMap::from([("all".to_string(), all_sinks)]);
         assert_eq!(paths.len(), 305);
+        let protected_path = vec![
+            "app.py:60".to_string(),
+            format!("app.py:{}", last_fn_sinks[0].line),
+        ];
         let got = filter_paths_by_budget(paths, &sources, &sinks);
-        // 300 kept within the nominal budget, +1 protected-family
-        // override, then the loop breaks on the next candidate.
+        // The family floor admits the protected family's path up front,
+        // so it now sits inside the 300-path budget instead of riding an
+        // over-budget override as the 301st.
+        assert_eq!(got.len(), 300);
+        assert!(got.contains(&protected_path));
+    }
+
+    /// One path per `(source, sink)`: `n_sources` source functions, each
+    /// reaching `sinks_per_source` one-hop sinks in family `family-a`, plus
+    /// ONE three-hop (so lower-scoring) path from the first source to a sink
+    /// in `extra_family`.
+    fn floor_fixture(
+        n_sources: usize,
+        sinks_per_source: usize,
+        extra_family: &str,
+    ) -> (Vec<Vec<String>>, Vec<String>, Vec<Vec<String>>) {
+        let mut sources: BTreeMap<String, Vec<CallSite>> = BTreeMap::new();
+        let mut a_sinks = Vec::new();
+        for j in 0..sinks_per_source {
+            let mut k = call_site("app.py", 5000 + j, "shared", "sink", "x", "CWE-89");
+            k.semantic_family = "family-a".to_string();
+            a_sinks.push(k);
+        }
+        let mut b = call_site("lib.py", 9000, "other", "sink", "x", "CWE-22");
+        b.semantic_family = extra_family.to_string();
+        let mut paths = Vec::new();
+        for i in 0..n_sources {
+            let src = call_site("app.py", i + 1, &format!("fn{i}"), "source", "network", "");
+            sources
+                .entry(format!("fn{i}"))
+                .or_default()
+                .push(src.clone());
+            for k in &a_sinks {
+                paths.push(vec![
+                    format!("app.py:{}", src.line),
+                    format!("app.py:{}", k.line),
+                ]);
+            }
+        }
+        let b_path = vec![
+            "app.py:1".to_string(),
+            "mid.py:1".to_string(),
+            "mid.py:2".to_string(),
+            "lib.py:9000".to_string(),
+        ];
+        paths.push(b_path.clone());
+        let mut all_sinks = a_sinks;
+        all_sinks.push(b);
+        let sinks = BTreeMap::from([("s".to_string(), all_sinks)]);
+        let got = filter_paths_by_budget(paths.clone(), &sources, &sinks);
+        (got, b_path, paths)
+    }
+
+    #[test]
+    fn the_family_floor_keeps_a_low_scoring_family_the_budget_would_cut() {
+        // 490 high-scoring family-a paths plus one low-scoring path in a
+        // non-protected family. Budget: 300 (491 > 200 paths, fanout
+        // 70 * 8 = 560 < 600). Without the floor the budget fills with
+        // family-a and the loop breaks before ever reaching family-b.
+        let (got, b_path, _) = floor_fixture(70, 7, "family-b");
+        assert!(got.contains(&b_path));
+        // ...and the budget still holds: an over-budget path whose
+        // (source, family) pair is already represented is dropped rather
+        // than leaking in under the per-source limit.
+        assert_eq!(got.len(), 300);
+    }
+
+    #[test]
+    fn a_protected_family_the_floor_could_not_fit_still_gets_its_first_path() {
+        // 301 distinct sink-family keys (300 CWE variants of sql-exec plus
+        // one lower-scoring file-io path) against a budget of 300: the
+        // floor overflows, keeps the 300 best, and file-io is admitted by
+        // the over-budget protected-family override instead.
+        let mut sources: BTreeMap<String, Vec<CallSite>> = BTreeMap::new();
+        let src = call_site("app.py", 1, "handler", "source", "network", "");
+        sources.insert("handler".to_string(), vec![src]);
+        let mut sinks_v = Vec::new();
+        let mut paths = Vec::new();
+        for i in 0..300 {
+            let mut k = call_site(
+                "app.py",
+                100 + i,
+                "h",
+                "sink",
+                "x",
+                &format!("CWE-{}", 2000 + i),
+            );
+            k.semantic_family = "sql-exec".to_string();
+            paths.push(vec!["app.py:1".to_string(), format!("app.py:{}", k.line)]);
+            sinks_v.push(k);
+        }
+        let mut f = call_site("io.py", 7, "h", "sink", "x", "CWE-22");
+        f.semantic_family = "file-io".to_string();
+        let file_io_path = vec![
+            "app.py:1".to_string(),
+            "a.py:1".to_string(),
+            "b.py:1".to_string(),
+            "io.py:7".to_string(),
+        ];
+        paths.push(file_io_path.clone());
+        sinks_v.push(f);
+        let sinks = BTreeMap::from([("s".to_string(), sinks_v)]);
+        let got = filter_paths_by_budget(paths, &sources, &sinks);
         assert_eq!(got.len(), 301);
+        assert_eq!(got.last(), Some(&file_io_path));
+    }
+
+    #[test]
+    fn sink_semantic_strips_the_cwe_prefix_when_present() {
+        assert_eq!(sink_semantic("89:sql-exec"), "sql-exec");
+        assert_eq!(sink_semantic("unknown"), "unknown");
     }
 
     #[test]

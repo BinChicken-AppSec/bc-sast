@@ -53,7 +53,10 @@ fn rust_result(case: &Case) -> Value {
         Case::Merge { op, .. } => panic!("unknown op {op}"),
         Case::Expand { value, env } => {
             let map: HashMap<&str, &str> = env.iter().copied().collect();
-            bc_config::expand(value, &|name| map.get(name).map(|s| s.to_string()))
+            // No case interpolates a secret-named variable, so the
+            // policy refusal (tested in bc-config itself) never fires.
+            bc_config::expand(value, "", &|name| map.get(name).map(|s| s.to_string()))
+                .expect("no secret-named variables in these cases")
         }
     }
 }

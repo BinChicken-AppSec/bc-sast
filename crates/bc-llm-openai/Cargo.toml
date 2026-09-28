@@ -14,7 +14,11 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 regex = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+bc-llm-agentic = { path = "../bc-llm-agentic" }
+bc-pricing = { path = "../bc-pricing" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = { workspace = true }

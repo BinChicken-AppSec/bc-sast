@@ -15,6 +15,8 @@ bc-llm-client = { path = "../bc-llm-client" }
 bc-llm-agentic = { path = "../bc-llm-agentic" }
 bc-json-repair = { path = "../bc-json-repair" }
 bc-repo-analysis = { path = "../bc-repo-analysis" }
+bc-redact = { path = "../bc-redact" }
+tracing = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

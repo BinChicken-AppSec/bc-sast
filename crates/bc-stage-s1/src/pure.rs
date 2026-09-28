@@ -759,7 +759,7 @@ pub fn merge_seed_into_data(
     // points: `EntryPointKind::Framework` is what the S5 route gate and
     // the S6 `[GUARDED]` marker take as the guard truth, and a survey entry
     // for the same handler with `reachable_from_unauth: true` (the model
-    // guesses; it does not read middleware) neutralised the gate on every
+    // guesses; it does not read middleware) neutralized the gate on every
     // guarded route in a 2026-09-07 live run. Demoted to `other`; the
     // model's reachability claim stays visible on the entry itself.
     let mut demoted = 0usize;

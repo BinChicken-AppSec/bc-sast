@@ -21,13 +21,16 @@ bc-yaml = { path = "../bc-yaml" }
 bc-pathjail = { path = "../bc-pathjail" }
 regex = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
 tracing = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-cpp = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+# `test-util`: `start_paused` clocks for the shard-gate caps (15 s and
+# 240 s), so those tests run in virtual time. A feature of an existing
+# dependency, not a new crate.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
 # Tests only, and only to hold one number to one number: the confidence

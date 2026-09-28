@@ -108,6 +108,8 @@ fn scan_config() -> ScanConfig {
     let mut step8 = Step8Config::new("m");
     step8.retry_backoff_base = std::time::Duration::ZERO;
     ScanConfig {
+        autoexclude: Default::default(),
+        cancel: None,
         step0_enabled: false,
         step0: Step0Config::new(),
         step1,

@@ -37,11 +37,18 @@
 //! hides itself on the non-terminal stderr regardless, and it is the
 //! reason this module tests stderr itself rather than reusing
 //! `should_render`'s answer.
+//!
+//! Every formatted event is passed through [`bc_redact::redact`] before
+//! it reaches either destination ([`Redacting`]), as Python's
+//! `util/logs.py` `_RedactingFormatter` does for every record. A log file
+//! is exactly the kind of artifact that gets uploaded from CI and kept,
+//! and a `tracing` field can carry anything a stage had in hand (a URL
+//! with a token in it, a model reply quoting a secret from the repo).
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 
-use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
+use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriter, MakeWriterExt};
 use tracing_subscriber::EnvFilter;
 
 /// Maps `-v`'s repeat count to a fallback level directive, used only when
@@ -93,13 +100,69 @@ fn should_stream_to_stderr(has_log_file: bool, log_stderr: bool, stderr_is_termi
 ///
 /// Split out from [`install`] so all four combinations are testable
 /// without racing for the process-wide subscriber slot (see
-/// [`init_logging`]'s own doc comment).
+/// [`init_logging`]'s own doc comment). Whatever the destinations, the
+/// result redacts ([`Redacting`]).
 fn make_writer(file: Option<std::fs::File>, to_stderr: bool) -> Option<BoxMakeWriter> {
-    match (file, to_stderr) {
-        (None, false) => None,
-        (Some(file), false) => Some(BoxMakeWriter::new(file)),
-        (None, true) => Some(BoxMakeWriter::new(std::io::stderr)),
-        (Some(file), true) => Some(BoxMakeWriter::new(file.and(std::io::stderr))),
+    let raw = match (file, to_stderr) {
+        (None, false) => return None,
+        (Some(file), false) => BoxMakeWriter::new(file),
+        (None, true) => BoxMakeWriter::new(std::io::stderr),
+        (Some(file), true) => BoxMakeWriter::new(file.and(std::io::stderr)),
+    };
+    Some(BoxMakeWriter::new(Redacting(raw)))
+}
+
+/// A [`MakeWriter`] that redacts whatever the wrapped one would have
+/// received.
+///
+/// `tracing-subscriber`'s fmt layer formats a whole event into one buffer,
+/// asks for a fresh writer, writes the buffer and drops the writer. So a
+/// [`RedactingWriter`] sees exactly one event: it holds every byte back
+/// until it is flushed or dropped and then redacts the event as a whole.
+/// Redacting per `write` call instead could miss a secret split across
+/// two calls, and per line would miss a multi-line one (a PEM key).
+struct Redacting<M>(M);
+
+impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for Redacting<M> {
+    type Writer = RedactingWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RedactingWriter {
+            inner: self.0.make_writer(),
+            pending: Vec::new(),
+        }
+    }
+}
+
+struct RedactingWriter<W: Write> {
+    inner: W,
+    pending: Vec<u8>,
+}
+
+impl<W: Write> Write for RedactingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.pending.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    /// Redacts and forwards everything held back so far. A no-op write
+    /// when nothing is pending, so the flush-then-drop sequence does not
+    /// emit twice.
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.pending.is_empty() {
+            let redacted = bc_redact::redact(&String::from_utf8_lossy(&self.pending));
+            self.pending.clear();
+            self.inner.write_all(redacted.as_bytes())?;
+        }
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> Drop for RedactingWriter<W> {
+    /// Logging is best-effort (see [`init_logging`]), so a failed final
+    /// write is dropped rather than panicking inside a `Drop`.
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -206,6 +269,58 @@ mod tests {
         assert!(make_writer(Some(open()), false).is_some());
         assert!(make_writer(None, true).is_some());
         assert!(make_writer(Some(open()), true).is_some());
+    }
+
+    fn github_token() -> String {
+        format!("ghp_{}", "a".repeat(36))
+    }
+
+    #[test]
+    fn a_redacting_writer_masks_a_secret_split_across_writes_when_dropped() {
+        let make = Redacting(std::sync::Mutex::new(Vec::new()));
+        let token = github_token();
+        {
+            let mut writer = make.make_writer();
+            let (head, tail) = token.split_at(10);
+            write!(writer, "WARN clone failed for https://x:{head}").unwrap();
+            writeln!(writer, "{tail}@github.com/o/r").unwrap();
+            // Held back until the event is complete.
+            assert!(!writer.pending.is_empty());
+        }
+        let out = String::from_utf8(make.0.into_inner().unwrap()).unwrap();
+        assert!(!out.contains(&token), "{out}");
+        assert!(out.starts_with("WARN clone failed"), "{out}");
+    }
+
+    #[test]
+    fn flushing_emits_once_and_a_later_drop_adds_nothing() {
+        let make = Redacting(std::sync::Mutex::new(Vec::new()));
+        let mut writer = make.make_writer();
+        writer.write_all(b"plain line\n").unwrap();
+        writer.flush().unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        assert_eq!(make.0.into_inner().unwrap(), b"plain line\n");
+    }
+
+    /// End to end through a real `fmt` subscriber (scoped to this thread,
+    /// so the process-wide slot is untouched): a secret in a message field
+    /// never reaches the destination.
+    #[test]
+    fn events_logged_through_the_subscriber_are_redacted() {
+        let sink: &'static std::sync::Mutex<Vec<u8>> =
+            Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Redacting(move || sink.make_writer()))
+            .with_ansi(false)
+            .finish();
+        let token = github_token();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!("retrying with token {token}");
+        });
+        let out = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("retrying with token"), "{out}");
+        assert!(!out.contains(&token), "{out}");
     }
 
     #[rstest::rstest]

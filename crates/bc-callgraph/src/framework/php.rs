@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn a_namespaced_route_facade_is_still_recognised() {
+    fn a_namespaced_route_facade_is_still_recognized() {
         let (m, _, _) = php("<?php\n\\Illuminate\\Support\\Facades\\Route::get('/a', 'A@b');\n");
         assert_eq!(m[0].marker_name, "GET /a");
     }
@@ -737,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn symfony_route_with_an_unrecognised_named_argument_still_reads_the_path() {
+    fn symfony_route_with_an_unrecognized_named_argument_still_reads_the_path() {
         let (m, _, _) =
             php("<?php\n#[Route('/u', name: 'app_u', methods: ['GET'])]\nfunction u() { }\n");
         assert_eq!(marker_names(&m), vec!["GET /u".to_string()]);

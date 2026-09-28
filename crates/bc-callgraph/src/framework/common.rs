@@ -39,7 +39,7 @@ pub(super) struct Facts<'a> {
     pub guards: &'a mut Vec<AuthGuardFact>,
 }
 
-/// One recognised route registration.
+/// One recognized route registration.
 pub(super) struct Route<'a> {
     /// `GET`/`POST`/… or [`ANY_METHOD`].
     pub method: &'a str,
@@ -108,7 +108,7 @@ impl Facts<'_> {
     }
 }
 
-/// Concatenate a group/controller prefix with a route path, normalising
+/// Concatenate a group/controller prefix with a route path, normalizing
 /// the slashes either side may or may not carry. The root path stays
 /// `"/"` rather than collapsing to the empty string.
 pub(super) fn join_path(prefix: &str, path: &str) -> String {
@@ -157,8 +157,8 @@ pub(super) fn path_params(path: &str) -> Vec<String> {
     out
 }
 
-/// Guard spellings only these four ecosystems use, normalised the same
-/// way [`normalize_guard_name`] normalises the shared table. Kept
+/// Guard spellings only these four ecosystems use, normalized the same
+/// way [`normalize_guard_name`] normalizes the shared table. Kept
 /// separate from `super::AUTH_REQUIRED_NAMES` so that adding, say, the
 /// bare name `auth` for Laravel middleware cannot change what an
 /// Express or Django decorator means.

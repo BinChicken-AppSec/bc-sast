@@ -27,8 +27,13 @@ static FINDING_HEADING: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^### \d+\. \[").unwrap());
 
 fn render_validation_block(score: &ValidationScore) -> String {
+    // An inconclusive panel has no score, so it reads `n/a` rather than
+    // the `0.00` its `raw_score` placeholder would print.
+    let shown = score
+        .score()
+        .map_or_else(|| "n/a".to_string(), |s| format!("{s:.2}"));
     format!(
-        "\n#### Validation\n\n**Status:** {} (score: {:.2})\n\n{}\n",
+        "\n#### Validation\n\n**Status:** {} (score: {shown})\n\n{}\n",
         // `fix_status` is a closed enum rendered by the port itself, so
         // it needs no escaping; `justification` is S11 model prose and
         // was previously spliced in raw — the one un-sanitized free-text
@@ -36,7 +41,6 @@ fn render_validation_block(score: &ValidationScore) -> String {
         // document with a `## ` line the same way every other model
         // field could before `demote_md_headings` was applied to it.
         score.fix_status.as_str(),
-        score.raw_score,
         demote_md_headings(score.justification.trim()),
     )
 }
@@ -343,6 +347,17 @@ mod tests {
         assert!(out.contains("#### Validation"));
         assert!(out.contains("**Status:** Fixed (score: 0.92)"));
         assert!(out.contains("fix verified"));
+    }
+
+    #[test]
+    fn an_unverifiable_score_renders_as_not_applicable() {
+        let md = "### 1. [HIGH] Title\nbody\n";
+        let validations = vec![Some(score(bc_validation_scoring::FixVerdict::Unverifiable))];
+        let out = augment_markdown(md, &validations);
+        assert!(
+            out.contains("**Status:** UNVERIFIABLE (score: n/a)"),
+            "{out}"
+        );
     }
 
     #[test]

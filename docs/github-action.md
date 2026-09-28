@@ -41,9 +41,11 @@ script that could work around it.
 |---|---|---|---|
 | `gateway-base-url` | yes | n/a | `--gateway-base-url` |
 | `gateway-api-key` | no | `""` | The `BC_GATEWAY_API_KEY` environment variable, not a CLI argument. |
-| `model` | no | `gpt-4o` | `--model` |
+| `model` | no | `gpt-5.6-luna` | `--model`. The default is a reasoning model, reached over the OpenAI Responses API; a retired model id fails the step before any token is spent (see [`configuration.md`](configuration.md#model-lifecycle-gate)). The transport, effort and cache flags have no inputs of their own: set them through a `--config` profile's `llm:` and `models:` sections. |
 | `dialect` | no | `openai` | `--dialect` (`openai` or `anthropic`) |
 | `remediate` | no | `"false"` | `--remediate <value>`, always passed explicitly, which is why the flag accepts a value as well as being bare. |
+| `validate` | no | `"true"` | `--validate <value>`: run S11's validation panel after remediation. A fix it grades `Not Fixed` or `UNVERIFIABLE` is rolled back, so `"false"` keeps patches nobody independently checked. Only meaningful with `remediate: "true"`. |
+| `fail-on-remediation` | no | `"false"` | `--remediation-exit-code <value>`. See [Exit status](#exit-status) below. |
 | `remediation-delivery` | no | `patch` | `--remediation-delivery`: `patch` or `zip`. ZIP requires full-scan remediation and a consumer artifact upload step. Branch mode requires explicit CLI destination flags not exposed by this action. |
 | `app-id` | no | `""` | `--app-id`, the **CMDB** application id used for environmental-CVSS/OffensivePriority enrichment. (Not to be confused with a GitHub App's `app-id`, which the apply-fix workflow further down also uses.) |
 | `cmdb-csv` | no | `""` | `--cmdb-csv`, a path inside the workspace to a CMDB CSV export, used alongside `app-id`. |
@@ -58,6 +60,26 @@ is written only when the scan reaches a final report **and** a git sha is
 known, and `remediation.json` only when `remediate: "true"` actually ran
 remediation against a final report. With remediation off, no
 `remediation.json` is produced, not even an empty one.
+
+### Exit status
+
+The action's entrypoint is the scanner binary itself, so the step's
+result is the scanner's exit code; there is no wrapper that could
+translate it. A scan that succeeds exits `0` and a scan that errors
+exits non-zero, as always.
+
+With `remediate: "true"`, the scanner can also report how remediation
+went (docs/outputs.md, "Exit codes"): `1` when an S10 remediation call
+or an S11 validation failed, and `3` when validation passed nothing and
+failed at least one fix. That is opt-in here: `fail-on-remediation`
+defaults to `"false"`, which passes `--remediation-exit-code false`, so a
+workflow that already runs with `remediate: "true"` keeps exiting `0`
+whenever the scan succeeded and its later steps keep running. Set it to
+`"true"` to fail the job on a bad remediation outcome, and give every
+step that must still run afterwards (the SARIF upload, the
+artifact upload) `if: always()`, since a failed step skips the steps
+after it. To inspect the outcome without failing the job, read
+`security-scan/remediation.json`'s `totals.exit_code` instead.
 
 ### Full-scan ZIP delivery
 
@@ -118,7 +140,7 @@ A docker action has nowhere to run a shell step before its entrypoint
 out of reach here. Git's environment-variable config scope is what is
 left, and it is sufficient: `GIT_CONFIG_KEY_n`/`VALUE_n` land in git's
 `command` scope, which git treats as *protected* configuration and
-therefore honours for `safe.directory`. A repository's own `.git/config`
+therefore honors for `safe.directory`. A repository's own `.git/config`
 is not protected, so a scanned repository still cannot grant itself the
 exemption.
 

@@ -487,29 +487,52 @@ mod tests {
     #[test]
     fn an_unreadable_source_directory_fails_the_archive_instead_of_omitting_it() {
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let locked = root.path().join("locked");
-        fs::create_dir(&locked).unwrap();
-        fs::write(locked.join("app.txt"), b"fixed").unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        let outcome = inventory(root.path()).err();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(outcome.unwrap().contains("cannot enumerate source"));
+        // Only a permission bit can make a directory that `lstat` accepts
+        // unlistable, and root ignores it, so this runs only where
+        // permissions are enforced. The listing failure itself is covered
+        // for root too, by `a_source_directory_that_cannot_be_listed_fails_the_walk`.
+        if crate::test_support::permissions_enforced(
+            "an_unreadable_source_directory_fails_the_archive_instead_of_omitting_it",
+        ) {
+            let root = tempfile::tempdir().unwrap();
+            let locked = root.path().join("locked");
+            fs::create_dir(&locked).unwrap();
+            fs::write(locked.join("app.txt"), b"fixed").unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let outcome = inventory(root.path()).err();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(outcome.unwrap().contains("cannot enumerate source"));
+        }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn a_listable_but_unsearchable_source_directory_fails_the_archive() {
-        // Readable but not searchable: the entries are named but none can be
-        // inspected, so the archive would silently omit them.
-        use std::os::unix::fs::PermissionsExt;
+    fn a_source_directory_that_cannot_be_listed_fails_the_walk() {
+        // A path under a regular file cannot be listed (ENOTDIR) by any
+        // user, root included, and the walk reports it rather than
+        // treating the directory as empty.
         let root = tempfile::tempdir().unwrap();
-        let listable = root.path().join("listable");
-        fs::create_dir(&listable).unwrap();
-        fs::write(listable.join("app.txt"), b"fixed").unwrap();
-        fs::set_permissions(&listable, fs::Permissions::from_mode(0o444)).unwrap();
-        let outcome = inventory(root.path()).err();
-        fs::set_permissions(&listable, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(root.path().join("app.txt"), b"fixed").unwrap();
+        let mut found = Inventory::default();
+        let outcome = walk(&root.path().join("app.txt/src"), "src", 1, &mut found);
+        assert!(outcome.unwrap_err().contains("cannot enumerate source"));
+        assert!(found.files.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_source_entry_that_cannot_be_inspected_fails_the_archive() {
+        // The directory is named by its parent's listing but cannot be
+        // inspected, so the archive would silently omit it. In the field
+        // that is a parent with read but not search permission, which
+        // root ignores; here the entry's full path exceeds `PATH_MAX`,
+        // which fails for every user.
+        let base = tempfile::tempdir().unwrap();
+        let staged = base.path().join("staged");
+        let listed = staged.join("l".repeat(200));
+        fs::create_dir_all(&listed).unwrap();
+        fs::write(listed.join("app.txt"), b"fixed").unwrap();
+        let root = crate::test_support::bury_near_path_max(&staged);
+        let outcome = inventory(&root).err();
         assert!(outcome.unwrap().contains("cannot inspect source"));
     }
 
@@ -519,18 +542,46 @@ mod tests {
         // The inventory only stats; the copy and the archive both have to
         // open the file, and neither may quietly ship a truncated tree.
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let locked = root.path().join("app.txt");
-        fs::write(&locked, b"fixed").unwrap();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-        let out = tempfile::tempdir().unwrap();
-        let artifact = out.path().join("source.zip");
-        let snapshot = create_snapshot(root.path()).err();
-        let zipped = export_zip(root.path(), &artifact);
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(snapshot.unwrap().contains("cannot open source file"));
-        assert!(zipped.unwrap_err().contains("cannot write ZIP artifact"));
-        assert!(!artifact.exists());
+        // Only a permission bit can make a file inside the source tree
+        // unopenable, and root ignores it, so this runs only where
+        // permissions are enforced. The open failure is covered for root
+        // too, by `only_a_regular_readable_file_is_opened_for_the_archive`
+        // and `a_source_file_that_cannot_be_opened_fails_the_zip_writer`.
+        if crate::test_support::permissions_enforced(
+            "a_source_file_the_scanner_cannot_read_fails_both_the_snapshot_and_the_zip",
+        ) {
+            let root = tempfile::tempdir().unwrap();
+            let locked = root.path().join("app.txt");
+            fs::write(&locked, b"fixed").unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let out = tempfile::tempdir().unwrap();
+            let artifact = out.path().join("source.zip");
+            let snapshot = create_snapshot(root.path()).err();
+            let zipped = export_zip(root.path(), &artifact);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(snapshot.unwrap().contains("cannot open source file"));
+            assert!(zipped.unwrap_err().contains("cannot write ZIP artifact"));
+            assert!(!artifact.exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_source_file_that_cannot_be_opened_fails_the_zip_writer() {
+        // An inventoried file the archive writer cannot open fails the
+        // archive rather than leaving a hole in it.
+        let found = Inventory {
+            files: vec![(
+                "app.txt".into(),
+                PathBuf::from(crate::test_support::UNREADABLE_FILE),
+                0o100644,
+            )],
+            ..Default::default()
+        };
+        let mut archive = std::io::Cursor::new(Vec::new());
+        let err = write_zip(&mut archive, found).unwrap_err().to_string();
+        assert!(err.contains("cannot open source file"), "{err}");
+        assert!(err.contains("Permission denied"), "{err}");
     }
 
     #[test]
@@ -547,7 +598,7 @@ mod tests {
         );
 
         // The 30,000-entry and 256 MiB ceilings are driven from an
-        // already-spent inventory. Materialising either in full would
+        // already-spent inventory. Materializing either in full would
         // dominate the suite without exercising anything the running
         // totals do not already decide.
         let source = tempfile::tempdir().unwrap();
@@ -597,7 +648,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_a_regular_readable_file_is_opened_for_the_archive() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::symlink;
         let root = tempfile::tempdir().unwrap();
         assert!(open_regular(&root.path().join("missing"))
             .unwrap_err()
@@ -613,10 +664,14 @@ mod tests {
             open_regular(&root.path().join("alias")).unwrap_err(),
             "source changed to a non-regular file"
         );
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o000)).unwrap();
-        let unreadable = open_regular(&target);
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(unreadable.unwrap_err().contains("cannot open source file"));
+        // A regular file root cannot open either (a chmod 000 file would
+        // not stop root).
+        #[cfg(target_os = "linux")]
+        assert!(
+            open_regular(Path::new(crate::test_support::UNREADABLE_FILE))
+                .unwrap_err()
+                .contains("cannot open source file")
+        );
     }
 
     #[test]

@@ -231,19 +231,25 @@ mod tests {
         assert!(journal.is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_unreadable_existing_file_is_not_recorded_as_nonexistent() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("secret.py");
-        std::fs::write(&path, "x\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // `drop_caches` is a regular file nobody can open for reading. The
+        // kernel checks a sysctl's mode bits itself, without the
+        // CAP_DAC_OVERRIDE bypass a chmod 000 file gets, so the read fails
+        // for root as well. Its directory stands in for the repository.
+        // Only the read is attempted: nothing is ever written to it.
+        let root = Path::new("/proc/sys/vm");
         let journal = WriteJournal::new();
-        journal.record(dir.path(), "secret.py");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        journal.record(root, "drop_caches");
         // Recording it as `None` would make a later revert DELETE a file
         // whose content was never captured.
+        assert!(journal.is_empty());
+        let refused = journal.prepare_write(root, "drop_caches").unwrap_err();
+        assert!(
+            refused.starts_with("ERROR: cannot capture pre-write baseline:"),
+            "{refused}"
+        );
         assert!(journal.is_empty());
     }
 

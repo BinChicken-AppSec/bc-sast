@@ -5,7 +5,9 @@
 
 use std::sync::LazyLock;
 
-use bc_llm_client::{sanitize_error_body, ChatResponse, ContentBlock, LlmError, StopReason, Usage};
+use bc_llm_client::{
+    sanitize_error_body, ChatResponse, ContentBlock, LlmError, OpaqueDialect, StopReason, Usage,
+};
 use regex::Regex;
 use serde_json::Value;
 
@@ -57,12 +59,30 @@ pub fn parse_response_body(body: &Value) -> Result<ChatResponse, LlmError> {
                 name: block["name"].as_str().unwrap_or_default().to_string(),
                 input: block["input"].clone(),
             }),
-            // Other block types (e.g. `thinking`, `redacted_thinking`) carry
-            // no text/tool_use signal this seam exposes; skipped rather
-            // than erroring so a new Anthropic block type doesn't break
-            // parsing of the parts we do understand.
+            // Kept verbatim, signature included, so the next turn of a
+            // tool loop can replay them: with extended thinking on, the
+            // API rejects an assistant tool-use turn whose thinking was
+            // dropped or altered.
+            Some("thinking") | Some("redacted_thinking") => content.push(ContentBlock::Opaque {
+                dialect: OpaqueDialect::Anthropic,
+                payload: block.clone(),
+            }),
+            // Any other block type carries no signal this seam exposes;
+            // skipped rather than erroring so a new Anthropic block type
+            // doesn't break parsing of the parts we do understand.
             _ => {}
         }
+    }
+
+    // A model-level safety refusal arrives as an ordinary 200 with
+    // `stop_reason: "refusal"` (Claude 4 and later), possibly with some
+    // partial text before it. Surfaced as the same guardrail error the
+    // org classifier's canned refusal below is, so S6's cumulative-refusal
+    // gate counts both, rather than handing a stage a truncated answer.
+    if body["stop_reason"] == "refusal" {
+        return Err(LlmError::GuardrailBlocked {
+            message: "the model declined to answer (stop_reason=refusal)".to_string(),
+        });
     }
 
     let stop_reason = match body["stop_reason"].as_str() {
@@ -112,9 +132,27 @@ fn parse_usage(usage: &Value) -> Usage {
     Usage {
         input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
         output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
-        cache_creation_input_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+        cache_creation_input_tokens: cache_creation_tokens(usage),
         cache_read_input_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
     }
+}
+
+/// Tokens written to cache, both lifetimes together. The API reports the
+/// total as `cache_creation_input_tokens` and the per-lifetime split as
+/// `cache_creation: {ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}`;
+/// the total wins, and the split is summed only when a gateway forwarded
+/// the breakdown without it (otherwise a working cache would read as zero
+/// writes and be under-billed). Which lifetime applied is the request's
+/// own `CachePolicy::ttl`: every marker in one request carries the same
+/// one, so the split adds nothing a caller does not already know.
+pub fn cache_creation_tokens(usage: &Value) -> u64 {
+    usage["cache_creation_input_tokens"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            let split = &usage["cache_creation"];
+            split["ephemeral_5m_input_tokens"].as_u64().unwrap_or(0)
+                + split["ephemeral_1h_input_tokens"].as_u64().unwrap_or(0)
+        })
 }
 
 /// Classify a non-2xx HTTP response into an [`LlmError`]. Anthropic's own
@@ -147,7 +185,14 @@ fn parse_usage(usage: &Value) -> Usage {
 /// body ("rate_limit_exceeded", "Limit 30000, Used 29000") trips by
 /// accident, and a context overflow is a 400 in this dialect, never a
 /// 429. The two dialects keep the same shape here on purpose.
+///
+/// Authentication (401, or auth prose on a status no retry can help) and
+/// a proxy's 407 are settled first, by the classifier both dialects
+/// share: they halt the scan rather than failing one unit of work.
 pub fn classify_http_error(status: u16, body: &str, retry_after_secs: Option<u64>) -> LlmError {
+    if let Some(halting) = bc_llm_client::classify_auth_or_proxy_status(status, body) {
+        return halting;
+    }
     if status == 429 {
         return LlmError::RateLimited { retry_after_secs };
     }
@@ -193,7 +238,11 @@ pub fn classify_stream_error(error: &Value) -> LlmError {
         "overloaded_error" => 529,
         "rate_limit_error" => 429,
         "invalid_request_error" => 400,
-        "authentication_error" | "permission_error" => 403,
+        // 401, as the API sends it over HTTP, so a credential the
+        // gateway rejects mid-stream halts the scan exactly as it would
+        // have before the stream started.
+        "authentication_error" => 401,
+        "permission_error" => 403,
         "not_found_error" => 404,
         "request_too_large" => 413,
         // `api_error`, and anything the API adds later: transient, which
@@ -245,9 +294,15 @@ mod tests {
                 retry_after_secs: None
             }
         );
+        assert!(matches!(
+            of("authentication_error"),
+            LlmError::Authentication {
+                status: Some(401),
+                ..
+            }
+        ));
         for kind in [
             "invalid_request_error",
-            "authentication_error",
             "permission_error",
             "not_found_error",
             "request_too_large",
@@ -315,16 +370,64 @@ mod tests {
     }
 
     #[test]
-    fn unknown_block_types_are_skipped() {
+    fn thinking_blocks_are_kept_verbatim_and_unknown_blocks_skipped() {
+        let thinking = json!({"type": "thinking", "thinking": "reasoning...", "signature": "s=="});
+        let redacted = json!({"type": "redacted_thinking", "data": "cipher"});
         let body = json!({
             "content": [
-                {"type": "thinking", "thinking": "reasoning..."},
+                thinking,
+                redacted,
+                {"type": "server_tool_use_from_the_future"},
                 {"type": "text", "text": "answer"},
             ],
             "stop_reason": "end_turn",
         });
         let resp = parse_response_body(&body).unwrap();
         assert_eq!(resp.text(), "answer");
+        assert_eq!(
+            resp.content,
+            vec![
+                ContentBlock::Opaque {
+                    dialect: OpaqueDialect::Anthropic,
+                    payload: thinking,
+                },
+                ContentBlock::Opaque {
+                    dialect: OpaqueDialect::Anthropic,
+                    payload: redacted,
+                },
+                ContentBlock::text("answer"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refusal_stop_reason_is_a_guardrail_block() {
+        let body = json!({
+            "content": [{"type": "text", "text": "I started to"}],
+            "stop_reason": "refusal",
+        });
+        assert!(matches!(
+            parse_response_body(&body).unwrap_err(),
+            LlmError::GuardrailBlocked { .. }
+        ));
+    }
+
+    #[test]
+    fn cache_writes_fall_back_to_the_per_lifetime_split() {
+        assert_eq!(
+            cache_creation_tokens(&json!({
+                "cache_creation_input_tokens": 10,
+                "cache_creation": {"ephemeral_5m_input_tokens": 99},
+            })),
+            10
+        );
+        assert_eq!(
+            cache_creation_tokens(&json!({
+                "cache_creation": {"ephemeral_5m_input_tokens": 3, "ephemeral_1h_input_tokens": 4},
+            })),
+            7
+        );
+        assert_eq!(cache_creation_tokens(&json!({})), 0);
     }
 
     #[test]
@@ -612,7 +715,7 @@ mod tests {
         // not put the key into an `LlmError` that lands in a report.
         let raw =
             r#"{"error":{"message":"bad key: Authorization: Bearer sk-live-abcd1234efgh5678"}}"#;
-        let err = classify_http_error(401, raw, None);
+        let err = classify_http_error(400, raw, None);
         assert_eq!(
             err,
             LlmError::InvalidRequest {
@@ -622,6 +725,31 @@ mod tests {
         assert!(
             !err.to_string().contains("sk-live-abcd1234efgh5678"),
             "token survived: {err}"
+        );
+    }
+
+    /// A 401 used to be an `InvalidRequest`, so a wrong key failed every
+    /// chunk of a scan one at a time. It now halts the scan (VVAH-E001),
+    /// and a 407 from a proxy is VVAH-E002, both ahead of the 429 and
+    /// quota arms.
+    #[test]
+    fn classify_http_error_401_is_authentication_and_407_is_proxy() {
+        let raw = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+        let err = classify_http_error(401, raw, None);
+        assert_eq!(
+            err,
+            LlmError::Authentication {
+                status: Some(401),
+                message: raw.to_string(),
+            }
+        );
+        assert!(err.halts_scan());
+        assert_eq!(
+            classify_http_error(407, "Proxy Authentication Required", None),
+            LlmError::ProxyOrTls {
+                status: Some(407),
+                message: "Proxy Authentication Required".to_string(),
+            }
         );
     }
 

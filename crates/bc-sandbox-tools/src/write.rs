@@ -99,28 +99,35 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unwritable_directory_is_reported_as_an_io_error() {
-        use std::os::unix::fs::PermissionsExt;
+        // The target path is an existing directory, so the write fails
+        // (EISDIR) for every user. A read-only parent directory would not
+        // stop root, which bypasses permission bits.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::create_dir(dir.path().join("a.txt")).unwrap();
         let out = write_file(dir.path(), "a.txt", "x");
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             out.starts_with("ERROR: cannot write a.txt:"),
             "unexpected: {out}"
         );
+        assert!(dir.path().join("a.txt").is_dir());
     }
 
     #[cfg(unix)]
     #[test]
     fn an_uncreatable_parent_directory_is_reported_as_an_io_error() {
-        use std::os::unix::fs::PermissionsExt;
+        // The parent path is taken by a regular file, so creating the
+        // directory fails for every user. A read-only root directory would
+        // not stop root, which bypasses permission bits.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::write(dir.path().join("nested"), "not a directory").unwrap();
         let out = write_file(dir.path(), "nested/file.txt", "x");
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             out.starts_with("ERROR: cannot create directory for nested/file.txt:"),
             "unexpected: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("nested")).unwrap(),
+            "not a directory"
         );
     }
 }

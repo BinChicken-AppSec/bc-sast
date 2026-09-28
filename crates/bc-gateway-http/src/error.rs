@@ -3,9 +3,25 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum GatewayError {
-    Io { path: PathBuf, message: String },
-    InvalidCaCert { path: PathBuf, message: String },
-    Build { message: String },
+    Io {
+        path: PathBuf,
+        message: String,
+    },
+    InvalidCaCert {
+        path: PathBuf,
+        message: String,
+    },
+    /// The mTLS client certificate or key named by `path` is missing,
+    /// unreadable, on a network path, or not a usable certificate and
+    /// private key pair. Carries the path and the reason, never the
+    /// file's contents.
+    InvalidClientIdentity {
+        path: PathBuf,
+        message: String,
+    },
+    Build {
+        message: String,
+    },
 }
 
 impl fmt::Display for GatewayError {
@@ -17,6 +33,11 @@ impl fmt::Display for GatewayError {
             GatewayError::InvalidCaCert { path, message } => {
                 write!(f, "invalid ca_cert {}: {message}", path.display())
             }
+            GatewayError::InvalidClientIdentity { path, message } => write!(
+                f,
+                "invalid mTLS client certificate/key {}: {message}",
+                path.display()
+            ),
             GatewayError::Build { message } => write!(f, "failed to build HTTP client: {message}"),
         }
     }
@@ -40,6 +61,14 @@ mod tests {
             message: "bad pem".to_string(),
         };
         assert_eq!(invalid.to_string(), "invalid ca_cert /a: bad pem");
+        let identity = GatewayError::InvalidClientIdentity {
+            path: PathBuf::from("/c.pem"),
+            message: "no private key".to_string(),
+        };
+        assert_eq!(
+            identity.to_string(),
+            "invalid mTLS client certificate/key /c.pem: no private key"
+        );
         let build = GatewayError::Build {
             message: "boom".to_string(),
         };

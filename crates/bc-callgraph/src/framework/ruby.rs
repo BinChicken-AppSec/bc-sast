@@ -214,7 +214,7 @@ fn rails_binding(args: Node, src: &[u8]) -> Option<(String, String)> {
 }
 
 /// The verbs a `match ... via:` option names, or [`ANY_METHOD`] when it
-/// names none this walk recognises.
+/// names none this walk recognizes.
 fn via_methods(args: Node, src: &[u8]) -> Vec<String> {
     let mut names = Vec::new();
     if let Some(value) = pair_value(args, src, "via") {
@@ -601,7 +601,7 @@ mod tests {
             "{DRAW}  namespace model do\n    get '/ping', to: 'ping#show'\n  end\nend\n"
         ));
         // Unreadable segment: the block is still walked, as any
-        // unrecognised call's children are.
+        // unrecognized call's children are.
         assert_eq!(marker_names(&m), vec!["GET /ping".to_string()]);
     }
 
@@ -658,7 +658,7 @@ mod tests {
         let (m, _, _) = ruby(&format!(
             "{DRAW}  namespace do\n    get '/ping', to: 'ping#show'\n  end\nend\n"
         ));
-        // The block is still walked as an unrecognised call's children.
+        // The block is still walked as an unrecognized call's children.
         assert_eq!(marker_names(&m), vec!["GET /ping".to_string()]);
     }
 

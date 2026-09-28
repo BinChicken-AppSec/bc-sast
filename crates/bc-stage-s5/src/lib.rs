@@ -82,6 +82,26 @@ pub async fn run_prefilter(
     input: &Step5Input,
     config: &Step5Config,
 ) -> (DedupOutput, Option<String>) {
+    let (output, reason, _) = run_prefilter_with_diagnostics(client, input, config).await;
+    (output, reason)
+}
+
+/// Counters from one pre-filter run, for the report's Pipeline
+/// Diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PrefilterDiagnostics {
+    /// Findings kept without a `source_ref`/`sink_ref` pair because they
+    /// are point-of-occurrence (hardcoded credential, missing control,
+    /// information leak), which `require_evidence` would otherwise drop.
+    pub evidence_exempted: usize,
+}
+
+/// [`run_prefilter`], also returning the run's [`PrefilterDiagnostics`].
+pub async fn run_prefilter_with_diagnostics(
+    client: &dyn LlmClient,
+    input: &Step5Input,
+    config: &Step5Config,
+) -> (DedupOutput, Option<String>, PrefilterDiagnostics) {
     let valid_files: Option<HashSet<&str>> = if input.ctx.all_files.is_empty() {
         None
     } else {
@@ -114,6 +134,9 @@ pub async fn run_prefilter(
             .then(|| std::path::Path::new(input.ctx.repo_root.as_str())),
         &routes,
     );
+    let diagnostics = PrefilterDiagnostics {
+        evidence_exempted: gate_result.evidence_exempted,
+    };
     let mut dropped = gate_result.dropped;
     let mut survivors = gate_result.keep;
 
@@ -155,6 +178,7 @@ pub async fn run_prefilter(
             dropped,
         },
         degraded_reason,
+        diagnostics,
     )
 }
 
@@ -240,7 +264,7 @@ mod tests {
             // this stage runs now has a flow-identity tier
             // (`bc_dedup_core::collapse_trivial`), so two findings sharing
             // one literal `"src"`/`"sink"` pair would be the same flow and
-            // collapse — which is correct behaviour, and exactly what a
+            // collapse — which is correct behavior, and exactly what a
             // fixture must not accidentally trigger.
             source_ref: Some(format!("{file}:{line}")),
             sink_ref: Some(format!("{file}:{line}")),
@@ -281,6 +305,23 @@ mod tests {
         assert_eq!(out.findings.len(), 1);
         assert_eq!(out.dropped.len(), 2);
         assert!(reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_count_findings_kept_only_by_the_point_of_occurrence_exemption() {
+        let mut csrf = finding("views.py", 3, 0.9);
+        csrf.cwe = Some("CWE-352".to_string());
+        csrf.source_ref = None;
+        csrf.sink_ref = None;
+        let input = Step5Input {
+            findings: vec![csrf, finding("a.rs", 10, 0.9)],
+            ctx: ContextPackage::default(),
+        };
+        let (out, reason, diag) =
+            run_prefilter_with_diagnostics(&FailingClient, &input, &Step5Config::new("m")).await;
+        assert_eq!(out.findings.len(), 2);
+        assert!(reason.is_none());
+        assert_eq!(diag.evidence_exempted, 1);
     }
 
     /// The 2026-09-06 Juice Shop `routes/captcha.ts:11` false positive,

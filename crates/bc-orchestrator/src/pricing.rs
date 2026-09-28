@@ -48,7 +48,7 @@
 
 use std::collections::BTreeSet;
 
-use bc_llm_client::Usage;
+use bc_llm_client::{CacheTtl, Usage};
 use bc_pricing::{Call, CostTotal, Money, PriceTable, Pricer};
 
 /// How an unpriced call names a provider that could not be identified at
@@ -72,6 +72,15 @@ pub struct PricingConfig {
     /// gateway on terms the public table does not know. Empty by
     /// default.
     pub overrides: PriceTable,
+    /// The Anthropic prompt-cache lifetime every request of this run was
+    /// sent with (`llm.cache_ttl`). One-hour writes bill at twice the
+    /// base input rate rather than the five-minute write rate, and the
+    /// usage a provider reports does not say which lifetime a write had,
+    /// so the run's own setting is the only source. Every marker in one
+    /// request carries the same lifetime, so a run sent with `1h` wrote
+    /// all its cache tokens at it. `bc-cli` sets it only on the
+    /// Anthropic dialect: OpenAI has no lifetime to choose.
+    pub cache_ttl: CacheTtl,
 }
 
 impl PricingConfig {
@@ -80,6 +89,7 @@ impl PricingConfig {
         PricingConfig {
             provider: provider.map(Into::into),
             overrides: PriceTable::default(),
+            cache_ttl: CacheTtl::default(),
         }
     }
 
@@ -146,14 +156,16 @@ impl PhaseCost {
     /// Price one call and fold it in, returning the `provider/model`
     /// label when nothing about it could be priced, so the caller can
     /// name it in the report. A call the table knows returns `None`.
+    /// `cache_ttl` is [`PricingConfig::cache_ttl`].
     pub(crate) fn record_call(
         &mut self,
         pricer: &Pricer<'_>,
         provider: Option<&str>,
         model: &str,
         usage: Usage,
+        cache_ttl: CacheTtl,
     ) -> Option<String> {
-        let call = call_of(usage);
+        let call = call_of(usage, cache_ttl);
         if let Some(provider) = provider {
             if let Ok(cost) = pricer.price_call(provider, model, &call) {
                 self.priced.add_call(cost);
@@ -172,13 +184,20 @@ impl PhaseCost {
 /// cached tokens (`bc-llm-openai` subtracts `cached_tokens` from
 /// `prompt_tokens` explicitly), so this sum is the real prompt size and
 /// therefore the real tier selector.
-fn call_of(usage: Usage) -> Call {
-    Call::from_usage(
+///
+/// Under a one-hour `cache_ttl` every cache write is re-rated as a
+/// one-hour write (see [`PricingConfig::cache_ttl`] for why all of them).
+fn call_of(usage: Usage, cache_ttl: CacheTtl) -> Call {
+    let call = Call::from_usage(
         usage.input_tokens,
         usage.output_tokens,
         usage.cache_read_input_tokens,
         usage.cache_creation_input_tokens,
-    )
+    );
+    match cache_ttl {
+        CacheTtl::FiveMinutes => call,
+        CacheTtl::OneHour => call.long_ttl_cache_writes(usage.cache_creation_input_tokens),
+    }
 }
 
 /// Every token a call would have been billed for, at whatever rate. Used
@@ -337,7 +356,8 @@ mod tests {
                 &pricer,
                 config.provider.as_deref(),
                 "claude-sonnet-4-5",
-                million_of_everything()
+                million_of_everything(),
+                CacheTtl::FiveMinutes
             ),
             None
         );
@@ -357,6 +377,7 @@ mod tests {
             Some("openai"),
             "house-blend-9",
             million_of_everything(),
+            CacheTtl::FiveMinutes,
         );
         assert_eq!(label.as_deref(), Some("openai/house-blend-9"));
         assert_eq!(cost.total(), Money::ZERO);
@@ -369,7 +390,13 @@ mod tests {
     fn no_provider_at_all_prices_nothing_and_says_which_model() {
         let pricer = PricingConfig::default().pricer();
         let mut cost = PhaseCost::default();
-        let label = cost.record_call(&pricer, None, "claude-sonnet-4-5", million_of_everything());
+        let label = cost.record_call(
+            &pricer,
+            None,
+            "claude-sonnet-4-5",
+            million_of_everything(),
+            CacheTtl::FiveMinutes,
+        );
         assert_eq!(
             label.as_deref(),
             Some("unidentified-provider/claude-sonnet-4-5")
@@ -389,6 +416,7 @@ mod tests {
         let config = PricingConfig {
             provider: Some("acme-gateway".to_string()),
             overrides,
+            cache_ttl: CacheTtl::FiveMinutes,
         };
         let pricer = config.pricer();
         let mut cost = PhaseCost::default();
@@ -397,7 +425,8 @@ mod tests {
                 &pricer,
                 config.provider.as_deref(),
                 "claude-sonnet-4-5",
-                million_of_everything()
+                million_of_everything(),
+                CacheTtl::FiveMinutes
             ),
             None
         );
@@ -415,6 +444,7 @@ mod tests {
         let config = PricingConfig {
             provider: Some("gw".to_string()),
             overrides,
+            cache_ttl: CacheTtl::FiveMinutes,
         };
         let mut cost = PhaseCost::default();
         cost.record_call(
@@ -427,6 +457,7 @@ mod tests {
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 4_000,
             },
+            CacheTtl::FiveMinutes,
         );
         assert_eq!(cost.priced_calls(), 1);
         assert_eq!(cost.unpriced_calls(), 0);
@@ -451,8 +482,20 @@ mod tests {
             ..Usage::default()
         };
         let mut per_call = PhaseCost::default();
-        per_call.record_call(&pricer, Some("aihubmix"), "claude-opus-4-6", under);
-        per_call.record_call(&pricer, Some("aihubmix"), "claude-opus-4-6", over);
+        per_call.record_call(
+            &pricer,
+            Some("aihubmix"),
+            "claude-opus-4-6",
+            under,
+            CacheTtl::FiveMinutes,
+        );
+        per_call.record_call(
+            &pricer,
+            Some("aihubmix"),
+            "claude-opus-4-6",
+            over,
+            CacheTtl::FiveMinutes,
+        );
         assert_eq!(per_call.priced_calls(), 2);
 
         let mut as_aggregate = PhaseCost::default();
@@ -464,6 +507,7 @@ mod tests {
                 input_tokens: 400_001,
                 ..Usage::default()
             },
+            CacheTtl::FiveMinutes,
         );
 
         // 5.00 per million below the 200,000 threshold, 10.00 above it.
@@ -484,6 +528,7 @@ mod tests {
             Some("anthropic"),
             "claude-sonnet-4-5",
             million_of_everything(),
+            CacheTtl::FiveMinutes,
         );
         let mut b = PhaseCost::default();
         b.record_call(
@@ -491,12 +536,14 @@ mod tests {
             Some("anthropic"),
             "not-a-model",
             million_of_everything(),
+            CacheTtl::FiveMinutes,
         );
         b.record_call(
             &pricer,
             Some("anthropic"),
             "claude-sonnet-4-5",
             million_of_everything(),
+            CacheTtl::FiveMinutes,
         );
 
         let mut run = PhaseCost::default();
@@ -531,9 +578,79 @@ mod tests {
                 cache_creation_input_tokens: 1_000_000,
                 cache_read_input_tokens: 1_000_000,
             },
+            CacheTtl::FiveMinutes,
         );
         // 3.75 per million written, 0.30 per million read.
         assert_eq!(cost.total().to_usd_string(2), "4.05");
+    }
+
+    #[test]
+    fn a_one_hour_cache_write_bills_at_twice_the_input_rate() {
+        let config = PricingConfig::for_provider(Some("anthropic"));
+        let writes = Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 1_000_000,
+            cache_read_input_tokens: 0,
+        };
+        let mut five = PhaseCost::default();
+        five.record_call(
+            &config.pricer(),
+            Some("anthropic"),
+            "claude-sonnet-4-5",
+            writes,
+            CacheTtl::FiveMinutes,
+        );
+        let mut hour = PhaseCost::default();
+        hour.record_call(
+            &config.pricer(),
+            Some("anthropic"),
+            "claude-sonnet-4-5",
+            writes,
+            CacheTtl::OneHour,
+        );
+        // 3.00 per million input: 1.25x for five minutes, 2x for an hour.
+        assert_eq!(five.total().to_usd_string(2), "3.75");
+        assert_eq!(hour.total().to_usd_string(2), "6.00");
+        assert_eq!(config.cache_ttl, CacheTtl::FiveMinutes);
+    }
+
+    /// End to end through the scan's own metering client: a run priced
+    /// with `cache_ttl: 1h` costs its cache writes at the one-hour rate.
+    #[tokio::test]
+    async fn the_usage_tracking_client_prices_one_hour_writes_from_the_config() {
+        use bc_llm_client::{ChatRequest, ChatResponse, ContentBlock, LlmClient, LlmError};
+
+        struct Cached;
+        #[async_trait::async_trait]
+        impl LlmClient for Cached {
+            async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+                Ok(ChatResponse {
+                    content: vec![ContentBlock::text("ok")],
+                    stop_reason: bc_llm_client::StopReason::EndTurn,
+                    usage: Usage {
+                        input_tokens: 1_000_000,
+                        output_tokens: 0,
+                        cache_creation_input_tokens: 1_000_000,
+                        cache_read_input_tokens: 1_000_000,
+                    },
+                })
+            }
+        }
+
+        let cost_with = |ttl| async move {
+            let config = PricingConfig {
+                cache_ttl: ttl,
+                ..PricingConfig::for_provider(Some("anthropic"))
+            };
+            let tracker = crate::UsageTrackingClient::new(std::sync::Arc::new(Cached), &config);
+            let request = ChatRequest::new("claude-sonnet-4-5", Vec::new(), 16);
+            tracker.chat(&request).await.unwrap();
+            tracker.take().cost.total().to_usd_string(2)
+        };
+        // 3.00 input + 0.30 read, plus the write: 3.75 or 6.00.
+        assert_eq!(cost_with(CacheTtl::FiveMinutes).await, "7.05");
+        assert_eq!(cost_with(CacheTtl::OneHour).await, "9.30");
     }
 
     #[test]

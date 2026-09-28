@@ -17,11 +17,12 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
-use bc_llm_client::{ChatRequest, LlmClient, LlmError, Message};
-use bc_model::{Chunk, ContextPackage, Finding};
+use bc_llm_client::{ChatRequest, LlmClient, LlmError, Message, StopReason};
+use bc_model::{Chunk, Finding};
 use regex::Regex;
 
-use crate::prompts::{build_confirm_refute_prompt, build_prompt, SYSTEM};
+use crate::prompt_layout::DeepdivePrompt;
+use crate::prompts::SYSTEM;
 use crate::reanchor::reanchor_temporal;
 
 static CWE_RX: LazyLock<Regex> =
@@ -52,6 +53,11 @@ pub enum RunError {
     /// failed run and starting the next. See
     /// [`bc_llm_client::LlmError::QuotaExhausted`].
     QuotaExhausted(String),
+    /// A credential or proxy/TLS failure (VVAH-E001/E002, see
+    /// [`bc_llm_client::LlmError::halts_scan`]): like quota exhaustion,
+    /// every other chunk would fail the same way, so the caller stops the
+    /// stage. Carries the error's own coded message.
+    Halting(String),
     Other(String),
 }
 
@@ -60,6 +66,7 @@ impl std::fmt::Display for RunError {
         match self {
             RunError::GuardrailBlocked(m) => write!(f, "guardrail blocked: {m}"),
             RunError::QuotaExhausted(m) => write!(f, "provider quota exhausted: {m}"),
+            RunError::Halting(m) => write!(f, "{m}"),
             RunError::Other(m) => write!(f, "{m}"),
         }
     }
@@ -113,14 +120,12 @@ fn coerce_item(item: &mut serde_json::Value, chunk_id: &str) {
     );
 }
 
-fn extract_findings(data: &serde_json::Value) -> Vec<serde_json::Value> {
-    match data {
-        serde_json::Value::Object(map) => match map.get("findings") {
-            Some(serde_json::Value::Array(arr)) => arr.clone(),
-            _ => Vec::new(),
-        },
-        serde_json::Value::Array(arr) => arr.clone(),
-        _ => Vec::new(),
+fn map_llm_error(e: LlmError) -> RunError {
+    match e {
+        LlmError::GuardrailBlocked { message } => RunError::GuardrailBlocked(message),
+        LlmError::QuotaExhausted { message } => RunError::QuotaExhausted(message),
+        halting if halting.halts_scan() => RunError::Halting(halting.to_string()),
+        other => RunError::Other(other.to_string()),
     }
 }
 
@@ -132,6 +137,8 @@ pub struct Sampling {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub seed: Option<u64>,
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
     pub timeout: Option<std::time::Duration>,
 }
 
@@ -141,6 +148,8 @@ impl Sampling {
             temperature: config.temperature,
             top_p: config.top_p,
             seed: config.seed,
+            reasoning_effort: config.reasoning_effort,
+            openai_api: config.openai_api,
             timeout: config.timeout_secs.map(std::time::Duration::from_secs),
         }
     }
@@ -152,47 +161,47 @@ impl Sampling {
 /// individually dropping any item that isn't a JSON object or fails
 /// `Finding` validation, then capping to `max_findings_per_run` by
 /// descending confidence.
+///
+/// A reply that does not parse as a findings list (bad JSON, or valid
+/// JSON of the wrong shape, see [`crate::findings_shape`]) gets exactly
+/// one repair re-ask capped at [`crate::repair::REPAIR_MAX_TOKENS`]; if
+/// the repaired reply still fails, the run fails rather than counting as
+/// a clean zero-finding run. Repair and truncation counts accumulate into
+/// `diag`.
+///
+/// `prompt` is built once per chunk by the caller (see
+/// [`crate::prompt_layout::deepdive_prompt`], which also picks the
+/// confirm/refute prompt for a taint chunk when the operator opted in):
+/// every run of a chunk sends the same bytes.
 #[allow(clippy::too_many_arguments)]
 pub async fn single_run(
     client: &dyn LlmClient,
     chunk: &Chunk,
-    ctx: &ContextPackage,
-    code: &str,
+    prompt: &DeepdivePrompt,
     // The scan root, only so a temporal finding's own file can be
     // re-read and re-anchored — see `reanchor_temporal`.
     repo_root: &Path,
     model: &str,
     max_tokens: u32,
     max_findings_per_run: Option<usize>,
-    taint_prompt_mode: &str,
-    // Whether `code` came out of a function slicer rather than a
-    // whole-file load — decides which of the confirm/refute prompt's two
-    // "what the SOURCE CODE below contains" sentences is true. See
-    // `code_loading::load_chunk_code`.
-    sliced: bool,
     max_transient_retries: u32,
     retry_backoff_base: std::time::Duration,
     sampling: Sampling,
+    diag: &mut crate::DeepdiveDiagnostics,
 ) -> Result<Vec<Finding>, RunError> {
-    // Ported from `_single_run`'s dispatch: a chunk carrying an S0/S3
-    // static taint path (`path_funcs` non-empty) gets the confirm/refute
-    // prompt instead of the open-ended hunt, but only when the operator
-    // opted in via `taint_prompt_mode: "confirm_refute"` (Python's
-    // default is `"discover"`, i.e. always open-ended).
-    let user_prompt = if !chunk.path_funcs.is_empty() && taint_prompt_mode == "confirm_refute" {
-        build_confirm_refute_prompt(chunk, ctx, code, sliced)
-    } else {
-        build_prompt(chunk, ctx, code)
-    };
     let request = ChatRequest {
         model: model.to_string(),
         system: Some(SYSTEM.clone()),
-        messages: vec![Message::user_text(&user_prompt)],
+        messages: vec![Message::user_text(&prompt.user)],
+        cache_prefix: prompt.cache_prefix.clone(),
+        cache_key: Some(prompt.cache_key.clone()),
         tools: Vec::new(),
         max_tokens,
         temperature: sampling.temperature,
         top_p: sampling.top_p,
         seed: sampling.seed,
+        reasoning_effort: sampling.reasoning_effort,
+        openai_api: sampling.openai_api,
         thinking_budget: None,
         betas: Vec::new(),
         // Ported from `s4_deepdive.py:489`'s own `output_format="json"`,
@@ -205,26 +214,68 @@ pub async fn single_run(
         json_mode: true,
         timeout: sampling.timeout,
         stream: false,
+        ..ChatRequest::default()
     };
 
-    let response = bc_llm_agentic::chat_with_retry(
-        client,
-        &request,
-        max_transient_retries,
-        retry_backoff_base,
+    let response = bc_llm_agentic::salvage_truncated(
+        bc_llm_agentic::chat_with_retry(
+            client,
+            &request,
+            max_transient_retries,
+            retry_backoff_base,
+        )
+        .await,
+        "s4",
     )
-    .await
-    .map_err(|e| match e {
-        LlmError::GuardrailBlocked { message } => RunError::GuardrailBlocked(message),
-        LlmError::QuotaExhausted { message } => RunError::QuotaExhausted(message),
-        other => RunError::Other(other.to_string()),
-    })?;
+    .map_err(map_llm_error)?;
 
-    let data = bc_json_repair::extract_json(&response.text())
-        .map_err(|e| RunError::Other(e.to_string()))?;
+    let raw = response.text();
+    let truncated = response.stop_reason == StopReason::MaxTokens;
+    let items = match crate::repair::parse_findings(&raw, truncated) {
+        Ok(items) => items,
+        Err(failure) => {
+            // Bound outside the macro: tracing skips evaluating its
+            // arguments when no subscriber listens.
+            let (id, detail) = (&chunk.id, bc_redact::redact(&failure.to_string()));
+            tracing::warn!(
+                "[s4] {id}: reply failed to parse as a findings object, retrying repair: {detail}"
+            );
+            diag.json_repairs_attempted += 1;
+            let repair_request = ChatRequest {
+                messages: vec![Message::user_text(crate::repair::repair_json_prompt(
+                    &raw, &failure,
+                ))],
+                max_tokens: max_tokens.min(crate::repair::REPAIR_MAX_TOKENS),
+                // The repair re-ask carries the broken reply, not the
+                // chunk's context or code, so the prefix must not ride
+                // along (upstream's repair dispatch passes none either).
+                cache_prefix: None,
+                ..request
+            };
+            let repaired = bc_llm_agentic::salvage_truncated(
+                bc_llm_agentic::chat_with_retry(
+                    client,
+                    &repair_request,
+                    max_transient_retries,
+                    retry_backoff_base,
+                )
+                .await,
+                "s4",
+            )
+            .map_err(map_llm_error)?;
+            // A repaired reply that still carries no well-formed findings
+            // list fails the run, exactly like one that still fails to
+            // parse: the run/chunk handling records the coverage loss.
+            let repaired_truncated = repaired.stop_reason == StopReason::MaxTokens;
+            let items = crate::repair::parse_findings(&repaired.text(), repaired_truncated)
+                .map_err(|e| RunError::Other(format!("after one repair re-ask: {e}")))?;
+            diag.json_repairs_succeeded += 1;
+            items
+        }
+    };
 
     let mut findings: Vec<Finding> = Vec::new();
-    for mut item in extract_findings(&data) {
+    for mut item in items {
         if !item.is_object() {
             continue;
         }
@@ -243,6 +294,11 @@ pub async fn single_run(
 
     if let Some(cap) = max_findings_per_run {
         if findings.len() > cap {
+            // Everything past the cap is real model output being
+            // discarded: count it so the recall loss reaches the
+            // diagnostics instead of vanishing (upstream
+            // `s4_findings_truncated`).
+            diag.findings_truncated += findings.len() - cap;
             findings.sort_by(|a, b| {
                 b.confidence
                     .partial_cmp(&a.confidence)
@@ -262,6 +318,19 @@ mod tests {
     use bc_model::ChunkSize;
 
     use super::*;
+
+    #[test]
+    fn sampling_carries_the_role_effort_and_transport_pin() {
+        let mut config = crate::Step4Config::new("m");
+        config.reasoning_effort = Some(bc_llm_client::ReasoningEffort::Max);
+        config.openai_api = Some(bc_llm_client::OpenAiApi::Auto);
+        let sampling = Sampling::from_config(&config);
+        assert_eq!(
+            sampling.reasoning_effort,
+            Some(bc_llm_client::ReasoningEffort::Max)
+        );
+        assert_eq!(sampling.openai_api, Some(bc_llm_client::OpenAiApi::Auto));
+    }
 
     // Boxed trait object (not a generic type param) so every test's
     // closure shares one compiled `chat` body — see
@@ -316,6 +385,7 @@ mod tests {
             source_ref: String::new(),
             sink_ref: String::new(),
             sink_cwe: Vec::new(),
+            shard_id: String::new(),
         }
     }
 
@@ -333,23 +403,127 @@ mod tests {
         })
     }
 
+    fn prompt_for(c: &Chunk, taint_prompt_mode: &str) -> DeepdivePrompt {
+        crate::prompt_layout::deepdive_prompt(
+            c,
+            &bc_model::ContextPackage::default(),
+            "code",
+            taint_prompt_mode,
+            false,
+            "SHARED",
+        )
+    }
+
+    /// Answers with an unparseable reply first, then a valid one, keeping
+    /// every request it saw.
+    struct RepairCapture {
+        seen: std::sync::Mutex<Vec<ChatRequest>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for RepairCapture {
+        async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(request.clone());
+            let body = if seen.len() == 1 {
+                "not json at all".to_string()
+            } else {
+                serde_json::json!({"findings": []}).to_string()
+            };
+            Ok(ChatResponse {
+                content: vec![ContentBlock::Text(body)],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_request_carries_the_prompt_prefix_and_key_but_the_repair_drops_the_prefix() {
+        let client = RepairCapture {
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut c = chunk();
+        c.shard_id = "shard-03".to_string();
+        let prompt = prompt_for(&c, "discover");
+        let mut diag = crate::DeepdiveDiagnostics::default();
+        single_run(
+            &client,
+            &c,
+            &prompt,
+            std::path::Path::new("."),
+            "m",
+            1000,
+            None,
+            0,
+            std::time::Duration::ZERO,
+            Sampling::default(),
+            &mut diag,
+        )
+        .await
+        .unwrap();
+        let seen = client.seen.into_inner().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].cache_prefix, prompt.cache_prefix);
+        assert!(seen[0]
+            .cache_prefix
+            .as_deref()
+            .unwrap()
+            .starts_with("SHARED\n\nSOURCE CODE:\ncode"));
+        assert_eq!(seen[0].cache_key.as_deref(), Some("s4:shard-03"));
+        assert_eq!(
+            seen[0].messages[0].content,
+            vec![ContentBlock::Text(prompt.user)]
+        );
+        assert_eq!(seen[1].cache_prefix, None);
+        assert_eq!(seen[1].cache_key.as_deref(), Some("s4:shard-03"));
+        assert_eq!(diag.json_repairs_succeeded, 1);
+    }
+
     async fn run(client: &dyn LlmClient, cap: Option<usize>) -> Result<Vec<Finding>, RunError> {
         single_run(
             client,
             &chunk(),
-            &ContextPackage::default(),
-            "code",
+            &prompt_for(&chunk(), "discover"),
             std::path::Path::new("."),
             "m",
             1000,
             cap,
-            "discover",
-            false,
             0,
             std::time::Duration::ZERO,
             Sampling::default(),
+            &mut crate::DeepdiveDiagnostics::default(),
         )
         .await
+    }
+
+    /// Always stops at its output budget, echoing a findings document cut
+    /// off after its first complete finding.
+    struct AlwaysTruncatedClient;
+
+    #[async_trait]
+    impl LlmClient for AlwaysTruncatedClient {
+        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            let whole = serde_json::json!({"findings": [finding_json("injection", 0.9, "CWE-89")]})
+                .to_string();
+            // Drop the closing `]}` and start a second finding, as a reply
+            // cut off mid-document looks.
+            let cut = format!("{},{{\"file\": \"b.py\", \"li", &whole[..whole.len() - 2]);
+            Ok(ChatResponse {
+                content: vec![ContentBlock::Text(cut)],
+                stop_reason: StopReason::MaxTokens,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    /// A reply still truncated after the doubled-budget retry (VVAH-E005)
+    /// keeps the findings it did finish instead of failing the run.
+    #[tokio::test]
+    async fn a_reply_truncated_twice_keeps_its_completed_findings() {
+        let findings = run(&AlwaysTruncatedClient, None).await.unwrap();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].file, "a.py");
     }
 
     #[tokio::test]
@@ -394,26 +568,143 @@ mod tests {
         assert_eq!(findings.len(), 1);
     }
 
+    /// A non-array `findings` is no longer read as a clean zero-finding
+    /// run (upstream v1.4.0 `_findings_list`): it gets one repair, and a
+    /// repair that answers the same shape again fails the run.
     #[tokio::test]
-    async fn findings_key_present_but_not_an_array_yields_no_findings() {
+    async fn findings_key_present_but_not_an_array_fails_the_run_after_one_repair() {
         let body = serde_json::json!({"findings": "oops"}).to_string();
-        let client = ScriptedClient::text(body);
-        let findings = run(&client, None).await.unwrap();
-        assert!(findings.is_empty());
+        let client = SeqClient::new(vec![Ok(body.clone()), Ok(body)]);
+        let mut diag = crate::DeepdiveDiagnostics::default();
+        let err = run_with(&client, 64_000, None, &mut diag)
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, RunError::Other(m) if m.contains("after one repair re-ask")));
+        assert_eq!(diag.json_repairs_attempted, 1);
+        assert_eq!(diag.json_repairs_succeeded, 0);
     }
 
-    // `extract_json` (this function's only real caller) can only ever
-    // return a `Value::Object` or `Value::Array` — a balanced span
-    // starting with `{` or `[` cannot parse as anything else — so a
-    // scalar/null top-level value can't be reached through `single_run`
-    // itself. `extract_findings`'s own contract is "any `Value`", so its
-    // catch-all is still real, load-bearing defensive code; exercise it
-    // directly instead of faking an unreachable call path.
-    #[test]
-    fn extract_findings_of_a_non_object_non_array_value_is_empty() {
-        assert!(extract_findings(&serde_json::json!(42)).is_empty());
-        assert!(extract_findings(&serde_json::json!(null)).is_empty());
-        assert!(extract_findings(&serde_json::json!("a string")).is_empty());
+    /// Replays `replies` in order and records every request's
+    /// `max_tokens` and last-message text.
+    struct SeqClient {
+        replies: std::sync::Mutex<std::collections::VecDeque<Result<String, LlmError>>>,
+        seen: std::sync::Mutex<Vec<(u32, String)>>,
+    }
+
+    impl SeqClient {
+        fn new(replies: Vec<Result<String, LlmError>>) -> Self {
+            SeqClient {
+                replies: std::sync::Mutex::new(replies.into()),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<(u32, String)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for SeqClient {
+        async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            // The Debug form, so no never-taken non-text arm is needed:
+            // assertions match its escaped `\n` and `\"` spellings.
+            let prompt = format!("{:?}", request.messages[0].content);
+            self.seen.lock().unwrap().push((request.max_tokens, prompt));
+            let text = self.replies.lock().unwrap().pop_front().unwrap()?;
+            Ok(ChatResponse {
+                content: vec![ContentBlock::Text(text)],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    async fn run_with(
+        client: &dyn LlmClient,
+        max_tokens: u32,
+        cap: Option<usize>,
+        diag: &mut crate::DeepdiveDiagnostics,
+    ) -> Result<Vec<Finding>, RunError> {
+        single_run(
+            client,
+            &chunk(),
+            &prompt_for(&chunk(), "discover"),
+            std::path::Path::new("."),
+            "m",
+            max_tokens,
+            cap,
+            0,
+            std::time::Duration::ZERO,
+            Sampling::default(),
+            diag,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_wrong_shape_reply_is_repaired_with_the_shape_prompt_and_a_capped_budget() {
+        let good = serde_json::json!({"findings": [finding_json("injection", 0.9, "CWE-89")]});
+        let client = SeqClient::new(vec![
+            Ok(r#"{"findings": null}"#.to_string()),
+            Ok(good.to_string()),
+        ]);
+        let mut diag = crate::DeepdiveDiagnostics::default();
+        let findings = run_with(&client, 64_000, None, &mut diag).await.unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(diag.json_repairs_attempted, 1);
+        assert_eq!(diag.json_repairs_succeeded, 1);
+        let seen = client.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].0, 64_000);
+        assert_eq!(seen[1].0, crate::repair::REPAIR_MAX_TOKENS);
+        assert!(seen[1].1.contains("VALID JSON but the wrong shape"));
+        assert!(seen[1]
+            .1
+            .contains(r#"PREVIOUS RESPONSE:\n{\"findings\": null}\n"#));
+    }
+
+    #[tokio::test]
+    async fn a_syntax_error_is_repaired_with_the_syntax_prompt_and_a_smaller_budget_kept() {
+        let client = SeqClient::new(vec![
+            Ok("not json {{{".to_string()),
+            Ok(r#"{"findings": []}"#.to_string()),
+        ]);
+        let mut diag = crate::DeepdiveDiagnostics::default();
+        let findings = run_with(&client, 1000, None, &mut diag).await.unwrap();
+        assert!(findings.is_empty());
+        let seen = client.seen();
+        assert_eq!(seen[1].0, 1000, "min(max_tokens, 12000)");
+        assert!(seen[1].1.contains("Fix the JSON syntax only"));
+    }
+
+    #[tokio::test]
+    async fn a_guardrail_block_on_the_repair_is_reported_as_a_guardrail_block() {
+        let client = SeqClient::new(vec![
+            Ok("{}".to_string()),
+            Err(LlmError::GuardrailBlocked {
+                message: "no".into(),
+            }),
+        ]);
+        let mut diag = crate::DeepdiveDiagnostics::default();
+        let err = run_with(&client, 1000, None, &mut diag).await.unwrap_err();
+        assert_eq!(err, RunError::GuardrailBlocked("no".into()));
+        assert_eq!(diag.json_repairs_attempted, 1);
+    }
+
+    #[tokio::test]
+    async fn findings_past_the_cap_are_counted_as_truncated() {
+        let body = serde_json::json!({"findings": [
+            finding_json("injection", 0.9, ""),
+            finding_json("injection", 0.8, ""),
+            finding_json("injection", 0.7, ""),
+        ]});
+        let client = SeqClient::new(vec![Ok(body.to_string())]);
+        let mut diag = crate::DeepdiveDiagnostics::default();
+        let findings = run_with(&client, 1000, Some(1), &mut diag).await.unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(diag.findings_truncated, 2);
+        assert_eq!(diag.json_repairs_attempted, 0);
     }
 
     // `single_run`'s only caller already filters `!item.is_object()` before
@@ -578,17 +869,15 @@ mod tests {
         let findings = single_run(
             &client,
             &chunk(),
-            &ContextPackage::default(),
-            "code",
+            &prompt_for(&chunk(), "discover"),
             std::path::Path::new("."),
             "m",
             1000,
             None,
-            "discover",
-            false,
             4,
             std::time::Duration::ZERO,
             Sampling::default(),
+            &mut crate::DeepdiveDiagnostics::default(),
         )
         .await
         .unwrap();
@@ -628,6 +917,19 @@ mod tests {
             "provider quota exhausted: no credits"
         );
         assert_eq!(RunError::Other("y".to_string()).to_string(), "y");
+        assert_eq!(RunError::Halting("z".to_string()).to_string(), "z");
+    }
+
+    /// A rejected credential is not laundered into `Other` either: it
+    /// stops the stage the way quota exhaustion does, carrying its code.
+    #[tokio::test]
+    async fn an_authentication_error_is_reported_as_halting() {
+        let client = ScriptedClient::erroring(|| LlmError::Authentication {
+            status: Some(401),
+            message: "Incorrect API key provided".to_string(),
+        });
+        let err = run(&client, None).await.unwrap_err();
+        assert!(matches!(&err, RunError::Halting(m) if m.starts_with("[VVAH-E001]")));
     }
 
     // -- taint_prompt_mode dispatch ---------------------------------------
@@ -694,6 +996,7 @@ mod tests {
             json_mode: false,
             timeout: None,
             stream: false,
+            ..ChatRequest::default()
         };
         let response = client.chat(&request).await.unwrap();
         assert_eq!(response.text(), "echo:hello");
@@ -722,17 +1025,15 @@ mod tests {
         let findings = single_run(
             &client,
             &c,
-            &ContextPackage::default(),
-            "code",
+            &prompt_for(&c, "confirm_refute"),
             std::path::Path::new("."),
             "m",
             1000,
             None,
-            "confirm_refute",
-            false,
             0,
             std::time::Duration::ZERO,
             Sampling::default(),
+            &mut crate::DeepdiveDiagnostics::default(),
         )
         .await
         .unwrap();
@@ -749,17 +1050,15 @@ mod tests {
         let findings = single_run(
             &client,
             &c,
-            &ContextPackage::default(),
-            "code",
+            &prompt_for(&c, "discover"),
             std::path::Path::new("."),
             "m",
             1000,
             None,
-            "discover",
-            false,
             0,
             std::time::Duration::ZERO,
             Sampling::default(),
+            &mut crate::DeepdiveDiagnostics::default(),
         )
         .await
         .unwrap();
@@ -796,17 +1095,15 @@ mod tests {
         let findings = single_run(
             &client,
             &chunk(),
-            &ContextPackage::default(),
-            "code",
+            &prompt_for(&chunk(), "discover"),
             dir.path(),
             "m",
             1000,
             None,
-            "discover",
-            false,
             0,
             std::time::Duration::ZERO,
             Sampling::default(),
+            &mut crate::DeepdiveDiagnostics::default(),
         )
         .await
         .unwrap();
@@ -821,17 +1118,15 @@ mod tests {
         let findings = single_run(
             &client,
             &chunk(),
-            &ContextPackage::default(),
-            "code",
+            &prompt_for(&chunk(), "confirm_refute"),
             std::path::Path::new("."),
             "m",
             1000,
             None,
-            "confirm_refute",
-            false,
             0,
             std::time::Duration::ZERO,
             Sampling::default(),
+            &mut crate::DeepdiveDiagnostics::default(),
         )
         .await
         .unwrap();

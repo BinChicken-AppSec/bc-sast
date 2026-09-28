@@ -10,10 +10,10 @@ Standard library only, no third-party dependency, no build step:
 
     python3 docs/diagrams/gen/precision_chart.py
 
-Colours are chosen to carry enough contrast on both GitHub's light and
-dark backgrounds, because GitHub sanitises ``<style>`` out of an SVG it
+Colors are chosen to carry enough contrast on both GitHub's light and
+dark backgrounds, because GitHub sanitizes ``<style>`` out of an SVG it
 renders in Markdown, so ``prefers-color-scheme`` is not available. Value
-labels are drawn in their own series' colour rather than in grey for the
+labels are drawn in their own series' color rather than in gray for the
 same reason.
 
 The numbers are the measured results from docs/comparison.md. Precision
@@ -40,7 +40,7 @@ TOTAL_RS = 66.1
 
 PY_COLOR = "#c2762a"   # amber; ~3.6:1 on white, ~4.6:1 on #0d1117
 RS_COLOR = "#3d7ab8"   # blue;  ~4.6:1 on white, ~3.9:1 on #0d1117
-AXIS = "#8b929b"       # neutral grey, deliberately mid-tone
+AXIS = "#8b929b"       # neutral gray, deliberately mid-tone
 GRID = "#8b929b"
 
 W, H = 900, 470
@@ -93,13 +93,13 @@ def build():
 
     # Legend.
     lx = LEFT - 4
-    for label, colour in (("Python harness v1.2.0", PY_COLOR),
+    for label, color in (("Python harness v1.2.0", PY_COLOR),
                           ("Rust port", RS_COLOR)):
         add('<rect x="%d" y="60" width="11" height="11" rx="2" fill="%s"/>'
-            % (lx, colour))
+            % (lx, color))
         add('<text x="%d" y="70" font-family="%s" font-size="12" '
             'font-weight="600" fill="%s">%s</text>'
-            % (lx + 17, FONT, colour, esc(label)))
+            % (lx + 17, FONT, color, esc(label)))
         lx += 24 + len(label) * 6.6
 
     # Y gridlines and labels.
@@ -119,15 +119,15 @@ def build():
 
     for i, (label, py, rs) in enumerate(DATA):
         cx = LEFT + slot * i + slot / 2.0
-        for value, colour, offset in ((py, PY_COLOR, -bar_w - BAR_GAP / 2.0),
+        for value, color, offset in ((py, PY_COLOR, -bar_w - BAR_GAP / 2.0),
                                       (rs, RS_COLOR, BAR_GAP / 2.0)):
             x = cx + offset
             y = y_of(value)
             add('<rect x="%.1f" y="%.1f" width="%.1f" height="%.1f" rx="2" '
-                'fill="%s"/>' % (x, y, bar_w, baseline - y, colour))
+                'fill="%s"/>' % (x, y, bar_w, baseline - y, color))
             add('<text x="%.1f" y="%.1f" font-family="%s" font-size="10.5" '
                 'font-weight="600" fill="%s" text-anchor="middle">%s</text>'
-                % (x + bar_w / 2.0, y - 5, FONT, colour, fmt(value)))
+                % (x + bar_w / 2.0, y - 5, FONT, color, fmt(value)))
 
         add('<text x="%.1f" y="%d" font-family="%s" font-size="11" '
             'fill="%s" text-anchor="middle">%s</text>'

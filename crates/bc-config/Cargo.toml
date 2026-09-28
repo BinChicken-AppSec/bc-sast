@@ -14,6 +14,9 @@ regex = { workspace = true }
 bc-yaml = { path = "../bc-yaml" }
 bc-pathjail = { path = "../bc-pathjail" }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 rstest = { workspace = true }
 tempfile = { workspace = true }

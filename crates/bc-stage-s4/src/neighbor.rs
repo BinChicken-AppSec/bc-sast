@@ -19,7 +19,7 @@ use std::path::Path;
 use bc_model::{Chunk, ContextPackage};
 use bc_repo_analysis::{q_file, q_name};
 
-use crate::code_loading::read_file_lossy;
+use crate::code_loading::read_confined;
 use crate::redact_source::redact_source;
 
 fn reverse_call_graph(fwd: &BTreeMap<String, Vec<String>>) -> BTreeMap<String, Vec<String>> {
@@ -72,10 +72,18 @@ fn find_anchor(lines: &[&str], fn_name: &str, hint_line: i64) -> Option<usize> {
 /// after the anchor (plus 2 lines of lead-in), or `None` if the file can't
 /// be read or no anchor is found anywhere. The excerpt is redacted before
 /// it can ever reach a prompt, same as every other source excerpt in this
-/// crate.
-fn excerpt(path: &Path, fn_name: &str, hint_line: i64, n: usize) -> Option<(String, usize)> {
-    let text = read_file_lossy("", path).ok()?;
-    let redacted = redact_source(&text);
+/// crate. The read is confined to `repo_root` like every chunk-file read,
+/// so a call-graph path through a symlink cannot pull text from outside
+/// the repository into the prompt.
+fn excerpt(
+    repo_root: &Path,
+    rel: &str,
+    fn_name: &str,
+    hint_line: i64,
+    n: usize,
+) -> Option<(String, usize)> {
+    let text = read_confined(repo_root, rel).ok()?;
+    let redacted = redact_source(&text, rel);
     let lines: Vec<&str> = redacted.lines().collect();
     let anchor = find_anchor(&lines, fn_name, hint_line)?;
     let lo = anchor.saturating_sub(2);
@@ -109,7 +117,7 @@ pub fn neighbor_context(
     // AST def-start lines, keyed by full qnode — the PREFERRED anchor
     // source (`s4_deepdive.py:1288-1294`, consumed at `:1324` as
     // `qn_line.get(neighbor_qn) or def_line.get((nfile, nname), 0)`).
-    // This half was never ported, so every neighbour excerpt fell back to
+    // This half was never ported, so every neighbor excerpt fell back to
     // `call_graph_files`' bare-name def-site map, which cannot tell two
     // same-named functions in one file apart and is regex-derived rather
     // than parsed. With no anchor at all, `excerpt` re-scans the file for
@@ -174,7 +182,7 @@ pub fn neighbor_context(
             .copied()
             .filter(|&line| line != 0)
             .unwrap_or_else(|| *def_line.get(&(nfile.clone(), nname.clone())).unwrap_or(&0));
-        let Some((body, lo)) = excerpt(&repo_root.join(&nfile), &nname, nline, n_lines) else {
+        let Some((body, lo)) = excerpt(repo_root, &nfile, &nname, nline, n_lines) else {
             continue;
         };
         if !seen.insert((nfile.clone(), lo)) {
@@ -215,6 +223,7 @@ mod tests {
             source_ref: String::new(),
             sink_ref: String::new(),
             sink_cwe: Vec::new(),
+            shard_id: String::new(),
         }
     }
 

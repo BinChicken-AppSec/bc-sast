@@ -1,12 +1,12 @@
 # Crate map
 
-The workspace is `members = ["crates/*"]`: **47 crates**, one binary
+The workspace is `members = ["crates/*"]`: **51 crates**, one binary
 (`bc-cli`, which builds `bc-sast`). The dependency graph is a strict DAG:
 every crate depends only on crates in a lower or equal tier, never a higher
 one, and the tiers were derived from the actual `path = "../..."` edges
 rather than assigned by hand.
 
-Drawing 47 nodes is unreadable, so this map groups them into 16 boxes and
+Drawing 51 nodes is unreadable, so this map groups them into 17 boxes and
 draws the group-level edges. Edges implied by transitivity are omitted.
 `bc-stage-s4` really does depend on `bc-model`, but the arrow is not drawn
 because *Scan stages to Analysis engines to Foundation* already says so.
@@ -16,6 +16,7 @@ because *Scan stages to Analysis engines to Foundation* already says so.
 ```mermaid
 flowchart TD
     O["Product surface<br/>bc-cli, bc-interactive"]
+    Q["Target testing<br/>bc-target-tests, bc-api-spec"]
     N["Orchestrator<br/>bc-orchestrator"]
     I["Remediation and validation<br/>bc-stage-s10, bc-stage-s11, bc-diffcapture"]
     H["Scan stages S0 to S8<br/>bc-stage-s0 .. bc-stage-s8"]
@@ -29,10 +30,13 @@ flowchart TD
     J["Checkpoint state<br/>bc-checkpoint"]
     C["Scoring and taxonomy<br/>bc-cvss, bc-cwe, bc-validation-scoring"]
     B["Safety primitives<br/>bc-pathjail, bc-redact"]
-    A["Foundation<br/>bc-model, bc-pipeline-core, bc-json-repair,<br/>bc-yaml, bc-metrics, bc-dedup-core, bc-prompts,<br/>bc-pricing"]
+    A["Foundation<br/>bc-model, bc-pipeline-core, bc-json-repair,<br/>bc-yaml, bc-xml, bc-metrics, bc-dedup-core,<br/>bc-prompts, bc-pricing"]
     P["Parity harness, not shipped<br/>bc-parity-tests"]
 
     O --> N
+    O --> Q
+    Q --> A
+    Q --> B
     N --> H
     N --> I
     N --> K
@@ -66,7 +70,7 @@ flowchart TD
 
 | Group | Crates | What it is |
 |---|---|---|
-| **Foundation** | `bc-model`, `bc-pipeline-core`, `bc-json-repair`, `bc-yaml`, `bc-metrics`, `bc-dedup-core`, `bc-prompts`, `bc-pricing` | Pure logic, no workspace dependencies. `bc-model` is the cross-stage DTO spine with lenient LLM-JSON coercion; `bc-pipeline-core` encodes the "degrade rather than crash" policy as a type; `bc-prompts` holds shared prompt blocks as `&'static str` so prompt-cache prefixes stay byte-identical; `bc-pricing` prices one call's token counts against a vendored models.dev table and has no consumer in the pipeline yet. |
+| **Foundation** | `bc-model`, `bc-pipeline-core`, `bc-json-repair`, `bc-yaml`, `bc-xml`, `bc-metrics`, `bc-dedup-core`, `bc-prompts`, `bc-pricing` | Pure logic, no workspace dependencies. `bc-model` is the cross-stage DTO spine with lenient LLM-JSON coercion; `bc-pipeline-core` encodes the "degrade rather than crash" policy as a type; `bc-prompts` holds shared prompt blocks as `&'static str` so prompt-cache prefixes stay byte-identical; `bc-pricing` prices one call's token counts against a vendored models.dev table and has no consumer in the pipeline yet; `bc-xml` is the safe XML 1.0 reader and writer (no DTDs, bounded, namespace-aware, span-based minimal edits) for SOAP/WSDL, XSD and OData CSDL checks; today its one consumer is `bc-thirdparty`'s Checkmarx XML importer. |
 | **Safety primitives** | `bc-pathjail`, `bc-redact` | Path confinement and UNC/SMB rejection; stateless secret/PAN/SSN masking. Both pure, both leaves of the graph. |
 | **Scoring and taxonomy** | `bc-cvss`, `bc-cwe`, `bc-validation-scoring` | CVSS 3.1 calculator, CWE id-to-name lookup, and the deterministic S11 fix-validation engine. |
 | **Config and policy** | `bc-config`, `bc-compliance`, `bc-policy-gate` | YAML load with overlay and `${VAR}` expansion plus the config-trust gate; compliance rules steering prompts; the no-LLM remediation eligibility gate. |
@@ -80,6 +84,7 @@ flowchart TD
 | **Output and reporting** | `bc-report-md`, `bc-sarif`, `bc-csv`, `bc-github` | `bc-sarif` owns the stable `finding_id` fingerprint; `bc-csv` and `bc-github` both reuse it. |
 | **Third-party ingestion** | `bc-thirdparty`, `bc-thirdparty-api` | Vendor export parsing and live vendor API clients, both producing the same shape for re-verification through S6/S7. |
 | **Orchestrator** | `bc-orchestrator` | Sequences the stages. Knows stage *order*, degrade handling and early stop. Knows nothing about prompts or rendering. |
+| **Target testing** | `bc-target-tests`, `bc-api-spec` | Static target-repository test discovery, and the pure API specification rules (detection, placement, validation, emission, repair and relocation checks). Used only by `bc-cli`'s target-testing workflow. |
 | **Product surface** | `bc-cli`, `bc-interactive` | Flag parsing, concrete client wiring, disk writes; the arrow-key finding picker. |
 | **Parity harness** | `bc-parity-tests` | Not shipped. Runs the real Python `vvaharness` source and diffs its output against `bc-cvss` / `bc-redact` / `bc-config` / `bc-validation-scoring`. Excluded from the coverage gate. |
 
@@ -105,10 +110,11 @@ These are the places where the shape is not what a reader would guess.
   stage. That is true only in `llm` spec-detection mode, which makes exactly
   one call to choose which source/sink specs to match; the walk itself is
   LLM-free. See [`seed-plane.md`](seed-plane.md).
-- **`bc-cli` is the widest node** (33 workspace dependencies) but is *not* a
+- **`bc-cli` is the widest node** (39 workspace dependencies) but is *not* a
   superset of the orchestrator's: `bc-enrich`, `bc-metrics`, `bc-cwe`,
   `bc-cvss`, `bc-yaml` and `bc-llm-agentic` are orchestrator-owned and the
-  CLI never touches them.
+  CLI never touches them directly (`bc-api-spec` reads YAML through
+  `bc-yaml` on its behalf).
 
 Same-tier edges inside a group, not drawn above: the three dialect crates
 depend on `bc-llm-client`; `bc-stage-s1` on `bc-stage-s0`; `bc-stage-s5` on

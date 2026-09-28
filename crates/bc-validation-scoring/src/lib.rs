@@ -20,6 +20,10 @@
 
 use std::collections::BTreeSet;
 
+mod vocab;
+
+pub use vocab::{not_remediated, verdict_state, CaseState, Decision, Rollup, ValidationCounts};
+
 /// The 4 gates a fix is scored against — the Python original's 5th gate
 /// (`branch_targeting`) was already dropped upstream of this port ("Four
 /// renormalized gates (branch_targeting dropped...)",
@@ -177,6 +181,18 @@ impl SynthesisConfidence {
             SynthesisConfidence::Flagged => "FLAGGED",
         }
     }
+
+    /// The inverse of [`Self::as_str`], for reading a persisted score back
+    /// (an S11 `--resume` checkpoint). Exact match only.
+    pub fn parse(s: &str) -> Option<SynthesisConfidence> {
+        [
+            SynthesisConfidence::High,
+            SynthesisConfidence::Split,
+            SynthesisConfidence::Flagged,
+        ]
+        .into_iter()
+        .find(|c| c.as_str() == s)
+    }
 }
 
 /// A file/line/snippet reference pinning a gate verdict to source
@@ -229,6 +245,19 @@ impl FixVerdict {
             FixVerdict::NotFixed => "Not Fixed",
             FixVerdict::Unverifiable => "UNVERIFIABLE",
         }
+    }
+
+    /// The inverse of [`Self::as_str`], for reading a persisted score back
+    /// (an S11 `--resume` checkpoint). Exact match only.
+    pub fn parse(s: &str) -> Option<FixVerdict> {
+        [
+            FixVerdict::Fixed,
+            FixVerdict::PartiallyFixed,
+            FixVerdict::NotFixed,
+            FixVerdict::Unverifiable,
+        ]
+        .into_iter()
+        .find(|v| v.as_str() == s)
     }
 }
 
@@ -506,6 +535,26 @@ fn anchors_str(gates: &[GateResult]) -> String {
     anchors.join("; ")
 }
 
+/// Longest the joined "files needing fixes" list may be in a
+/// justification. Each file is model-written evidence (already capped per
+/// entry by `bc-stage-s11`), and the list is repeated into
+/// `remediation.json`, the report and SARIF, so its total is bounded too.
+pub const MAX_FILES_NEEDING_FIXES_CHARS: usize = 4096;
+
+/// Appended where a justification field was cut short.
+pub const TRUNCATION_MARKER: &str = "...[truncated]";
+
+/// `files` joined with `, `, capped at [`MAX_FILES_NEEDING_FIXES_CHARS`]
+/// characters plus [`TRUNCATION_MARKER`].
+fn joined_files(files: &[String]) -> String {
+    let joined = files.join(", ");
+    if joined.chars().count() <= MAX_FILES_NEEDING_FIXES_CHARS {
+        return joined;
+    }
+    let kept: String = joined.chars().take(MAX_FILES_NEEDING_FIXES_CHARS).collect();
+    format!("{kept}{TRUNCATION_MARKER}")
+}
+
 fn files_needing_fixes(gates: &[GateResult]) -> Vec<String> {
     let mut files: BTreeSet<String> = BTreeSet::new();
     for g in gates {
@@ -567,7 +616,7 @@ fn partial_text(raw_score: f64, gates: &[GateResult]) -> String {
         if files.is_empty() {
             "N/A".to_string()
         } else {
-            files.join(", ")
+            joined_files(&files)
         }
     )
 }
@@ -586,7 +635,7 @@ fn not_fixed_text(raw_score: f64, gates: &[GateResult]) -> String {
         if files.is_empty() {
             "affected files".to_string()
         } else {
-            files.join(", ")
+            joined_files(&files)
         },
         confidence(raw_score),
         actions.join("; ")

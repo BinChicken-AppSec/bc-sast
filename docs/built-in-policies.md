@@ -35,6 +35,18 @@ pinned container images, plus one lockfile-respecting install command per
 ecosystem. All other shipped profiles remain generation-only or
 discovery-only and install nothing. A package with no lockfile the build
 can install from is refused rather than run without dependencies.
+The `integration`, `comprehensive`, `e2e`, `generate` and
+`discovered-offline` profiles also carry the API specification step's
+allowances in an `api_spec` object: the specification size cap, repair
+rounds, the run-wide cap on generator sessions (`max_documents`), the
+file-name patterns of documentation and framework configuration a
+relocation may update, and a `formats` object naming each API
+description standard the profile allows with its own `max_documents`
+(OpenAPI 4, GraphQL 2, AsyncAPI 2, OpenRPC 2, Protocol Buffers 32, RAML 8,
+API Blueprint 8, WSDL 4 and OData CSDL 4). A standard absent from
+`formats` is never assessed.
+See
+[API specification](target-testing.md#api-specifications).
 Omitting `--target-tests` leaves this additional testing workflow disabled.
 The flag accepts a name, not a JSON file path. A bare `--target-tests`
 selects `comprehensive`; `generate` remains a compatible comprehensive

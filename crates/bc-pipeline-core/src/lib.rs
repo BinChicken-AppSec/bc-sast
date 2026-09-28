@@ -19,9 +19,12 @@
 
 use std::fmt;
 
+mod cancel;
+pub use cancel::{canceled, CancelToken, CancelTokenRef, USER_CANCEL_REASON};
+
 /// The result of running one pipeline stage: either it completed fully, or
 /// it degraded to a safe fallback value for a documented, non-fatal reason
-/// (mirroring the Python original's S1/S3/S8 behaviour — a malformed LLM
+/// (mirroring the Python original's S1/S3/S8 behavior — a malformed LLM
 /// response degrades that stage's output rather than aborting the run).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StageOutcome<T> {
@@ -100,7 +103,7 @@ impl fmt::Display for StageError {
 impl std::error::Error for StageError {}
 
 /// The contract every S1-S9 stage crate implements. `NAME` is used for
-/// checkpoint keys and progress/log labelling.
+/// checkpoint keys and progress/log labeling.
 pub trait PipelineStage {
     type Input;
     type Output;
@@ -185,20 +188,162 @@ pub fn budget_allows(gate: Option<&BudgetGateRef>) -> bool {
     !gate.is_some_and(|g| g.should_stop())
 }
 
-/// Progress/observability events emitted while a scan runs — consumed by
-/// `bc-cli`'s progress bar (task #75) or any other external observer
-/// (structured logging, a UI). Not a port — the Python original has no
-/// equivalent event stream. Deliberately plain data, not tied to any
-/// particular renderer.
+/// How one pipeline stage ended, as the run manifest and the text
+/// progress lines report it. Ported from the outcome strings the Python
+/// original's `util/stage_telemetry.py` records (`completed`,
+/// `completed_with_errors`, `cached`, `skipped`, `disabled`, `error`).
+///
+/// Named `StageStatus` rather than Python's `outcome` because
+/// [`StageOutcome`] already names the Ok/Degraded value a stage returns;
+/// the two are related (a degraded value closes its stage as
+/// [`StageStatus::CompletedWithErrors`]) but not the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StageStatus {
+    /// The stage ran and produced a clean result.
+    Completed,
+    /// The stage ran to the end but degraded, lost work (a failed chunk,
+    /// a budget stop) or recorded errors along the way.
+    CompletedWithErrors,
+    /// The stage was not run: its result was restored from a `--resume`
+    /// checkpoint.
+    Cached,
+    /// The stage was switched off by configuration (`step0.enabled`,
+    /// `step2.enabled: false`, `--no-threat-model`).
+    Skipped,
+    /// The stage could not, or was not asked to, run this time:
+    /// remediation not requested or refused by its preflight, validation
+    /// off.
+    Disabled,
+    /// The stage failed outright.
+    Error,
+}
+
+impl StageStatus {
+    /// The wire spelling, identical to the Python original's outcome
+    /// strings so a manifest consumer can read either tool's output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StageStatus::Completed => "completed",
+            StageStatus::CompletedWithErrors => "completed_with_errors",
+            StageStatus::Cached => "cached",
+            StageStatus::Skipped => "skipped",
+            StageStatus::Disabled => "disabled",
+            StageStatus::Error => "error",
+        }
+    }
+
+    /// The status a stage that actually ran closes with: degraded work is
+    /// `CompletedWithErrors`, never a plain `Completed` that would make a
+    /// fallback result look like a clean one.
+    pub fn from_degraded(degraded: bool) -> Self {
+        if degraded {
+            StageStatus::CompletedWithErrors
+        } else {
+            StageStatus::Completed
+        }
+    }
+
+    /// Whether a stage with this status ran a timed body. Cached, skipped
+    /// and disabled stages did no work, so their duration is reported as
+    /// unknown (`null` in the manifest) rather than as a misleading
+    /// near-zero figure, matching Python's `STAGES.mark`.
+    pub fn is_timed(self) -> bool {
+        matches!(
+            self,
+            StageStatus::Completed | StageStatus::CompletedWithErrors | StageStatus::Error
+        )
+    }
+}
+
+/// Every pipeline stage id in run order, `s0` through `s11`. The Python
+/// original's `_STAGE_ORDER` stops at `s10`, so its stage-only lines
+/// number S11 as `?/11`; this list includes S11 on purpose.
+pub const STAGE_IDS: [&str; 12] = [
+    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
+];
+
+/// The short stage id (`"s4"`) of a stage's event name (`"s4-deepdive"`,
+/// or a bare `"s9"`): everything before the first `-`.
+pub fn stage_id(name: &str) -> &str {
+    name.split_once('-').map_or(name, |(id, _)| id)
+}
+
+/// A human label for a stage id, used by the text progress lines and the
+/// run manifest. `None` for an id outside [`STAGE_IDS`].
+pub fn stage_label(id: &str) -> Option<&'static str> {
+    Some(match id {
+        "s0" => "static seed",
+        "s1" => "pre-process",
+        "s2" => "threat model",
+        "s3" => "decompose",
+        "s4" => "deep-dive",
+        "s5" => "pre-filter",
+        "s6" => "verify",
+        "s7" => "dedup",
+        "s8" => "chain",
+        "s9" => "report",
+        "s10" => "remediate",
+        "s11" => "validate",
+        _ => return None,
+    })
+}
+
+/// A stage's 1-based position in [`STAGE_IDS`], or `None` for an unknown
+/// id.
+pub fn stage_number(id: &str) -> Option<usize> {
+    STAGE_IDS.iter().position(|s| *s == id).map(|i| i + 1)
+}
+
+/// One stage's model spend, as [`ScanEvent::UsageUpdate`] carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct StageUsage {
+    /// Billable input: fresh input plus cache writes, the report's
+    /// headline prompt figure.
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub calls: i64,
+    /// US dollars for the calls that could be priced; `None` when none
+    /// could. A lower bound whenever `unpriced_tokens` is non-zero.
+    pub cost_usd: Option<f64>,
+    pub unpriced_tokens: i64,
+    /// Replies the transport gave up on as truncated (VVAH-E005).
+    pub truncated_replies: u64,
+}
+
+/// Progress/observability events emitted while a scan runs, consumed by
+/// `bc-cli`'s progress bar (task #75), its text progress lines, its run
+/// manifest, or any other external observer. Deliberately plain data,
+/// not tied to any particular renderer. The Python original has no event
+/// stream as such; the start/finish pair carries what its
+/// `ScanProgress.stage_started`/`stage_done` and `STAGES` recorder see.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScanEvent {
     /// A pipeline stage began running (the live path — a checkpoint-
     /// resumed stage still emits this, immediately followed by
-    /// `StageFinished`, so a progress bar sees a consistent start/finish
-    /// pair either way rather than a stage silently never starting).
+    /// `StageFinished` with [`StageStatus::Cached`], so a progress bar
+    /// sees a consistent start/finish pair either way rather than a stage
+    /// silently never starting). A stage that never starts at all
+    /// (skipped or disabled) emits `StageFinished` alone.
     StageStarted { stage: &'static str },
-    /// A pipeline stage finished (live or resumed-from-checkpoint).
-    StageFinished { stage: &'static str, degraded: bool },
+    /// A pipeline stage finished (live, resumed, skipped or disabled).
+    StageFinished {
+        stage: &'static str,
+        status: StageStatus,
+        /// Wall-clock time the stage body ran for; `None` for a status
+        /// that ran no timed body (see [`StageStatus::is_timed`]).
+        duration: Option<std::time::Duration>,
+        /// Stable `name=value` counters describing what the stage did
+        /// (`findings`, `kept`/`dropped`, S10's `attempted`/`fixed`/
+        /// `not_fixed`/`failed`, S11's `validated`/`passed`/`failed`),
+        /// in display order. Plain pairs rather than a typed struct per
+        /// stage so a renderer needs no knowledge of any one stage.
+        counts: Vec<(&'static str, u64)>,
+        /// Free text: why a stage was skipped or disabled, or what went
+        /// wrong. Already redacted by the emitter.
+        detail: Option<String>,
+    },
     /// One more unit of a stage's own internal work completed — currently
     /// only S4's per-chunk deep-dive loop reports this (S3's decompose is
     /// a single LLM call with no incremental sub-progress of its own to
@@ -208,15 +353,28 @@ pub enum ScanEvent {
         completed: usize,
         total: usize,
     },
+    /// S6's verification loop, per finding (Python's `_S6Progress`, behind
+    /// `--s6-progress-file`). Emitted once with `completed: 0` and
+    /// `outcome: None` when the loop starts, announcing `total`, then once
+    /// per finding that reaches an outcome, in completion order, with
+    /// Python's outcome string (`TRUE_POSITIVE`, `FALSE_POSITIVE`,
+    /// `UNCONFIRMED`, `VERIFY_ERROR`, `GUARDRAIL_BLOCKED`). A finding a
+    /// budget stop or a cancellation kept from the verifier emits nothing,
+    /// since nothing verified it, so `completed` can end below `total`.
+    VerifyProgress {
+        stage: &'static str,
+        completed: usize,
+        total: usize,
+        outcome: Option<&'static str>,
+    },
     /// The running count of findings on hand after a stage that changes
     /// it (S4 raises candidates, S6 verifies, S7 dedups, S8 finalizes).
     FindingsCount { stage: &'static str, count: usize },
-    /// Token spend attributed to one stage, mirroring
+    /// Model spend attributed to one stage, mirroring
     /// `bc_orchestrator::UsageTrackingClient`'s own per-phase tallying.
     UsageUpdate {
         stage: &'static str,
-        prompt_tokens: i64,
-        completion_tokens: i64,
+        usage: StageUsage,
     },
 }
 
@@ -307,7 +465,7 @@ mod tests {
     // poll-or-panic) is legitimate here and genuinely exercised below by
     // `PendOnce` — no real wakeup delivery is needed for a future that
     // completes after a bounded number of polls regardless of whether
-    // `wake()` was actually honoured.
+    // `wake()` was actually honored.
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         use std::task::{Context, Poll, Waker};
 
@@ -400,17 +558,62 @@ mod tests {
     }
 
     #[test]
+    fn stage_status_spells_pythons_outcome_strings() {
+        let all = [
+            (StageStatus::Completed, "completed", true),
+            (
+                StageStatus::CompletedWithErrors,
+                "completed_with_errors",
+                true,
+            ),
+            (StageStatus::Cached, "cached", false),
+            (StageStatus::Skipped, "skipped", false),
+            (StageStatus::Disabled, "disabled", false),
+            (StageStatus::Error, "error", true),
+        ];
+        for (status, spelling, timed) in all {
+            assert_eq!(status.as_str(), spelling);
+            assert_eq!(status.is_timed(), timed, "{spelling}");
+        }
+    }
+
+    #[test]
+    fn a_degraded_stage_never_closes_as_plainly_completed() {
+        assert_eq!(StageStatus::from_degraded(false), StageStatus::Completed);
+        assert_eq!(
+            StageStatus::from_degraded(true),
+            StageStatus::CompletedWithErrors
+        );
+    }
+
+    #[test]
+    fn stage_id_strips_the_role_suffix_and_keeps_a_bare_id() {
+        assert_eq!(stage_id("s4-deepdive"), "s4");
+        assert_eq!(stage_id("s10-remediate"), "s10");
+        assert_eq!(stage_id("s9"), "s9");
+    }
+
+    #[test]
+    fn every_stage_id_has_a_label_and_a_position() {
+        for (i, id) in STAGE_IDS.iter().enumerate() {
+            assert!(stage_label(id).is_some(), "{id}");
+            assert_eq!(stage_number(id), Some(i + 1));
+        }
+        assert_eq!(stage_label("s4"), Some("deep-dive"));
+        assert_eq!(stage_label("s12"), None);
+        assert_eq!(stage_number("s12"), None);
+    }
+
+    #[test]
     fn scan_event_variants_carry_their_own_fields() {
-        assert_eq!(
-            ScanEvent::StageFinished {
-                stage: "s4",
-                degraded: true
-            },
-            ScanEvent::StageFinished {
-                stage: "s4",
-                degraded: true
-            }
-        );
+        let finished = ScanEvent::StageFinished {
+            stage: "s4",
+            status: StageStatus::CompletedWithErrors,
+            duration: Some(std::time::Duration::from_millis(1500)),
+            counts: vec![("findings", 3)],
+            detail: Some("2 chunk(s) failed".to_string()),
+        };
+        assert_eq!(finished.clone(), finished);
         assert_eq!(
             ScanEvent::ChunkProgress {
                 stage: "s4",
@@ -433,18 +636,28 @@ mod tests {
                 count: 5
             }
         );
+        let usage = StageUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            cache_read_tokens: 7,
+            cache_write_tokens: 3,
+            calls: 2,
+            cost_usd: Some(0.25),
+            unpriced_tokens: 0,
+            truncated_replies: 1,
+        };
         assert_eq!(
-            ScanEvent::UsageUpdate {
-                stage: "s4",
-                prompt_tokens: 100,
-                completion_tokens: 50
-            },
-            ScanEvent::UsageUpdate {
-                stage: "s4",
-                prompt_tokens: 100,
-                completion_tokens: 50
-            }
+            ScanEvent::UsageUpdate { stage: "s4", usage },
+            ScanEvent::UsageUpdate { stage: "s4", usage }
         );
+        assert_eq!(StageUsage::default().cost_usd, None);
+        let verified = ScanEvent::VerifyProgress {
+            stage: "s6",
+            completed: 1,
+            total: 2,
+            outcome: Some("TRUE_POSITIVE"),
+        };
+        assert_eq!(verified.clone(), verified);
     }
 
     #[derive(Debug)]

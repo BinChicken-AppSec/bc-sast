@@ -34,7 +34,7 @@ bc-sast --repo /path/to/target \
     --gateway-base-url https://api.openai.com/v1 \
     --gateway-api-key "$OPENAI_API_KEY" \
     --dialect openai \
-    --model gpt-4o
+    --model gpt-5.6-luna
 ```
 
 Writes `/path/to/target/security-scan/report.md`, `report.sarif`,
@@ -75,7 +75,7 @@ that change what one invocation does:
 | Mode | Trigger | What happens |
 |---|---|---|
 | **Plain scan** | `--repo` alone (`--gateway-base-url` always required) | Runs S0-S9, writes `report.md` + `report.sarif` + `report.csv`. Nothing else. |
-| **Scan + remediate** | add `--remediate` | After the scan reaches a `FinalReport`, walks its findings with the remediation agent (S10), applying a minimal diff per finding via `Read`/`Glob`/`Grep`/`Edit`/`Write` tools. **Your checkout is not modified**: for a git `--repo` the edits happen in a throwaway detached worktree and come back as `security-scan/remediation.patch` (see §1f). S11 fix-validation then runs automatically afterward for each remediated finding (see below) unless disabled via `--config`'s `step_validate.enabled: false`. A no-op when the scan does not produce a report or any `--stop-after` boundary is selected, including S8 and S9. |
+| **Scan + remediate** | add `--remediate` | After the scan reaches a `FinalReport`, walks its findings with the remediation agent (S10), applying a minimal diff per finding via `Read`/`Glob`/`Grep`/`Edit`/`Write` tools. **Your checkout is not modified**: for a git `--repo` the edits happen in a throwaway detached worktree and come back as `security-scan/remediation.patch` (see §1f). S11 fix-validation then runs automatically afterward for each remediated finding (see below) unless disabled with `--no-validate` / `--validate false` or `--config`'s `step_validate.enabled: false`. A no-op when the scan does not produce a report or any `--stop-after` boundary is selected, including S8 and S9. |
 | **Interactive remediation** | `--remediate -i` (`-i`/`--interactive`) | Same S10 remediation, but findings are chosen live from an arrow-key terminal menu (falls back to a numbered prompt on a non-TTY stream) instead of being walked automatically top-N. Shows **every** finding (a profile's `step_remediate.top_n_findings` default is ignored) unless `--top` is also given explicitly on the same invocation. |
 | **Remediate only** | `--remediate-from <findings.json>` | Skips SCANNING but not remediation: reads a findings JSON written by a prior run's `--out-findings-json` and remediates those findings directly. Everything `--remediate` supports still applies (`--top`, `-i`, the safety gates, worktree isolation, S11 validation, `--out-remediation-json`). The export carries the commit it came from, so the same HEAD-staleness refusal applies; `--force` overrides it. The prior run's `report.md`/`report.sarif` ARE augmented in place when they exist. See §1h. Mutually exclusive with `--remediate`. |
 | **Post comments only** | `--post-comments-from <findings.json>` | Skips scanning entirely. Reads a findings JSON file written by a prior run's `--out-findings-json`, and posts/updates GitHub PR review comments for it. Requires `--github-token`, `--github-repo`, and `--pr-number`; errors out otherwise. `--repo` is still required as an arg but is unused in this mode. |
@@ -100,13 +100,37 @@ upload from a fork PR (see `docs/github-action.md`).
 Whenever `--remediate` runs in **batch mode** (i.e. not `-i`), each
 remediated finding is, by default, immediately graded by a second LLM pass
 (S11) that scores whether the applied diff actually fixed the finding
-(`Fixed` / `PartiallyFixed` / `NotFixed` / `Unverifiable`). This is
-`step_validate.enabled: true` by default, overridable per-run in a
-`--config` YAML. Validation results are folded back into `report.md` and
-`report.sarif` in a second write pass after remediation completes, and into
-`--out-remediation-json` if requested. **Validation is never blocking**.
-See `docs/validation.md` and `docs/compliance/AI_AGENT_SECURITY_REVIEW.md`
-for why this is a real, documented consideration, not an oversight.
+(`Fixed` / `PartiallyFixed` / `NotFixed` / `Unverifiable`). It is on by
+default, overridable per run with `--validate false` / `--no-validate`
+(or `--validate true`), or in a `--config` YAML with
+`step_validate.enabled`; the flags win. This deliberately differs from
+vvaharness v1.4.0, which ships S11 off: here a fix S11 grades `Not Fixed`
+or `Unverifiable` is rolled back, so S11 is what keeps an unchecked patch
+off disk (see `docs/validation.md`). A skipped S11 is announced on stderr
+as `[s11] disabled`. Validation results are folded back into `report.md`
+and `report.sarif` in a second write pass after remediation completes, and
+into `--out-remediation-json` if requested. Validation does not block
+reporting. See `docs/validation.md` and
+`docs/compliance/AI_AGENT_SECURITY_REVIEW.md` for why this is a real,
+documented consideration, not an oversight.
+
+**Exit codes.** A `--remediate` run exits `1` when an S10 remediation
+call or an S11 validation failed, and `3` when S11 validated nothing as
+fixed and failed at least one fix (an all-inconclusive run is `0`);
+otherwise `0`. A run without `--remediate` is unaffected, and
+`--remediation-exit-code false` restores `0` whenever the scan
+succeeded. A run canceled with Ctrl-C exits `130` (below). See
+`docs/outputs.md` § Exit codes.
+
+**Canceling a run (Ctrl-C).** The first Ctrl-C during a scan stops it
+the way a spent budget does: nothing new starts, the model calls already
+in flight finish, the remaining stages are skipped, and the partial
+report and run manifest are still written, marked `CANCELED`. Nothing is
+published, posted or remediated from a canceled run, and a remediation
+already under way stops at its next model call with its partial patch
+rolled back. Press Ctrl-C a second time to exit at once without waiting.
+Either way the exit code is `130`. See `docs/outputs.md` § Canceling a
+run.
 
 There is no separate `--mode fix|report-only` flag. Every `--remediate`
 run attempts to apply patches directly, subject to the policy gate if
@@ -154,6 +178,22 @@ Add `--target-tests [LEVEL]` (alias `--testing-level`) to a full scan with
 `generate` spelling select comprehensive scope. Discovery runs first and
 existing tests are inspected before missing tests are proposed. Suitable
 existing suites can be retained without creating unnecessary new files.
+
+From `integration` upwards the same run also looks after the target's API
+descriptions: it creates, completes, repairs or, when clearly misplaced,
+relocates OpenAPI (and Swagger), GraphQL SDL, AsyncAPI, OpenRPC and SOAP
+WSDL (1.1 and 2.0, with XML Schema) documents, repairs OData 4 CSDL
+(XML or JSON) without ever creating one, and checks and reports Protocol
+Buffers (against the gRPC services the code registers), RAML, API
+Blueprint and legacy OData 2 and 3 documents without rewriting them. It
+runs when discovery finds API evidence (an HTTP framework, a GraphQL
+server, a messaging client, a JSON-RPC server, gRPC, a SOAP or an OData
+server) or an existing description. Each change is a static,
+independently reviewed proposal delivered with the tests; nothing is sent
+to the application or a broker, and no imported schema is fetched.
+`--api-spec off` skips the step, and `--api-spec-formats openapi,graphql`
+(for example) narrows it. See
+[API specifications](target-testing.md#api-specifications).
 
 Those levels inspect, generate and review tests but do not execute code.
 Select `discovered-offline` to authorize discovered suites through compiled
@@ -642,18 +682,38 @@ Three standalone commands, each skipping scanning entirely, plus a gate
 that runs automatically before every real scan:
 
 - **`--setup`** runs read-only, no-network readiness checks: gateway
-  client/credentials, `git` on PATH, and (if `--config` was also passed)
-  that the config file loads and passes the trust gate. Never makes a
-  network call or spends a token. Ported from `vvaharness setup`, but
+  client/credentials, `git` on PATH, (if `--config` was also passed)
+  that the config file loads and passes the trust gate, and the
+  lifecycle of every configured model (a retired one blocks, a
+  deprecated or legacy one warns; see
+  [`configuration.md`](configuration.md#model-lifecycle-gate)). Never
+  makes a network call or spends a token. Ported from `vvaharness setup`, but
   deliberately scoped down to this port's single-gateway architecture,
   with no profile recommendation, `.env` scaffolding, shell-rc gateway
   auto-discovery, or rulepack-generation hints, none of which apply here.
-- **`--doctor`** runs the exact same static checks as `--setup`, and
-  then, only if none of them are blocking, one minimal live request
-  through the gateway (`--model`, 4 max tokens) to catch bad credentials,
-  an unreachable base URL, a TLS/proxy misconfiguration, or an unknown
-  model id before a real scan spends real tokens. Ported from
+- **`--doctor`** runs the exact same static checks as `--setup`,
+  prints one capability row per configured model (lifecycle, effort
+  tiers, sampling rule, thinking mode, output ceiling, cache minimum),
+  and then, only if none of the checks are blocking, one minimal live
+  request through the gateway (`--model`, 256 max tokens) to catch bad
+  credentials, an unreachable base URL, a TLS/proxy misconfiguration, or
+  an unknown model id before a real scan spends real tokens. Ported from
   `vvaharness doctor`.
+- **`--doctor --cache-probe`** additionally runs a live prompt-cache
+  diagnostic once the live probe has reached the model: two calls
+  through the real configured client (cache policy included) that share
+  a deterministic system prompt of roughly 10,000 tokens and differ only
+  in the user turn, sent back to back, then one verdict on whether the
+  second call read what the first wrote, with a one-line explanation
+  (for example `anthropic_works`, `anthropic_marker_not_honoured`,
+  `openai_implicit_working`, `anthropic_marker_withheld_by_gate`; the
+  full list is in [`llm-transport.md`](llm-transport.md#cache-probe)).
+  **It spends real tokens** (about 20,000 prompt tokens plus two short
+  replies) and says so in its output. A probe that cannot reach a
+  verdict (a failed call, or a live probe that failed first) makes
+  `--doctor` exit non-zero; any verdict, including "not caching", is a
+  finding rather than a failure. Ported from `vvaharness doctor
+  --cache-probe`.
 - **`--estimate`** is a rough, no-network, no-LLM-call scope preview: it
   walks `--repo`, counts files matching a fixed source-code extension
   set, sums their bytes, and divides by 4 for a crude token estimate.
@@ -678,18 +738,27 @@ unreachable base URL, a TLS/proxy misconfiguration, an unknown model id)
 blocks. Static checks are evaluated first, and a blocking one short-
 circuits the probe entirely: a known-bad key never spends a token.
 
+The probe asks for a 256-token reply (it used to be 4, which a model that
+thinks or opens with a word of preamble spends before it says anything,
+as the Python original also found). Any reply counts as reachable,
+including one cut off by that budget: the probe asks whether the model
+can be reached, not whether its answer was complete.
+
 Blocking-ness is per check, not per warning: a missing `--gateway-api-key`
 and a `git` binary absent from `PATH` are both warnings, since a gateway
 may need no key and `--git-sha` can stand in for `git`.
 
-Sample `--doctor` output (`--setup`'s is identical minus the `[probe]` line):
+Sample `--doctor` output (`--setup`'s is identical minus the `[model]`
+and `[probe]` lines):
 
 ```
   ✓ gateway client                http://127.0.0.1:8080 (Openai dialect)
   ✓ gateway API key                set
   ✓ git                            found on PATH
-  3 ok · 0 warning(s) · 0 blocking issue(s)
-  [probe] ✓ gpt-4o reachable
+  ✓ models                         gpt-5.6-luna
+  4 ok · 0 warning(s) · 0 blocking issue(s)
+  [model] gpt-5.6-luna: family=gpt-5.6-luna lifecycle=current sampling=only-when-effort-none effort=none,low,medium,high,xhigh,max (default medium) thinking=none max_output=128000 cache_min=-
+  [probe] ✓ gpt-5.6-luna reachable
 ```
 
 A blocking check instead prints `[probe] skipped: fix the blocking
@@ -718,11 +787,16 @@ cross-checked against `bc-sast --help`.
 | `--git-token <TOKEN>` | `Option<String>` (env `BC_GIT_TOKEN`) | none | Batch mode only: token for authenticating an `http(s)` clone URL. See §1d. |
 | `--out-batch-summary <PATH>` | `Option<PathBuf>` | `./batch_summary.md` | Batch mode only: where the batch roll-up summary is written. |
 | `--repo-name <NAME>` | `Option<String>` | repo dir's own name | Human-readable name for the report title. Ignored in `--repo-file` mode, where each entry's manifest-declared repository name is used instead. |
-| `--model <MODEL>` | `String` | `gpt-4o` | Model identifier passed to every pipeline stage. |
+| `--model <MODEL>` | `String` | `gpt-5.6-luna` | Model identifier passed to every pipeline stage, unless a `--config` names a role's own `models.<role>.id`. The default is a reasoning model, reached over the Responses API under the default `--openai-api auto`. A retired model stops the run before any spend (see `--allow-unsupported-model`). |
 | `--gateway-base-url <URL>` | `String` (env `BC_GATEWAY_BASE_URL`) | *(required)* | AI-gateway base URL (OpenAI-compatible or Anthropic-compatible). |
 | `--gateway-api-key <KEY>` | `Option<String>` (env `BC_GATEWAY_API_KEY`) | none | AI-gateway API key. |
 | `--ca-cert <PATH>` | `Option<PathBuf>` | none | Custom CA certificate (PEM) to trust for the gateway's TLS connection, e.g. for a private/self-signed gateway deployment. |
+| `--client-cert <PATH>` | `Option<PathBuf>` (env `BC_GATEWAY_CLIENT_CERT`) | none | Client certificate (PEM) to present for mutual TLS; may also hold the private key. An unloadable file stops the run instead of connecting without mTLS. See [`configuration.md`](configuration.md#gateway-tls-and-credentials). |
+| `--client-key <PATH>` | `Option<PathBuf>` (env `BC_GATEWAY_CLIENT_KEY`) | none | Private key (PEM) for `--client-cert` when it is a separate file. Refused without `--client-cert`. |
 | `--dialect <openai\|anthropic>` | enum | `openai` | Which wire dialect the gateway speaks. |
+| `--openai-api <chat\|responses\|auto>` | `Option<OpenAiApi>` (env `BC_OPENAI_API`) | `auto` | Which OpenAI API shape the OpenAI dialect speaks. `auto` starts known reasoning models on the Responses API and everything else on Chat Completions, and learns per model from how the gateway answers. The flag (or env) wins over `llm.openai_api`; a role's `models.<role>.use_responses_api` pins that role alone. Ignored under `--dialect anthropic`. See [`llm-transport.md`](llm-transport.md#selecting-it-from-the-cli). |
+| `--no-cache-markers` | flag | `false` | Send no prompt-cache markers at all (no Anthropic `cache_control`, no OpenAI `prompt_cache_key`), for a gateway that rejects them. Same as `llm.cache_markers: false`; wins over a config that turns them on. |
+| `--allow-unsupported-model` | flag | `false` | Run even when a configured model is retired. Without it a retired `--model` or `models.<role>.id` stops the run (scan, `--remediate-from`, batch) before any token is spent, and blocks `--doctor`/`--setup`. For a private gateway that serves its own model under a retired name. |
 | `--pricing-provider <ID>` | `Option<String>` | inferred from `--gateway-base-url` | Price the run's tokens at this [models.dev](https://models.dev) provider's rates (`openai`, `anthropic`, `openrouter`, and others). Needed only when the gateway host does not identify a provider, where the run is otherwise reported as unpriced rather than guessed at. Wins over `pricing.provider` in `--config`. See §10. |
 | `--stop-after <s1..s9>` | `String`, case-insensitive | `""` (not provided) | Stop the scan after this stage. Empty string means "not provided", a raw `String` field rather than `Option<T>`, since a custom clap `value_parser` on `Option<T>` can't express "empty means None." |
 | `--app-id <ID>` | `String` | `""` (not provided) | CMDB application id, for environmental-CVSS/OffensivePriority enrichment. |
@@ -772,6 +846,8 @@ cross-checked against `bc-sast --help`.
 | `--github-api-base-url <URL>` | `String` (env `GITHUB_API_URL`) | `https://api.github.com` | GitHub REST API base URL; override for GitHub Enterprise Server. GitHub Actions runners already export `GITHUB_API_URL` correctly. |
 | `--diff-scope` | flag | `false` | Scope the scan itself to the PR's changed files. See §1a. Requires `--github-token`/`--github-repo`/`--pr-number`; errors out otherwise. Fetching the diff is read-only and posts nothing on its own. |
 | `--target-tests [LEVEL]` | `Option<String>` | disabled; bare flag selects `comprehensive` | Built-in testing level: `discover`, `unit`, `integration`, `comprehensive`; `e2e` and `generate` are aliases for comprehensive scope. `--testing-level` is an alternative spelling. Full-scan isolated remediation only; see [target testing](target-testing.md). |
+| `--api-spec <auto\|off>` | `ApiSpecMode` | `auto` | The API specification step of `--target-tests`: at `integration` or wider, create a missing OpenAPI, GraphQL, AsyncAPI, OpenRPC or WSDL document at the framework's conventional location, or complete, repair or relocate an existing one, as an independently reviewed proposal; OData 4 CSDL is repaired but never created; Protocol Buffers, RAML, API Blueprint and legacy OData 2 and 3 documents are checked and reported only. `off` skips it and records that. Static only; see [target testing](target-testing.md#api-specifications). |
+| `--api-spec-formats <LIST>` | `Vec<FormatId>` | every standard the profile allows | Comma-separated standards the API specification step considers: `openapi`, `graphql`, `asyncapi`, `openrpc`, `protobuf`, `raml`, `api_blueprint`, `wsdl`, `odata`. It can only narrow what the compiled profile allows. |
 | `--remediation-delivery <patch\|branch\|zip>` | `DeliveryMode` | `patch` | Choose combined patch, one pushed branch, or updated source ZIP. Branch and ZIP modes require full-scan isolated remediation; see [delivery](remediation-delivery.md). |
 | `--delivery-remote <NAME>` | `Option<String>` | none | Named Git remote, required with branch delivery; paired with `--delivery-branch`. |
 | `--delivery-branch <NAME>` | `Option<String>` | none | New destination branch, required with branch delivery; paired with `--delivery-remote`. |
@@ -783,15 +859,19 @@ cross-checked against `bc-sast --help`.
 | `--config <PATH>` | `Option<PathBuf>` | none | YAML config file with per-stage settings and per-role model overrides. See `docs/configuration.md`. |
 | `--cve-file <PATH>` | `Option<PathBuf>` | none (or `inject.cve_file`) | JSON feed of CVEs already filed against this codebase (a bare array or an object with a `cves` array). Rendered into S1's "Known CVEs already filed" block, S2's "KNOWN PRIOR CVEs" evidence block, S3's "KNOWN CVEs: DO NOT REDISCOVER" block, and S8's "KNOWN CVEs" chain-combination block. A missing file injects nothing; a structurally broken one warns and injects nothing (it is prompt context, not a gate). |
 | `--controls-file <PATH>` | `Option<PathBuf>` | none (or `inject.controls_file`) | YAML list of compensating design controls already in place (bare list or an object with a `controls` list), rendered into the `DESIGN CONTROLS` block of S2, S3 and S8, and into S6's "DESIGN CONTROLS IN EFFECT ON THIS PATH" block (where the verifier must demonstrate a bypass to return TRUE_POSITIVE). Same missing/broken-file rules as `--cve-file`. |
-| `--temperature <F>` | `Option<f64>` | none (provider default, `1.0`) | Sampling temperature for every stage. A `--config`'s per-role `models.<role>.temperature` wins over it. `--temperature 0` is the main run-to-run stability lever. See `docs/configuration.md` § Reproducible runs. |
+| `--temperature <F>` | `Option<f64>` | none (provider default, `1.0`) | Sampling temperature for every stage. A `--config`'s per-role `models.<role>.temperature` wins over it. On a model that accepts it, `--temperature 0` is the main run-to-run stability lever. **Reasoning models drop it**: on GPT-5.x (the default model included) `temperature`, `top_p` and `seed` are not sent, with a once-per-model warning, unless the role's effort is `none`; the o-series and Claude Opus 4.7 and later never take them. See `docs/configuration.md` § Reproducible runs. |
 | `--seed <N>` | `Option<u64>` | none | Deterministic-sampling seed for every stage; per-role `models.<role>.seed` wins. **OpenAI dialect only**. The Anthropic Messages API has no seed parameter. |
 | `--top-p <F>` | `Option<f64>` | none | Nucleus-sampling cutoff for every stage; per-role `models.<role>.top_p` wins. The Anthropic dialect drops it when `temperature` is also set. |
+| `--reasoning-effort <TIER>` | `Option<ReasoningEffort>` | none (provider default; S11 `high`) | Reasoning-effort tier for every role: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`. A role's `models.<role>.effort` wins over it; it wins over `step_validate.effort`. Clamped to the nearest tier the model supports; a model that takes no effort gets none. See [`configuration.md`](configuration.md#modelsrole-per-stage-model-overrides). |
 | `--step-timeout <SECS>` | `Option<u64>` | none | Per-LLM-call wall-clock deadline for every stage. Unlike the sampling flags this OVERRIDES any `stepN.timeout` in `--config`. Without it, each stage uses its own configured value (S3/S8 `3600`, S4 `1800`) or the gateway client's 300 s default. |
 | `--remediate [true\|false]` | `bool`, explicit-value-capable | `false` | Bare `--remediate` = `true`; also accepts an explicit value (`--remediate false`) so a static CI `args:` array can pass it unconditionally. |
+| `--validate [true\|false]` | `Option<bool>`, explicit-value-capable | unset (S11 on) | Run or skip S11 validation after remediation, overriding `step_validate.enabled` in `--config`. Bare `--validate` = `true`. |
+| `--no-validate` | flag | `false` | Skip S11 validation; the same as `--validate false`. Conflicts with `--validate`. |
+| `--remediation-exit-code [true\|false]` | `bool`, explicit-value-capable | `true` | Let a `--remediate` run's outcome set the exit code (`1` for an S10/S11 failure, `3` when nothing validated as fixed). `false` exits `0` whenever the scan succeeded. The GitHub Action's `fail-on-remediation` input maps here and defaults to `false`. |
 | `--top <N\|all\|*>` | `Option<String>`, parsed | none (profile default, or uncapped) | Cap remediation to the top N findings by CVSS score (highest first), or `all`/`*` for every finding. |
 | `-i`, `--interactive` | flag | `false` | See §1. |
 | `--force` | flag | `false` | Override the S10 git-HEAD-staleness safety refusal: by default, remediation refuses to run if the repo's HEAD has moved since the scan ran (stale line numbers would misplace the agent's file:line evidence). |
-| `--resume` | flag | `false` | Skip re-remediating a finding whose previously-saved checkpoint still matches it exactly. Checkpoints are always written when a checkpoint store is available; this flag only controls whether they're *consulted* before re-running. |
+| `--resume` | flag | `false` | Skip re-remediating a finding whose previously-saved checkpoint still matches it exactly, under the same model, dialect, gateway host and release (checkpoints are engine-keyed, so switching models re-runs the finding). Checkpoints are always written when a checkpoint store is available; this flag only controls whether they're *consulted* before re-running. |
 | `--enforce-remediation-policy` | flag | `false` | Enable S10's deterministic policy gate. See §6. |
 | `--remediation-policy <PATH>` | `Option<PathBuf>` | none | The remediation policy YAML. Only consulted when `--enforce-remediation-policy` is set. |
 | `--remediation-playbook <PATH>` | `Option<PathBuf>` | none | Per-CWE fix-strategy YAML injected into the agent's prompt on the policy gate's allow path. Only consulted when `--enforce-remediation-policy` is set. Config-side equivalents of the two flags above: `step_remediate.policy_file` / `step_remediate.playbook_file`, resolved against the `--config` file's own directory. |
@@ -813,7 +893,8 @@ cross-checked against `bc-sast --help`.
 | `--gc-run <PATH>` | `Option<PathBuf>` | none | See §1b. Implies `--gc`. |
 | `--gc-dry-run` | flag | `false` | Report what `--gc`/`--gc-run` would delete without touching the database. |
 | `--estimate` | flag | `false` | Print a rough, no-network scope preview for `--repo` and exit. See §1e. |
-| `--doctor` | flag | `false` | Run environment-readiness checks plus a live gateway probe, then exit. See §1e. |
+| `--doctor` | flag | `false` | Run environment-readiness checks, print each configured model's capability row, then a live gateway probe, then exit. See §1e. |
+| `--cache-probe` | flag | `false` | Only with `--doctor`: also run the live prompt-cache diagnostic against `--model`. **Spends real tokens** (about 20,000 prompt tokens). See §1e. |
 | `--setup` | flag | `false` | Run the same read-only readiness checks as `--doctor` (no live probe), then exit. See §1e. |
 | `--stream-large-responses` | flag | `false` | Send any model call asking for at least 21,333 output tokens as a server-sent-event stream, reassembled into exactly the response a single JSON body would have carried. Off by default; turn it on when a gateway/proxy in front of the provider drops connections that go quiet for minutes. Also settable as `llm.stream_large_responses` in `--config` (the flag can only turn it ON). See §8. |
 | `--skip-preflight` | flag | `false` | Skip the automatic pre-scan readiness gate that otherwise runs before every real scan. See §1e. |
@@ -821,6 +902,9 @@ cross-checked against `bc-sast --help`.
 | `--log-stderr` | flag | `false` | Stream logs to stderr even when stderr is a real terminal, and alongside `--log-file` when that is given too. Without it, streaming turns itself on whenever there is no `--log-file` and stderr is not a terminal, which is the CI case. See §7. |
 | `-v`, `--verbose` | count (0-3+) | `0` | Raise the level above the default `WARN`: once for `INFO`, twice for `DEBUG`, 3+ for `TRACE`. Applies to whichever destinations are active. `RUST_LOG` (standard `tracing-subscriber` `EnvFilter` syntax) takes precedence when set. See §7. |
 | `--no-progress` | flag | `false` | Disable the live terminal progress bar. Already auto-disabled when stdout isn't a real terminal. This flag opts out explicitly even in an interactive one. See §7. |
+| `--progress-style <STYLE>` | `compact`\|`verbose`\|`summary_only`\|`stage_only` | none | Print plain-text `[progress]` lines to stderr instead of the progress bar, for CI and other logs nothing redraws in place. Also switched on by `scan_progress.enabled: true` in `--config` or `BC_SCAN_PROGRESS_ENABLED=1`, whose style defaults to `compact`. See §7. |
+| `--s6-progress-file` | flag | `false` | Keep `<state-dir>/s6_progress/<run_id>/s6_progress.json` up to date while S6 verifies, for another process to watch. Same as `step6_verify.progress_file: true`. See `docs/outputs.md`. |
+| `--out-run-manifest <PATH>` | `Option<PathBuf>` | `<out-dir>/run_manifest.json` | Where the run manifest goes: per-stage outcome, duration, tokens and cost through S11, config and input hashes, scrubbed command line. Written for every scan that ran. See `docs/outputs.md`. |
 | `-h`, `--help` / `-V`, `--version` | *(n/a)* | *(n/a)* | Standard clap help/version. |
 
 `--repo` and `--gateway-base-url` are the only two flags with no default:
@@ -852,6 +936,12 @@ property of `bc-sandbox-tools`, not of which dialect you pick.
 - TLS verification is always on; there is no flag to disable it.
   `--ca-cert <PEM path>` adds a custom trust anchor on top of that, for a
   private or self-signed gateway; it does not weaken verification.
+  `--client-cert`/`--client-key` present a client certificate to a
+  gateway that requires mutual TLS, and fail closed: a certificate that
+  will not load stops the run rather than being silently dropped.
+- With `--dialect anthropic`, an `sk-ant-oat...` OAuth token passed as
+  `--gateway-api-key` is sent as a bearer token with the
+  `oauth-2025-04-20` beta, not as `x-api-key`.
 - `--model` sets one model id for every stage; per-stage/per-role overrides
   (`models.deepdive`, `models.remediate`, and others) are only available via
   `--config`. The roles are named by function rather than by stage number,
@@ -896,7 +986,7 @@ them and creates no out-dir at all.
 | `BC_GATEWAY_BASE_URL` | `--gateway-base-url` | Supplies the gateway URL if the flag itself is omitted. |
 | `BC_GATEWAY_API_KEY` | `--gateway-api-key` | Supplies the gateway API key if the flag itself is omitted. |
 | `BC_STATE_DIR` | remediation checkpoint store, `--gc`/`--gc-run` | Root directory for the checkpoint SQLite DB (`$BC_STATE_DIR/bc-sast.db`). Falls back to `$HOME/.bc-sast/state/bc-sast.db` if unset. Opened automatically whenever `--remediate` is passed; if opening it fails there, the run continues with a warning and `--resume` has no effect that run. In `--gc`/`--gc-run` mode a failure to open it is a hard error instead. The operator explicitly asked to touch the state DB, so a silent no-op would hide exactly the failure they'd want to know about. |
-| `BC_NO_LOCAL_CONFIG` | `--config` loading | If set to a non-empty value, skips merging a sibling `config.local.yaml` found next to a `--config` file. |
+| `BC_NO_LOCAL_CONFIG` | `--config` loading | If set to a non-empty value, skips merging a sibling `config.local.yaml` found next to a `--config` file, before its trust check (a symlinked, foreign-owned or group/world-writable overlay otherwise fails the load). See `docs/configuration.md`. |
 | `BC_ALLOW_CWD_CONFIG` | `--config` trust gate | A `--config` file that resolves *inside* `--repo` is refused by default (defends against a malicious `config.yaml` checked into the scan target). Set this (non-empty) to opt out for a target you trust. |
 | `GITHUB_TOKEN` | `--github-token` | Supplies the GitHub token if the flag itself is omitted. |
 | `GITHUB_API_URL` | `--github-api-base-url` | Supplies the GitHub REST API base URL if the flag itself is omitted; GitHub Actions runners export this automatically. |
@@ -1014,6 +1104,11 @@ Add `--log-stderr` to that command to watch the run and keep the file.
 - `RUST_LOG` (standard `tracing-subscriber` `EnvFilter` syntax, e.g.
   `RUST_LOG=bc_stage_s4=debug,warn`) takes precedence over `-v` when set,
   for per-module filtering a single global `-v` count can't express.
+- Every line is passed through `bc-redact` before it is written, on both
+  destinations, as the Python harness's own log handler does. An event is
+  redacted as a whole, so a secret that a log field happens to carry (a
+  token in a URL, a key quoted in a model reply) is masked even when it
+  spans lines.
 - Lines are plain text with a timestamp, no ANSI color, on both
   destinations. GitHub Actions prefixes its own timestamp column when it
   renders the console, but the raw log you download or pipe elsewhere
@@ -1031,14 +1126,51 @@ Renders, live: the current stage name, S3/S4 chunk progress (e.g. "chunk
 7 of 23"), a running findings-found counter, elapsed time, and token
 spend so far.
 
+### Text progress lines (`--progress-style`)
+
+The bar hides itself off a terminal, so a CI log would otherwise show
+nothing between the start banner and the summary. Plain-text lines fill
+that gap: one `[progress]` line per milestone on stderr, ported from the
+Python original's `scan_progress`. Turn them on with `--progress-style
+<style>`, `scan_progress.enabled: true` in `--config` (style from
+`scan_progress.style`), or `BC_SCAN_PROGRESS_ENABLED=1`. When they are on
+the bar is off, since both write to stderr.
+
+```
+[progress] stage-start s4    deep-dive
+[progress] scanned     7 / 23 chunks
+[progress] stage-done  s4   outcome=completed  412.6s  findings=9 chunks=23 chunks_failed=0 chunks_skipped=0
+[progress] summary     23 / 23 chunks done  |  findings=9  elapsed=412.6s
+           outcomes:  completed=23  failed=0  skipped=0
+```
+
+- `compact` (the default): stage start/done lines with their counters,
+  S4 chunk progress, and the S4 summary block.
+- `verbose`: compact plus running findings counts and each stage's
+  tokens and cost.
+- `summary_only`: the S4 summary block alone.
+- `stage_only`: numbered lines only, `[progress] ▶ [5/12] S4 deep-dive`
+  and `[progress] ✓ [5/12] S4 deep-dive (412.6s)`, the done mark
+  following the outcome (`⚠` completed with errors, `✗` error, `○`
+  skipped or disabled).
+
+Each stage closes with an outcome: `completed`, `completed_with_errors`,
+`cached` (restored by `--resume`), `skipped` (switched off by
+configuration), `disabled` (remediation or validation not run) or
+`error`. Python's `llm_debug` style, which prints every prompt, is
+deliberately not ported: prompts carry source code that does not belong
+in a CI log.
+
 ### The underlying event stream
 
-Both consumers above are built on the same internal
+Every consumer above is built on the same internal
 `bc_pipeline_core::ScanEvent` stream emitted at stage boundaries and at
 each S3/S4 chunk. There is no separate CLI flag for the event stream
-itself; it always fires during a scan; `--no-progress` controls only
-whether the bar renders it. The log stream above is separate: it carries
-`tracing` events from the stages themselves, not these.
+itself; it always fires during a scan, and always feeds the run
+manifest (`run_manifest.json`, see `docs/outputs.md`); `--no-progress`
+and `--progress-style` control only what is drawn from it. The log
+stream above is separate: it carries `tracing` events from the stages
+themselves, not these.
 
 ## 8. Streaming large model calls (`--stream-large-responses`)
 
@@ -1157,6 +1289,29 @@ The quota reason appears in the budget warning under `## Scan Health`,
 in the `[UNCONFIRMED]` bullets for unverified candidates, and in the
 executive summary's **Not examined** line. The fix is to top up the account and rerun, not to
 raise a budget.
+
+### Model-call error codes
+
+Three model-call failures carry a stable code, the same codes (and
+meanings) the Python original uses, so either project's docs explain an
+error from the other. The code leads the error text wherever it is
+reported.
+
+| Code | Meaning | Retried? |
+|---|---|---|
+| `VVAH-E001` | Authentication failed: an HTTP 401, or a non-retryable status whose body reads as a rejected key or token. | Three quick retries (2 s, 4 s, 8 s), for a credential that is mid-rotation, then it fails. |
+| `VVAH-E002` | Proxy or TLS problem: an HTTP 407, a refused `CONNECT` tunnel, a certificate the TLS stack will not accept (`invalid peer certificate: UnknownIssuer` and friends), or a gateway rejecting this client's mTLS certificate. | Never: a misconfiguration does not heal by waiting. |
+| `VVAH-E005` | A reply still hit its output-token budget after one retry at double the budget (see [`configuration.md`](configuration.md#llm-transport-level-model-call-settings)). Carries the partial reply. | Once, at double the budget, then it fails that one chunk or session. |
+
+`VVAH-E001` and `VVAH-E002` mean every other call in the scan is about
+to fail the same way; they are classified as halting, like quota
+exhaustion above (`LlmError::halts_scan`). The first S0 batch, S4 chunk
+or S6 session to hit one trips the scan-wide budget gate, so everything
+still queued is skipped and reported as a budget stop naming the code,
+instead of each unit of work failing on its own. `VVAH-E005` is not: one
+oversized answer says nothing about the next unit of work. `VVAH-E003`
+(a degenerate empty reply) and `VVAH-E004` (a deepagents-route prompt
+refusal) are Python codes this port does not raise.
 
 Transient retries that *are* worth retrying (a real 429, a 5xx, a dropped
 connection) are logged at `WARN` with the error, the attempt number and

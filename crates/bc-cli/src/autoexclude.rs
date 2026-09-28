@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use bc_llm_client::LlmClient;
 use bc_orchestrator::ScanConfig;
-use bc_stage_s1::{AutoExcludeConfig, AutoExcludeOverlay};
+use bc_stage_s1::{AutoExcludeConfig, AutoExcludeDiagnostics, AutoExcludeOverlay};
 
 use crate::{config_overrides, Cli};
 
@@ -137,18 +137,34 @@ fn apply_overlay(config: &mut ScanConfig, overlay: &AutoExcludeOverlay) {
 /// Never returns an error — every failure mode degrades to "no overlay
 /// applied, scan proceeds with global step1 only", printed to stderr,
 /// exactly matching Python's own non-fatal treatment of this optional
-/// pre-pass.
+/// pre-pass. That includes a `--config` that fails to load, which skips
+/// the survey (and its model call) outright rather than running it as if
+/// no config had been given.
 pub async fn maybe_apply(
     cli: &Cli,
     llm: &Arc<dyn LlmClient>,
     repo_root: &Path,
     config: &mut ScanConfig,
 ) {
-    let config_data = cli
+    // A `--config` that fails to load (including a secret-interpolation or
+    // untrusted-overlay refusal) is NOT read as "no config": that would
+    // run the survey with this function's own defaults and quietly ignore
+    // whatever the operator's file said. Fail closed on this optional
+    // pass instead. `build_scan_config` has already failed the whole run
+    // on the same file in every real call path, so this only matters for
+    // a caller that skipped it.
+    let config_data = match cli
         .config
-        .as_ref()
-        .and_then(|path| bc_config::load(path, &crate::getenv).ok())
-        .map(|loaded| loaded.data);
+        .as_deref()
+        .map(crate::config_load::load)
+        .transpose()
+    {
+        Ok(loaded) => loaded.map(|loaded| loaded.data),
+        Err(e) => {
+            tracing::warn!("[auto-step1] --config did not load ({e}); skipping the survey");
+            return;
+        }
+    };
 
     if !resolve_enabled(cli, config_data.as_ref()) {
         return;
@@ -159,25 +175,30 @@ pub async fn maybe_apply(
         return;
     };
 
-    let overlay = if cli.resume && path.is_file() {
+    let (overlay, diagnostics) = if cli.resume && path.is_file() {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 tracing::info!("[auto-step1] reusing {}", path.display());
-                Some(AutoExcludeOverlay::from_yaml(&text))
+                (Some(AutoExcludeOverlay::from_yaml(&text)), None)
             }
             Err(e) => {
                 tracing::warn!(
                     "[auto-step1] failed to read {} ({e}); re-surveying",
                     path.display()
                 );
-                run_and_write(llm, repo_root, config_data.as_ref(), &path, config).await
+                surveyed(run_and_write(llm, repo_root, config_data.as_ref(), &path, config).await)
             }
         }
     } else {
-        run_and_write(llm, repo_root, config_data.as_ref(), &path, config).await
+        surveyed(run_and_write(llm, repo_root, config_data.as_ref(), &path, config).await)
     };
 
     let Some(overlay) = overlay else { return };
+    // Only a survey that actually ran this invocation has guard decisions
+    // to report; an overlay reused on `--resume` does not.
+    if let Some(diag) = &diagnostics {
+        config.autoexclude = bc_orchestrator::autoexclude_counts(diag);
+    }
     let dirs = overlay.exclude_dirs.len();
     let exts = overlay.exclude_exts.len();
     let globs = overlay.exclude_globs.len();
@@ -185,16 +206,28 @@ pub async fn maybe_apply(
     tracing::info!("[auto-step1] applied overlay  (exclude_dirs={dirs} exts={exts} globs={globs})");
 }
 
+/// A fresh survey's result split into the overlay and its guard
+/// diagnostics, in the shape [`maybe_apply`] consumes.
+fn surveyed(
+    result: Option<(AutoExcludeOverlay, AutoExcludeDiagnostics)>,
+) -> (Option<AutoExcludeOverlay>, Option<AutoExcludeDiagnostics>) {
+    match result {
+        Some((overlay, diag)) => (Some(overlay), Some(diag)),
+        None => (None, None),
+    }
+}
+
 /// Runs the survey+LLM call, writes the overlay file on success, and
-/// returns the parsed overlay — or `None` (after a WARN to stderr) on
-/// any failure, so [`maybe_apply`] can degrade gracefully.
+/// returns the parsed overlay with what the overlay guards decided, or
+/// `None` (after a WARN to stderr) on any failure, so [`maybe_apply`] can
+/// degrade gracefully.
 async fn run_and_write(
     llm: &Arc<dyn LlmClient>,
     repo_root: &Path,
     config_data: Option<&serde_json::Value>,
     path: &Path,
     config: &ScanConfig,
-) -> Option<AutoExcludeOverlay> {
+) -> Option<(AutoExcludeOverlay, AutoExcludeDiagnostics)> {
     // `models.autoexclude` — id AND sampling knobs. The survey call is
     // as much an LLM call as any stage's, so it gets the same treatment;
     // without a role of its own it inherits S1's model (Python's own
@@ -220,11 +253,13 @@ async fn run_and_write(
         temperature: role.temperature.or(config.step1.temperature),
         top_p: role.top_p.or(config.step1.top_p),
         seed: role.seed.or(config.step1.seed),
+        reasoning_effort: role.effort.or(config.step1.reasoning_effort),
+        openai_api: role.openai_api().or(config.step1.openai_api),
         timeout_secs: config.step1.timeout_secs,
     };
 
     tracing::info!("[auto-step1] surveying {}", repo_root.display());
-    let result = bc_stage_s1::run_autoexclude(
+    let result = bc_stage_s1::run_autoexclude_with_diagnostics(
         llm.as_ref(),
         repo_root,
         &config.step1.walk,
@@ -235,20 +270,20 @@ async fn run_and_write(
     .await;
 
     match result {
-        Ok(overlay) => {
+        Ok((overlay, diag)) => {
             if let Some(parent) = path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     tracing::warn!(
                         "[auto-step1] failed to create {} ({e}); continuing with global step1 only",
                         parent.display()
                     );
-                    return Some(overlay);
+                    return Some((overlay, diag));
                 }
             }
             if let Err(e) = std::fs::write(path, overlay.to_yaml()) {
                 tracing::warn!("[auto-step1] failed to write {} ({e})", path.display());
             }
-            Some(overlay)
+            Some((overlay, diag))
         }
         Err(e) => {
             tracing::warn!("[auto-step1] failed ({e}); continuing with global step1 only");
@@ -260,7 +295,6 @@ async fn run_and_write(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn cli(auto: bool, no_auto: bool) -> Cli {
         let mut c = crate::test_support::minimal_cli(Path::new("/tmp/repo"));
@@ -437,6 +471,10 @@ mod tests {
             .walk
             .exclude_dirs
             .contains(&"generated".to_string()));
+        // The guards' decisions travel with the config into the scan's
+        // Pipeline Diagnostics.
+        assert!(config.autoexclude.ran);
+        assert_eq!(config.autoexclude.files_before, 1);
         assert!(
             path.is_file(),
             "overlay file should have been written to {}",
@@ -505,6 +543,8 @@ mod tests {
             .walk
             .exclude_dirs
             .contains(&"from-resume".to_string()));
+        // A reused overlay carries no guard decisions of its own.
+        assert!(!config.autoexclude.ran);
     }
 
     #[tokio::test]
@@ -542,8 +582,12 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let path = overlay_path(repo.path()).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "exclude_dirs:\n  - stale\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // The overlay is a regular file whose text cannot be read (it is not
+        // UTF-8), which fails `read_to_string` for every user. A chmod 000
+        // file would not stop root, which bypasses permission bits.
+        let mut unreadable = b"exclude_dirs:\n  - stale\n".to_vec();
+        unreadable.extend_from_slice(&[0xff, 0xfe]);
+        std::fs::write(&path, unreadable).unwrap();
 
         let mut c = cli(true, false);
         c.resume = true;
@@ -553,7 +597,6 @@ mod tests {
         let mut config = crate::tests::fast_config();
         maybe_apply(&c, &llm, repo.path(), &mut config).await;
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         crate::tests::restore_env("BC_STATE_DIR", prior);
 
         assert!(config
@@ -674,5 +717,42 @@ mod tests {
             .walk
             .exclude_dirs
             .contains(&"generated".to_string()));
+    }
+
+    #[tokio::test]
+    async fn maybe_apply_skips_the_survey_when_the_config_is_refused_by_policy() {
+        let _guard = crate::tests::ENV_LOCK.lock().await;
+        let state_dir = tempfile::tempdir().unwrap();
+        let prior = std::env::var("BC_STATE_DIR").ok();
+        unsafe {
+            std::env::set_var("BC_STATE_DIR", state_dir.path());
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("main.rs"), "fn main() {}").unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "step_remediate:\n  verify_command: make T=${GITHUB_TOKEN}\n",
+        )
+        .unwrap();
+
+        // `--auto-step1` is on and the model would answer, so the only
+        // thing that can keep the overlay out is the refused config.
+        let mut c = cli(true, false);
+        c.config = Some(config_path);
+        let llm: Arc<dyn LlmClient> = Arc::new(FakeLlmClient {
+            yaml: "```yaml\nexclude_dirs:\n  - generated\n```",
+        });
+        let mut config = crate::tests::fast_config();
+        let before = config.step1.walk.exclude_dirs.clone();
+        maybe_apply(&c, &llm, repo.path(), &mut config).await;
+        let overlay_written = overlay_path(repo.path()).is_some_and(|p| p.exists());
+
+        crate::tests::restore_env("BC_STATE_DIR", prior);
+
+        assert_eq!(config.step1.walk.exclude_dirs, before);
+        assert!(!overlay_written);
     }
 }

@@ -24,12 +24,20 @@
 //! specifically so the outer gate (mirroring `bc-stage-s6`'s already
 //! correct one) can actually trip.
 //!
-//! Concurrency mirrors `bc-stage-s6`: `config.parallel` chunks in flight
-//! via a `tokio::sync::Semaphore`, drained in completion order via
-//! `tokio::task::JoinSet` (matching Python's `as_completed`), then
-//! reassembled in risk-rank order before the final cross-chunk collapse —
-//! matching the Python original's own `for chunk in chunks:
-//! all_findings.extend(...)` reassembly.
+//! Concurrency: `config.parallel` model calls in flight via a
+//! `tokio::sync::Semaphore`. Chunks are dispatched in risk-rank order, each
+//! handed a permit as it is spawned (matching the FIFO thread pool Python
+//! submits to), drained in completion order (matching Python's
+//! `as_completed`), then reassembled in risk-rank order before the final
+//! cross-chunk collapse, matching the Python original's own `for chunk in
+//! chunks: all_findings.extend(...)` reassembly. Ordered dispatch is what
+//! lets `shard_gate` rely on a shard's leader being dispatched before
+//! its siblings.
+//!
+//! **Request-side prompt caching** (upstream v1.4.0): each call's prompt
+//! is split into a stable cache prefix and a volatile user text by
+//! `prompt_layout`, around the scan-constant block from
+//! `shared_context`.
 //!
 //! **Deliberately not ported**: `_effective_runs`'s CLI/SDK backend-
 //! *detection* branches — there is no CLI-subprocess backend in this port
@@ -66,11 +74,20 @@
 
 mod code_loading;
 mod cwe_kb;
+mod findings_shape;
 mod hints;
+mod lens_hints;
 mod neighbor;
+mod packed_text;
+mod prompt_layout;
 mod prompts;
 mod reanchor;
 mod redact_source;
+mod repair;
+#[cfg(test)]
+mod shard_cache_tests;
+mod shard_gate;
+mod shared_context;
 mod single_run;
 mod slice;
 mod vote;
@@ -80,7 +97,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 use bc_llm_client::LlmClient;
@@ -144,10 +161,20 @@ pub struct Step4Config {
     /// Python.
     ///
     /// Note this is a per-*stage* seed, not per-run: with `runs > 1` every
-    /// run of a chunk sends the SAME seed, so a provider that honours it
+    /// run of a chunk sends the SAME seed, so a provider that honors it
     /// makes the vote unanimous by construction. Set a seed or set
     /// `runs > 1`, not both.
     pub seed: Option<u64>,
+    /// Reasoning-effort tier for this stage's calls (the Python
+    /// original's `models.<role>.effort`, else `--reasoning-effort`),
+    /// forwarded to [`bc_llm_client::ChatRequest::reasoning_effort`].
+    /// `None` (the default) sends none, leaving the provider's default.
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+    /// Per-role OpenAI transport pin (Python's
+    /// `models.<role>.use_responses_api`), forwarded to
+    /// [`bc_llm_client::ChatRequest::openai_api`]. `None` (the default)
+    /// keeps the client-wide `--openai-api` choice.
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
     /// Per-call wall-clock deadline in seconds, overriding the shared
     /// gateway client's own 300 s default. Ported from `step4.timeout`
     /// (`_STEP_DEFAULTS`' `1800`, matched by every shipped profile), which
@@ -178,11 +205,11 @@ pub struct Step4Config {
     /// for why a stage-boundary check alone is not enough. `None` (the
     /// default) is an unbounded stage, exactly as before this existed.
     ///
-    /// The check deliberately lives inside the task rather than in the
-    /// spawn loop: every chunk is spawned up-front and `parallel` is
-    /// enforced by a semaphore permit acquired *inside* the task, so a
-    /// pre-spawn check would run 444 times in a burst before a single
-    /// token had been spent and could never trip.
+    /// The check deliberately lives inside the task, holding the permit
+    /// the chunk's model call will run under, rather than at dispatch: a
+    /// shard sibling may park between the two (see
+    /// [`Self::shard_cache_gating`]), and the budget can run out while it
+    /// waits. It is asked exactly once per chunk.
     pub budget_gate: Option<bc_pipeline_core::BudgetGateRef>,
     /// How many def-spans the `function`-mode graph slice may take from
     /// any one file before shipping that file whole instead. Ported from
@@ -190,6 +217,18 @@ pub struct Step4Config {
     /// by `_load_graph_slice` (`s4_deepdive.py:1022`). Only consulted
     /// when [`Self::taint_chunk_slice`] is `"function"`.
     pub frontier_max_funcs_per_file: usize,
+    /// Hold each shard sibling's model call until its shard leader's call
+    /// has returned, so the siblings read the shard's cached prefix
+    /// instead of each writing it again (upstream v1.4.0 `_shard_gates`,
+    /// see `crate::shard_gate`). `true` by default, as upstream.
+    ///
+    /// Upstream builds no gates on a route with no prompt-prefix cache.
+    /// This stage cannot see the route (the transport owns the cache
+    /// policy), so the key is the operator's switch instead: set it
+    /// `false` when the provider or gateway caches nothing, where parking
+    /// only costs wall-clock. Parked siblings hold no concurrency permit,
+    /// so the cost is latency, never throughput.
+    pub shard_cache_gating: bool,
 }
 
 impl Step4Config {
@@ -220,10 +259,13 @@ impl Step4Config {
             temperature: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
+            openai_api: None,
             timeout_secs: Some(1800),
             taint_chunk_slice: "file".to_string(),
             budget_gate: None,
             frontier_max_funcs_per_file: 24,
+            shard_cache_gating: true,
         }
     }
 }
@@ -238,12 +280,84 @@ pub enum ChunkOutcome {
     Completed,
     Error,
     Guardrail,
-    /// Never analysed at all: the scan's token or wall-clock budget was
-    /// already spent when this chunk's turn came up. Distinct from
-    /// `Error` on purpose — nothing went wrong, the work simply was not
-    /// bought, and a reader (and `bc_orchestrator::build_metrics`) must
-    /// be able to tell "we tried and failed" from "we never tried".
+    /// Never analyzed at all: the scan's token or wall-clock budget was
+    /// already spent when this chunk's turn came up, or the chunk carried
+    /// no files to analyze (see [`DeepdiveDiagnostics::empty_chunks_skipped`]).
+    /// Distinct from `Error` on purpose — nothing went wrong, the work
+    /// simply was not bought, and a reader (and
+    /// `bc_orchestrator::build_metrics`) must be able to tell "we tried
+    /// and failed" from "we never tried".
     Skipped,
+}
+
+/// Typed per-run counters from S4, for pipeline diagnostics. Plain data on
+/// the stage output (never process-global state) so concurrent scans
+/// cannot mix their numbers. Mirrors upstream's `COUNTERS` bumps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeepdiveDiagnostics {
+    /// Replies that failed to parse as a findings list and got the one
+    /// JSON repair re-ask.
+    pub json_repairs_attempted: usize,
+    /// Repair re-asks whose reply parsed as a findings list.
+    pub json_repairs_succeeded: usize,
+    /// Findings discarded by `max_findings_per_run` (upstream
+    /// `s4_findings_truncated`): real model output lost to the cap.
+    pub findings_truncated: usize,
+    /// Chunks whose vote threshold was lowered to the number of runs that
+    /// actually succeeded (upstream `s4_vote_threshold_clamped`).
+    pub vote_threshold_clamped: usize,
+    /// Chunks skipped before any model call because they carried no
+    /// files (reported as [`ChunkOutcome::Skipped`]).
+    pub empty_chunks_skipped: usize,
+    /// Shard siblings that gave up waiting for their leader to start
+    /// (upstream `s4_shard_leader_start_cap_expired`) and ran ungated, so
+    /// the shard's cache prefix may have been written twice.
+    pub leader_start_cap_expired: usize,
+    /// Shard siblings whose leader was still running at the done cap
+    /// (upstream `s4_shard_gate_cap_expired`): they paid both the wait and
+    /// the duplicate cache write the wait was meant to avoid.
+    pub gate_cap_expired: usize,
+    /// Total wall-clock milliseconds shard siblings spent parked waiting
+    /// for their leader (upstream `s4_shard_sibling_parked_seconds`, in
+    /// milliseconds here). The latency side of the gating trade.
+    pub sibling_parked_ms: u64,
+}
+
+impl DeepdiveDiagnostics {
+    fn absorb(&mut self, other: DeepdiveDiagnostics) {
+        self.json_repairs_attempted += other.json_repairs_attempted;
+        self.json_repairs_succeeded += other.json_repairs_succeeded;
+        self.findings_truncated += other.findings_truncated;
+        self.vote_threshold_clamped += other.vote_threshold_clamped;
+        self.empty_chunks_skipped += other.empty_chunks_skipped;
+        self.leader_start_cap_expired += other.leader_start_cap_expired;
+        self.gate_cap_expired += other.gate_cap_expired;
+        self.sibling_parked_ms += other.sibling_parked_ms;
+    }
+
+    /// Fold one sibling's wait into the counters, warning when a cap
+    /// expired: the sibling then runs ungated and the shard prefix is
+    /// written again, which must be visible rather than silent.
+    fn record_park(&mut self, report: shard_gate::ParkReport, chunk: &str, leader: &str) {
+        let cap = if report.start_cap_expired {
+            self.leader_start_cap_expired += 1;
+            Some(("start", shard_gate::LEADER_START_CAP))
+        } else if report.done_cap_expired {
+            self.gate_cap_expired += 1;
+            Some(("finish", shard_gate::LEADER_DONE_CAP))
+        } else {
+            None
+        };
+        if let Some((what, cap)) = cap {
+            let secs = cap.as_secs();
+            tracing::warn!(
+                "[s4] {chunk}: shard leader {leader} did not {what} within {secs}s; proceeding \
+                 ungated (the shared cache prefix may be written again)"
+            );
+        }
+        let parked_ms = u64::try_from(report.parked.as_millis()).unwrap_or(u64::MAX);
+        self.sibling_parked_ms = self.sibling_parked_ms.saturating_add(parked_ms);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -253,8 +367,10 @@ pub struct DeepdiveOutput {
     /// `Some(reason)` when [`Step4Config::budget_gate`] tripped part-way
     /// through, naming the budget and how far the stage got. The findings
     /// present are still valid; the chunks marked
-    /// [`ChunkOutcome::Skipped`] simply were not analysed.
+    /// [`ChunkOutcome::Skipped`] simply were not analyzed.
     pub budget_stop: Option<String>,
+    /// Counters for the pipeline diagnostics, see [`DeepdiveDiagnostics`].
+    pub diagnostics: DeepdiveDiagnostics,
 }
 
 /// `(runs, vote_threshold)`, ported from `_effective_runs`
@@ -309,7 +425,15 @@ async fn deepdive_chunk(
     ctx: &ContextPackage,
     repo_root: &Path,
     config: &Step4Config,
+    // The scan's `shared_context_block`, rendered once for every chunk.
+    shared: &str,
+    diag: &mut DeepdiveDiagnostics,
 ) -> Result<Vec<Finding>, ChunkError> {
+    // For a shard's lenses this `code` must come out byte-identical, or
+    // their shared cache prefix never matches. It does: loading and the
+    // neighbor context read only `files`, `size`, `focus_entry_points`,
+    // `path_funcs` and `sink_ref`, which S3 copies from the shard to
+    // every lens (see `shard_lenses_assemble_byte_identical_code`).
     let (mut code, sliced) = code_loading::load_chunk_code(chunk, ctx, repo_root, config);
     code.push_str(&neighbor::neighbor_context(
         chunk,
@@ -318,6 +442,14 @@ async fn deepdive_chunk(
         config.neighbor_context_lines,
         config.neighbor_context_max,
     ));
+    let prompt = prompt_layout::deepdive_prompt(
+        chunk,
+        ctx,
+        &code,
+        &config.taint_prompt_mode,
+        sliced,
+        shared,
+    );
 
     let (runs_n, threshold) = if chunk.specialist.is_some() {
         (config.specialist_runs, 1)
@@ -341,17 +473,15 @@ async fn deepdive_chunk(
         match single_run::single_run(
             client,
             chunk,
-            ctx,
-            &code,
+            &prompt,
             repo_root,
             &config.model,
             config.max_tokens,
             config.max_findings_per_run,
-            &config.taint_prompt_mode,
-            sliced,
             config.max_transient_retries,
             config.retry_backoff_base,
             single_run::Sampling::from_config(config),
+            diag,
         )
         .await
         {
@@ -393,6 +523,15 @@ async fn deepdive_chunk(
                 }
                 return Err(ChunkError::BudgetStopped(reason));
             }
+            Err(single_run::RunError::Halting(reason)) => {
+                // A rejected credential or a broken proxy/TLS path
+                // (VVAH-E001/E002) fails every chunk identically, exactly
+                // like quota exhaustion above: stop the stage the same way.
+                if let Some(gate) = &config.budget_gate {
+                    gate.trip(reason.clone());
+                }
+                return Err(ChunkError::BudgetStopped(reason));
+            }
             Err(single_run::RunError::GuardrailBlocked(_)) => {
                 runs.push(Vec::new());
             }
@@ -411,11 +550,143 @@ async fn deepdive_chunk(
         });
     }
 
+    // Clamp to the runs that actually SUCCEEDED, not the configured
+    // count (upstream `eff_threshold`). With runs=3/threshold=2, two failed
+    // runs leave every finding of the survivor holding one vote, so a
+    // plain `n >= threshold` would discard them all and record the chunk
+    // "completed" with zero findings: total recall loss, indistinguishable
+    // from a chunk that genuinely found nothing. `runs_ok >= 1` here.
+    let eff_threshold = threshold.min(runs_ok);
+    if eff_threshold < threshold {
+        diag.vote_threshold_clamped += 1;
+        let id = &chunk.id;
+        tracing::warn!(
+            "[s4] {id}: {runs_ok}/{runs_n} run(s) succeeded; vote_threshold {threshold} -> \
+             {eff_threshold} so the surviving run(s) can still carry a finding"
+        );
+    }
+
     Ok(vote::vote_within_chunk(
         &runs,
         config.line_bucket,
-        threshold,
+        eff_threshold,
     ))
+}
+
+/// What every chunk task shares, cloned (cheaply, all `Arc`s) per task.
+#[derive(Clone)]
+struct TaskEnv {
+    client: Arc<dyn LlmClient>,
+    ctx: Arc<ContextPackage>,
+    repo_root: Arc<PathBuf>,
+    config: Arc<Step4Config>,
+    /// The scan's `shared_context_block`, rendered once.
+    shared: Arc<str>,
+    /// `config.parallel` permits: one is held for every model call.
+    semaphore: Arc<Semaphore>,
+}
+
+type TaskResult = (Chunk, Result<Vec<Finding>, ChunkError>, DeepdiveDiagnostics);
+
+/// Spawn one task per chunk, in `chunks` order, each handed a concurrency
+/// permit at dispatch, and send every task's result down `tx`.
+///
+/// Dispatching in order (rather than spawning every task up front to race
+/// for permits) is what lets shard gating promise that a leader is always
+/// dispatched before its siblings, the way upstream's FIFO thread pool
+/// does. Aborting the returned handle drops the `JoinSet`, which aborts
+/// every task it spawned.
+fn dispatch(
+    env: TaskEnv,
+    chunks: Vec<Chunk>,
+    mut gates: std::collections::HashMap<String, shard_gate::Gate>,
+    tx: mpsc::UnboundedSender<TaskResult>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut set = JoinSet::new();
+        for chunk in chunks {
+            let permit = env
+                .semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
+            let gate = gates.remove(&chunk.id);
+            let (env, tx) = (env.clone(), tx.clone());
+            set.spawn(async move {
+                // Fails only once the stage has stopped listening (the
+                // guardrail abort), when the result is moot anyway.
+                let _ = tx.send(run_chunk_task(env, chunk, permit, gate).await);
+            });
+        }
+        drop(tx);
+        while let Some(joined) = set.join_next().await {
+            joined.expect("deepdive task panicked");
+        }
+    })
+}
+
+/// One chunk, from dispatch to result: park if it is a shard sibling
+/// whose leader is still running, consult the budget gate, then run it.
+async fn run_chunk_task(
+    env: TaskEnv,
+    chunk: Chunk,
+    mut permit: OwnedSemaphorePermit,
+    gate: Option<shard_gate::Gate>,
+) -> TaskResult {
+    let mut diag = DeepdiveDiagnostics::default();
+    let leader = match gate {
+        Some(shard_gate::Gate::Leader(leader)) => Some(leader),
+        Some(shard_gate::Gate::Sibling(mut sibling)) => {
+            if !sibling.leader_finished() {
+                // Park WITHOUT the permit. Holding it would idle a
+                // `parallel` slot for the whole leader call (upstream's
+                // documented head-of-line cost) and would make progress
+                // depend on the leader having taken its own permit first.
+                // Released, it queues for a fresh permit behind at most
+                // the one dispatch already waiting and any sibling
+                // released before it.
+                drop(permit);
+                let report = sibling.park().await;
+                diag.record_park(report, &chunk.id, sibling.leader());
+                permit = env
+                    .semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore is never closed");
+            }
+            None
+        }
+        None => None,
+    };
+    // Asked here, holding the permit the call will run under, rather than
+    // at dispatch: see `Step4Config::budget_gate`. A budget-stopped
+    // leader still releases its siblings when `leader` drops.
+    if let Some(gate) = &env.config.budget_gate {
+        if gate.should_stop() {
+            let stopped = Err(ChunkError::BudgetStopped(gate.stop_reason()));
+            return (chunk, stopped, diag);
+        }
+    }
+    if let Some(leader) = &leader {
+        leader.start();
+    }
+    let result = deepdive_chunk(
+        env.client.as_ref(),
+        &chunk,
+        env.ctx.as_ref(),
+        env.repo_root.as_path(),
+        env.config.as_ref(),
+        &env.shared,
+        &mut diag,
+    )
+    .await;
+    // Explicit, so the order is plain: the siblings are released the
+    // moment the call returns, before this task gives up its permit.
+    drop(leader);
+    drop(permit);
+    (chunk, result, diag)
 }
 
 /// Deep-dive every chunk. Bounded to `config.parallel` concurrent chunks;
@@ -450,54 +721,51 @@ async fn run_deepdive_with_progress(
     chunks.sort_by_key(|c| c.risk_rank);
     let total = chunks.len();
 
-    let repo_root: Arc<PathBuf> = Arc::new(Path::new(&input.ctx.repo_root).to_path_buf());
-    let ctx = Arc::new(input.ctx);
-    let config = Arc::new(config.clone());
-    let semaphore = Arc::new(Semaphore::new(config.parallel.max(1)));
+    // A chunk emptied by upstream normalization has nothing to analyze, so
+    // sending it to the model buys nothing but a paid-for call. S3 already
+    // drops such chunks; this is the second, independent layer (upstream
+    // v1.4.0 `run()`), so this stage never pays for one even if a producer
+    // bypasses that guard. Recorded as `Skipped`, never as `Completed`: a
+    // slice of the manifest vanishing must not read as a clean chunk.
+    let mut outcomes: BTreeMap<String, ChunkOutcome> = BTreeMap::new();
+    let mut diagnostics = DeepdiveDiagnostics::default();
+    for chunk in chunks.iter().filter(|c| c.files.is_empty()) {
+        let id = &chunk.id;
+        tracing::warn!("[s4] chunk {id}: SKIPPED, no files to analyze");
+        outcomes.insert(chunk.id.clone(), ChunkOutcome::Skipped);
+        diagnostics.empty_chunks_skipped += 1;
+    }
+    chunks.retain(|c| !c.files.is_empty());
+
+    let gates = if config.shard_cache_gating {
+        shard_gate::build_gates(&chunks, |c| {
+            prompt_layout::shares_shard_prefix(c, &config.taint_prompt_mode)
+        })
+    } else {
+        std::collections::HashMap::new()
+    };
+    let env = TaskEnv {
+        shared: Arc::from(shared_context::shared_context_block(&input.ctx)),
+        repo_root: Arc::new(Path::new(&input.ctx.repo_root).to_path_buf()),
+        ctx: Arc::new(input.ctx),
+        config: Arc::new(config.clone()),
+        semaphore: Arc::new(Semaphore::new(config.parallel.max(1))),
+        client,
+    };
     let guardrail_gate = config.parallel.max(3);
 
-    let mut set: JoinSet<(Chunk, Result<Vec<Finding>, ChunkError>)> = JoinSet::new();
-    for chunk in &chunks {
-        let chunk = chunk.clone();
-        let sem = semaphore.clone();
-        let client = client.clone();
-        let ctx = ctx.clone();
-        let repo_root = repo_root.clone();
-        let config = config.clone();
-        set.spawn(async move {
-            let _permit = sem
-                .acquire_owned()
-                .await
-                .expect("semaphore is never closed");
-            // Asked here, holding the permit, rather than before the
-            // spawn: see `Step4Config::budget_gate`.
-            if let Some(gate) = &config.budget_gate {
-                if gate.should_stop() {
-                    return (chunk, Err(ChunkError::BudgetStopped(gate.stop_reason())));
-                }
-            }
-            let result = deepdive_chunk(
-                client.as_ref(),
-                &chunk,
-                ctx.as_ref(),
-                repo_root.as_path(),
-                config.as_ref(),
-            )
-            .await;
-            (chunk, result)
-        });
-    }
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let dispatcher = dispatch(env, chunks.clone(), gates, tx);
 
     let mut results: BTreeMap<String, Vec<Finding>> = BTreeMap::new();
-    let mut outcomes: BTreeMap<String, ChunkOutcome> = BTreeMap::new();
     let mut guardrail_hits = 0usize;
     let mut successes = 0usize;
     let mut completed = 0usize;
     let mut skipped = 0usize;
     let mut budget_reason: Option<String> = None;
 
-    while let Some(joined) = set.join_next().await {
-        let (chunk, result) = joined.expect("deepdive task panicked");
+    while let Some((chunk, result, diag)) = rx.recv().await {
+        diagnostics.absorb(diag);
         completed += 1;
         bc_pipeline_core::emit(
             progress,
@@ -517,7 +785,10 @@ async fn run_deepdive_with_progress(
                 guardrail_hits += 1;
                 outcomes.insert(chunk.id.clone(), ChunkOutcome::Guardrail);
                 if guardrail_hits >= guardrail_gate && successes == 0 {
-                    set.abort_all();
+                    // Aborting the dispatcher drops its `JoinSet`, which
+                    // aborts every chunk task still queued, parked or
+                    // mid-call.
+                    dispatcher.abort();
                     return Err(StageError::new(
                         Stage4::NAME,
                         format!("{guardrail_hits} guardrail blocks with zero successful chunks — aborting run."),
@@ -534,6 +805,9 @@ async fn run_deepdive_with_progress(
             }
         }
     }
+    // Every sender is gone, so every task has ended; a task that panicked
+    // sent nothing, and the dispatcher re-raised its panic, surfaced here.
+    dispatcher.await.expect("deepdive task panicked");
 
     let mut all_findings = Vec::new();
     for chunk in &chunks {
@@ -545,7 +819,7 @@ async fn run_deepdive_with_progress(
 
     let budget_stop = budget_reason.map(|reason| {
         format!(
-            "{reason} — {} of {total} deep-dive chunk(s) analysed, {skipped} skipped",
+            "{reason} — {} of {total} deep-dive chunk(s) analyzed, {skipped} skipped",
             total - skipped
         )
     });
@@ -554,6 +828,7 @@ async fn run_deepdive_with_progress(
         findings,
         outcomes,
         budget_stop,
+        diagnostics,
     })
 }
 
@@ -619,7 +894,10 @@ mod tests {
             id: id.to_string(),
             size: ChunkSize::Small,
             risk_rank,
-            files: Vec::new(),
+            // Non-empty: a chunk with no files is skipped before any call
+            // (see `run_deepdive_with_progress`). The file need not exist;
+            // the loader degrades a missing one to a placeholder.
+            files: vec!["a.py".to_string()],
             focus_entry_points: Vec::new(),
             hypothesis: String::new(),
             related_cves: Vec::new(),
@@ -630,6 +908,7 @@ mod tests {
             source_ref: String::new(),
             sink_ref: String::new(),
             sink_cwe: Vec::new(),
+            shard_id: String::new(),
         }
     }
 
@@ -735,6 +1014,7 @@ mod tests {
             json_mode: false,
             timeout: None,
             stream: false,
+            ..ChatRequest::default()
         };
         let response = client.chat(&request).await.unwrap();
         assert_eq!(response.text(), "echo:hello");
@@ -821,7 +1101,7 @@ mod tests {
             "{reason}"
         );
         assert!(
-            reason.ends_with("2 of 5 deep-dive chunk(s) analysed, 3 skipped"),
+            reason.ends_with("2 of 5 deep-dive chunk(s) analyzed, 3 skipped"),
             "{reason}"
         );
     }
@@ -853,6 +1133,49 @@ mod tests {
         fn trip(&self, reason: String) {
             self.reason.lock().unwrap().get_or_insert(reason);
         }
+    }
+
+    fn auth_rejected(_: &str) -> Result<String, LlmError> {
+        Err(LlmError::Authentication {
+            status: Some(401),
+            message: "Incorrect API key provided".to_string(),
+        })
+    }
+
+    /// A wrong gateway key must stop S4 at the first chunk, just as an
+    /// empty account does, instead of failing all of them one by one.
+    #[tokio::test]
+    async fn an_authentication_failure_trips_the_gate_and_skips_every_remaining_chunk() {
+        let client: Arc<dyn LlmClient> = Arc::new(RoutedClient::new(auth_rejected));
+        let mut cfg = Step4Config::new("m");
+        cfg.parallel = 1;
+        cfg.retry_backoff_base = std::time::Duration::ZERO;
+        let gate = TrippableGate::untripped();
+        cfg.budget_gate = Some(gate.clone());
+        let chunks = (0..3)
+            .map(|i| chunk(&format!("c{i}"), i, None))
+            .collect::<Vec<_>>();
+        let out = run_deepdive(
+            client,
+            Step4Input {
+                chunks,
+                ctx: ContextPackage::default(),
+            },
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert!(gate.should_stop());
+        assert!(
+            out.outcomes.values().all(|o| *o == ChunkOutcome::Skipped),
+            "{:?}",
+            out.outcomes
+        );
+        let reason = out.budget_stop.unwrap();
+        assert!(
+            reason.starts_with("[VVAH-E001] authentication failed"),
+            "{reason}"
+        );
     }
 
     fn quota_exhausted(_: &str) -> Result<String, LlmError> {
@@ -902,7 +1225,7 @@ mod tests {
             "{reason}"
         );
         assert!(
-            reason.ends_with("0 of 4 deep-dive chunk(s) analysed, 4 skipped"),
+            reason.ends_with("0 of 4 deep-dive chunk(s) analyzed, 4 skipped"),
             "{reason}"
         );
     }
@@ -969,7 +1292,7 @@ mod tests {
         assert!(outcome
             .reason()
             .unwrap()
-            .contains("0 of 1 deep-dive chunk(s) analysed"));
+            .contains("0 of 1 deep-dive chunk(s) analyzed"));
         assert!(outcome.into_value().findings.is_empty());
     }
 
@@ -1234,6 +1557,117 @@ mod tests {
         assert!(out.findings.is_empty());
         assert_eq!(out.outcomes.get("c1"), Some(&ChunkOutcome::Completed));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_runs_lower_the_vote_threshold_to_the_runs_that_succeeded() {
+        // runs=3/threshold=2 with two runs failing: the survivor's finding
+        // holds one vote, and must not be voted out of a chunk that is
+        // then recorded "completed" with nothing (upstream eff_threshold).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let client: Arc<dyn LlmClient> = Arc::new(RoutedClient::new(move |_| {
+            match calls_clone.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(finding_body("a.py", 10, 0.9)),
+                _ => Err(LlmError::Other {
+                    message: "socket dropped".into(),
+                }),
+            }
+        }));
+        let mut cfg = Step4Config::new("m");
+        cfg.runs = 3;
+        cfg.vote_threshold = 2;
+        cfg.max_transient_retries = 0;
+        let out = run_deepdive(
+            client,
+            Step4Input {
+                chunks: vec![chunk("c1", 1, None)],
+                ctx: ContextPackage::default(),
+            },
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.findings.len(), 1);
+        assert_eq!(out.findings[0].votes, 1);
+        assert_eq!(out.diagnostics.vote_threshold_clamped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_chunk_with_no_files_is_skipped_without_a_model_call() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let client: Arc<dyn LlmClient> = Arc::new(RoutedClient::new(move |_| {
+            calls_clone.fetch_add(1, Ordering::SeqCst);
+            Ok(finding_body("a.py", 10, 0.9))
+        }));
+        let mut empty = chunk("empty", 1, None);
+        empty.files.clear();
+        let out = run_deepdive(
+            client,
+            Step4Input {
+                chunks: vec![empty, chunk("real", 2, None)],
+                ctx: ContextPackage::default(),
+            },
+            &Step4Config::new("m"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only the real chunk is sent"
+        );
+        assert_eq!(out.outcomes.get("empty"), Some(&ChunkOutcome::Skipped));
+        assert_eq!(out.outcomes.get("real"), Some(&ChunkOutcome::Completed));
+        assert_eq!(out.diagnostics.empty_chunks_skipped, 1);
+        assert!(
+            out.budget_stop.is_none(),
+            "an empty chunk is not a budget stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_chunk_repair_and_truncation_counts_are_summed_into_the_output() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = calls.clone();
+        let two = serde_json::json!({"findings": [
+            {"file": "a.py", "line_start": 10, "line_end": 10, "vuln_class": "injection",
+             "title": "t", "description": "d", "code_snippet": "x", "confidence": 0.9},
+            {"file": "a.py", "line_start": 90, "line_end": 90, "vuln_class": "injection",
+             "title": "u", "description": "d", "code_snippet": "x", "confidence": 0.5},
+        ]})
+        .to_string();
+        let client: Arc<dyn LlmClient> = Arc::new(RoutedClient::new(move |_| {
+            Ok(match calls_clone.fetch_add(1, Ordering::SeqCst) {
+                0 => r#"{"findigns": []}"#.to_string(),
+                _ => two.clone(),
+            })
+        }));
+        let mut cfg = Step4Config::new("m");
+        cfg.max_findings_per_run = Some(1);
+        cfg.parallel = 1;
+        let out = run_deepdive(
+            client,
+            Step4Input {
+                chunks: vec![chunk("c1", 1, None), chunk("c2", 2, None)],
+                ctx: ContextPackage::default(),
+            },
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.diagnostics,
+            DeepdiveDiagnostics {
+                json_repairs_attempted: 1,
+                json_repairs_succeeded: 1,
+                findings_truncated: 2,
+                vote_threshold_clamped: 0,
+                empty_chunks_skipped: 0,
+                ..DeepdiveDiagnostics::default()
+            }
+        );
     }
 
     #[tokio::test]

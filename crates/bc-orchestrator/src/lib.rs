@@ -46,12 +46,25 @@
 //! degrades to `None` on any failure (missing `git`, not a repo, non-zero
 //! exit), matching the Python original's `except Exception: return None`.
 
+/// Folds each stage's typed diagnostics into the report's
+/// `ScanMetrics::pipeline_diagnostics`.
+mod diagnostics;
 /// External-context loaders for `ScanInput::known_cves` /
 /// `ScanInput::design_controls` (Python: `injectors/`).
 pub mod inject;
+pub use diagnostics::autoexclude_counts;
+/// Cooperative Ctrl-C: refused model calls and skipped-stage records.
+mod cancellation;
+pub use cancellation::cancel_aware_client;
+/// The run manifest (`run_manifest.json`): what the whole invocation did,
+/// stage by stage.
+pub mod manifest;
 mod provider_assessment;
 pub mod reporting;
+mod telemetry;
+use bc_pipeline_core::StageStatus;
 use reporting::Stage9;
+use telemetry::StageRun;
 
 /// What a scan cost: provider inference, operator rate overrides, and the
 /// per-call money accumulator behind [`ScanMetrics::cost_usd`].
@@ -168,6 +181,19 @@ pub struct ScanConfig {
     /// in that order of precedence. Not a port: the Python original
     /// reports tokens and no money at all.
     pub pricing: pricing::PricingConfig,
+    /// What the `--auto-step1` survey's overlay guards decided, when that
+    /// pre-pass ran (`bc-cli` runs it before the scan, see
+    /// [`autoexclude_counts`]). Carried here only so it can reach
+    /// `ScanMetrics::pipeline_diagnostics`; the default (`ran: false`) is
+    /// "no survey ran".
+    pub autoexclude: bc_model::AutoExcludeCounts,
+    /// The run's cooperative cancellation (Ctrl-C), or `None` for a run
+    /// nothing can cancel (every library caller, and every test that does
+    /// not exercise it). Once tripped, every stage gate stops starting new
+    /// work, the stages that have not started are skipped, S8 builds the
+    /// report without a model call, and the partial report comes back
+    /// with `ScanMetrics::canceled` set. See [`cancellation`].
+    pub cancel: Option<bc_pipeline_core::CancelTokenRef>,
 }
 
 /// A budget on total scan cost (see [`ScanConfig::spend_cap`]). Both
@@ -583,6 +609,40 @@ fn push_live_findings(
     record
 }
 
+/// Largest vendor export file read into memory (256 MiB). A report is
+/// operator-supplied, but a security tool should not be taken down by one:
+/// without a cap a multi-gigabyte file was read whole before any parser
+/// limit applied. Parsers may enforce tighter limits of their own
+/// (`bc_thirdparty::checkmarx::MAX_REPORT_BYTES`).
+const MAX_VENDOR_EXPORT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Reads `path` as UTF-8, refusing anything over `max` bytes without
+/// reading past the cap (the metadata length is checked first, and the
+/// read itself is bounded in case the file grows meanwhile).
+fn read_bounded_export(path: &Path, max: u64) -> Result<String, String> {
+    use std::io::Read;
+    // One named converter rather than a closure per call: the metadata and
+    // read failures cannot be provoked portably in a test, and each closure
+    // would be a function the coverage gate counts as never run.
+    fn message(e: impl std::fmt::Display) -> String {
+        e.to_string()
+    }
+    let too_large = || format!("larger than the {max}-byte limit for a vendor export");
+    let file = std::fs::File::open(path).map_err(message)?;
+    let len = file.metadata().map_err(message)?.len();
+    if len > max {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(message)?;
+    if bytes.len() as u64 > max {
+        return Err(too_large());
+    }
+    String::from_utf8(bytes).map_err(message)
+}
+
 /// `parse` is a plain function pointer (`fn(&str) -> ...`), not a
 /// generic `impl Fn`/`F: Fn` bound — every one of the 5 vendor `parse`
 /// functions this is called with shares an identical signature and
@@ -610,7 +670,7 @@ fn load_vendor_findings(
         // test installs one, so an inlined `path.display()`/`parsed.len()`
         // is invisible to both the test suite and to coverage. Same fix,
         // same reason, as `inject`'s own skipped-record summary.
-        let text = match std::fs::read_to_string(path) {
+        let text = match read_bounded_export(path, MAX_VENDOR_EXPORT_BYTES) {
             Ok(text) => text,
             Err(e) => {
                 let msg = format!(
@@ -699,6 +759,9 @@ struct UsageTrackingClient {
     /// endpoint could not be attributed to one. See
     /// [`crate::pricing::infer_provider`].
     provider: Option<String>,
+    /// The run's Anthropic cache lifetime, which decides the write rate
+    /// (see [`crate::pricing::PricingConfig::cache_ttl`]).
+    cache_ttl: bc_llm_client::CacheTtl,
     /// Every `provider/model` this run failed to price, kept outside
     /// [`PhaseUsage`] so that stays `Copy` and so the report can name the
     /// gap once for the whole run rather than per phase.
@@ -725,12 +788,20 @@ struct UsageTrackingClient {
 /// derivable from the other three fields: see [`crate::pricing`] for why
 /// a phase's totals cannot be priced after the fact, and why this is
 /// accumulated one call at a time instead.
+///
+/// `truncated_replies` counts `LlmClient::note_truncated_reply` calls.
+/// It lives in this bucket, behind the same lock as the token counts,
+/// rather than in a free-standing `AtomicU64`, so `take` attributes a
+/// truncation to exactly the phase whose tokens it is reset with: an
+/// atomic read at a stage boundary could straddle a concurrent S4 chunk's
+/// increment and charge it to the wrong stage.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PhaseUsage {
     usage: Usage,
     calls: i64,
     calls_with_usage: i64,
     cost: pricing::PhaseCost,
+    truncated_replies: u64,
 }
 
 impl UsageTrackingClient {
@@ -740,6 +811,7 @@ impl UsageTrackingClient {
             total: Mutex::new(PhaseUsage::default()),
             pricer: pricing.pricer(),
             provider: pricing.provider.clone(),
+            cache_ttl: pricing.cache_ttl,
             unpriced_models: pricing::UnpricedModels::default(),
         }
     }
@@ -779,6 +851,7 @@ impl LlmClient for UsageTrackingClient {
                 self.provider.as_deref(),
                 &request.model,
                 response.usage,
+                self.cache_ttl,
             );
         }
         total.usage.input_tokens += response.usage.input_tokens;
@@ -790,6 +863,31 @@ impl LlmClient for UsageTrackingClient {
             self.unpriced_models.add(label);
         }
         Ok(response)
+    }
+
+    /// Counted here (see [`PhaseUsage::truncated_replies`]) and forwarded,
+    /// as the trait requires of any decorator, so a client further in
+    /// still hears about it.
+    fn note_truncated_reply(&self) {
+        self.total.lock().unwrap().truncated_replies += 1;
+        self.inner.note_truncated_reply();
+    }
+}
+
+/// One phase's spend in the shape [`bc_pipeline_core::ScanEvent::UsageUpdate`]
+/// carries, using the same billable-prompt arithmetic ([`prompt_tokens`])
+/// and "priced nothing is `None`, not `0`" rule `build_metrics` applies
+/// to `tokens_by_phase`, so the live stream and the report agree.
+fn stage_usage(phase: PhaseUsage) -> bc_pipeline_core::StageUsage {
+    bc_pipeline_core::StageUsage {
+        prompt_tokens: prompt_tokens(phase.usage),
+        completion_tokens: phase.usage.output_tokens as i64,
+        cache_read_tokens: phase.usage.cache_read_input_tokens as i64,
+        cache_write_tokens: phase.usage.cache_creation_input_tokens as i64,
+        calls: phase.calls,
+        cost_usd: (phase.cost.priced_calls() > 0).then(|| phase.cost.total().dollars_f64()),
+        unpriced_tokens: phase.cost.unpriced_tokens() as i64,
+        truncated_replies: phase.truncated_replies,
     }
 }
 
@@ -967,6 +1065,9 @@ fn build_metrics(
     // summed here.
     let mut prompt_total = 0i64;
     let mut completion_total = 0i64;
+    let mut cache_read_total = 0i64;
+    let mut cache_write_total = 0i64;
+    let mut truncated_total = 0u64;
     let mut usage_recorded = false;
     let mut run_cost = pricing::PhaseCost::default();
     let tokens_by_phase_json: BTreeMap<String, serde_json::Value> = tokens_by_phase
@@ -977,6 +1078,9 @@ fn build_metrics(
             let completion = usage.output_tokens as i64;
             prompt_total += prompt;
             completion_total += completion;
+            cache_read_total += usage.cache_read_input_tokens as i64;
+            cache_write_total += usage.cache_creation_input_tokens as i64;
+            truncated_total += phase_usage.truncated_replies;
             usage_recorded |= phase_usage.calls_with_usage > 0;
             run_cost.merge(phase_usage.cost);
             let cost = phase_usage.cost;
@@ -1016,6 +1120,11 @@ fn build_metrics(
         errors_by_stage,
         errors_log_path: String::new(),
         budget_stop: budget_stop.unwrap_or_default(),
+        // Both set by `run_scan` after this returns: the diagnostics are
+        // accumulated stage by stage, and a cancellation is read once, at
+        // the point the report is assembled.
+        canceled: false,
+        pipeline_diagnostics: bc_model::PipelineDiagnostics::default(),
         loc_in_scope_by_language,
         loc_scanned_by_language,
         raw_findings_count,
@@ -1031,7 +1140,16 @@ fn build_metrics(
         prompt_tokens: usage_recorded.then_some(prompt_total),
         completion_tokens: usage_recorded.then_some(completion_total),
         total_tokens: usage_recorded.then_some(prompt_total + completion_total),
+        cache_read_tokens: usage_recorded.then_some(cache_read_total),
+        cache_write_tokens: usage_recorded.then_some(cache_write_total),
         tokens_by_phase: usage_recorded.then_some(tokens_by_phase_json),
+        // Counted whether or not the backend reported usage: a truncation
+        // is a lost result, which is a fact about the run regardless of
+        // what the provider said it cost.
+        llm_truncated_replies: truncated_total as i64,
+        // Filled in by `run_scan` once the report exists; this function
+        // only sees the stages up to S7.
+        stage_timings: BTreeMap::new(),
         // Same "`None`, not `Some(0)`" rule as the token fields above,
         // and for a sharper reason: a run whose model this build has no
         // rate for did not cost nothing, it cost an amount nobody here
@@ -1090,6 +1208,19 @@ fn cap_tripped_by(cap: &SpendCap, spent: u64, elapsed: std::time::Duration) -> O
     None
 }
 
+/// Why the scan must stop at an S4-S7 stage boundary: an operator's
+/// cancellation first (it explains the stop whatever else is true), then
+/// the spend cap.
+fn boundary_stop(
+    cancel: Option<&bc_pipeline_core::CancelTokenRef>,
+    cap: Option<&SpendCap>,
+    tokens_by_phase: &BTreeMap<String, PhaseUsage>,
+    scan_start: std::time::Instant,
+) -> Option<String> {
+    bc_pipeline_core::canceled(cancel)
+        .or_else(|| spend_cap_exceeded(cap, tokens_by_phase, scan_start))
+}
+
 /// Checked at S4-S7 stage boundaries — see [`ScanConfig::spend_cap`].
 /// `cap: None` never trips (the default, fully-unbounded scan).
 fn spend_cap_exceeded(
@@ -1133,6 +1264,9 @@ struct SpendGate {
     /// write itself; a `Mutex<Option<String>>` is also what the stage
     /// crates' own trippable test gates use.
     external: std::sync::Mutex<Option<String>>,
+    /// The run-wide cancellation, shared by every stage's gate (unlike
+    /// `external`, which belongs to this one stage's gate).
+    cancel: Option<bc_pipeline_core::CancelTokenRef>,
 }
 
 impl SpendGate {
@@ -1142,6 +1276,11 @@ impl SpendGate {
     /// the operator set — and when both apply, the provider's is the one
     /// that explains what actually happened.
     fn tripped(&self) -> Option<String> {
+        // An operator's cancellation outranks everything: it is the reason
+        // the run is stopping, whatever else is also true.
+        if let Some(reason) = bc_pipeline_core::canceled(self.cancel.as_ref()) {
+            return Some(reason);
+        }
         // `unwrap`, matching `UsageTrackingClient`'s own locking: the only
         // code this mutex ever guards is a `clone` and a `get_or_insert`,
         // neither of which can panic, so the lock cannot become poisoned.
@@ -1166,6 +1305,7 @@ impl std::fmt::Debug for SpendGate {
             .field("cap", &self.cap)
             .field("baseline_tokens", &self.baseline_tokens)
             .field("external", &self.external)
+            .field("cancel", &self.cancel)
             .finish_non_exhaustive()
     }
 }
@@ -1208,6 +1348,7 @@ fn budget_gate(
     tracker: &Arc<UsageTrackingClient>,
     tokens_by_phase: &BTreeMap<String, PhaseUsage>,
     scan_start: std::time::Instant,
+    cancel: Option<&bc_pipeline_core::CancelTokenRef>,
 ) -> Option<bc_pipeline_core::BudgetGateRef> {
     Some(Arc::new(SpendGate {
         cap: cap.copied(),
@@ -1215,6 +1356,7 @@ fn budget_gate(
         baseline_tokens: recorded_tokens(tokens_by_phase),
         scan_start,
         external: std::sync::Mutex::new(None),
+        cancel: cancel.cloned(),
     }))
 }
 
@@ -1280,8 +1422,7 @@ fn record_usage(
         progress,
         bc_pipeline_core::ScanEvent::UsageUpdate {
             stage,
-            prompt_tokens: prompt_tokens(usage.usage),
-            completion_tokens: usage.usage.output_tokens as i64,
+            usage: stage_usage(usage),
         },
     );
 }
@@ -1303,22 +1444,111 @@ struct Step2Checkpoint {
     degraded: bool,
 }
 
+/// Whether a threat model says anything at all, Python's
+/// `tm.threats or tm.assets or tm.trust_boundaries` save gate.
+fn threat_model_has_content(tm: &bc_model::ThreatModel) -> bool {
+    !(tm.threats.is_empty() && tm.assets.is_empty() && tm.trust_boundaries.is_empty())
+}
+
+/// S2's stage-done counters (`scan.py`: `assets= boundaries= threats=`);
+/// none at all when there is no model.
+fn threat_model_counts(tm: Option<&bc_model::ThreatModel>) -> Vec<(&'static str, u64)> {
+    tm.map(|tm| {
+        vec![
+            ("assets", telemetry::count(tm.assets.len())),
+            ("boundaries", telemetry::count(tm.trust_boundaries.len())),
+            ("threats", telemetry::count(tm.threats.len())),
+        ]
+    })
+    .unwrap_or_default()
+}
+
 #[derive(Serialize, Deserialize)]
 struct Step3Checkpoint {
     manifest: TaskManifest,
     degraded: bool,
 }
 
-/// S4's checkpoint deliberately does NOT persist `chunk_outcomes` — it
-/// only feeds one coarse `ScanMetrics::errors_by_stage["s4"]` count (see
-/// `build_metrics`'s own doc comment on that field already being an
-/// honestly-scoped, coarser-than-Python signal), not anything a resumed
-/// scan's correctness depends on. A cache hit reports zero failed chunks
-/// rather than adding a fifth field/dependency on `bc_stage_s4::
-/// ChunkOutcome` deriving `Serialize`/`Deserialize` for this alone.
+/// S4's checkpoint carries the per-chunk outcomes alongside the findings,
+/// as Python's does (`scan.py`: "Bundle the per-chunk outcomes with the
+/// findings so a --resume that rebuilds metrics still sees the coverage
+/// tally"). It used to drop them, so a resumed scan reported zero failed
+/// chunks and a clean `errors_by_stage` for an S4 that had in fact lost
+/// chunks: the one run a reader most needs to be told about.
+///
+/// `#[serde(default)]` keeps an older, findings-only row loadable; like
+/// Python's legacy bare-list checkpoint, it resumes with no outcomes.
 #[derive(Serialize, Deserialize)]
 struct Step4Checkpoint {
     findings: Vec<Finding>,
+    #[serde(default)]
+    outcomes: BTreeMap<String, CheckpointChunkOutcome>,
+}
+
+/// A serde-able mirror of [`bc_stage_s4::ChunkOutcome`], which derives no
+/// `serde` of its own; the stage crate owns the type, this crate owns the
+/// checkpoint format. Spelled exactly as [`outcome_str`] spells the same
+/// values, which is Python's own checkpoint vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckpointChunkOutcome {
+    Completed,
+    Error,
+    Guardrail,
+    Skipped,
+}
+
+impl From<bc_stage_s4::ChunkOutcome> for CheckpointChunkOutcome {
+    fn from(outcome: bc_stage_s4::ChunkOutcome) -> Self {
+        match outcome {
+            bc_stage_s4::ChunkOutcome::Completed => CheckpointChunkOutcome::Completed,
+            bc_stage_s4::ChunkOutcome::Error => CheckpointChunkOutcome::Error,
+            bc_stage_s4::ChunkOutcome::Guardrail => CheckpointChunkOutcome::Guardrail,
+            bc_stage_s4::ChunkOutcome::Skipped => CheckpointChunkOutcome::Skipped,
+        }
+    }
+}
+
+impl From<CheckpointChunkOutcome> for bc_stage_s4::ChunkOutcome {
+    fn from(outcome: CheckpointChunkOutcome) -> Self {
+        match outcome {
+            CheckpointChunkOutcome::Completed => bc_stage_s4::ChunkOutcome::Completed,
+            CheckpointChunkOutcome::Error => bc_stage_s4::ChunkOutcome::Error,
+            CheckpointChunkOutcome::Guardrail => bc_stage_s4::ChunkOutcome::Guardrail,
+            CheckpointChunkOutcome::Skipped => bc_stage_s4::ChunkOutcome::Skipped,
+        }
+    }
+}
+
+/// S4's stage-done counters and status from its per-chunk outcomes, the
+/// same whether the outcomes came from a live run or a checkpoint:
+/// `findings`, plus how many chunks there were and how many failed or were
+/// skipped by the budget. Failed chunks or a budget stop close S4 as
+/// `CompletedWithErrors`, the Python original's rule for a stage that
+/// returned but logged unrecovered errors.
+fn s4_counts(
+    findings: usize,
+    outcomes: &BTreeMap<String, bc_stage_s4::ChunkOutcome>,
+) -> Vec<(&'static str, u64)> {
+    let failed = outcomes
+        .values()
+        .filter(|o| {
+            !matches!(
+                o,
+                bc_stage_s4::ChunkOutcome::Completed | bc_stage_s4::ChunkOutcome::Skipped
+            )
+        })
+        .count();
+    let skipped = outcomes
+        .values()
+        .filter(|o| **o == bc_stage_s4::ChunkOutcome::Skipped)
+        .count();
+    vec![
+        ("findings", telemetry::count(findings)),
+        ("chunks", telemetry::count(outcomes.len())),
+        ("chunks_failed", telemetry::count(failed)),
+        ("chunks_skipped", telemetry::count(skipped)),
+    ]
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1326,6 +1556,19 @@ struct Step5Checkpoint {
     findings: Vec<Finding>,
     dropped: Vec<DroppedFinding>,
     degraded: bool,
+}
+
+/// The `kept=`/`verified=`/`canonical=` plus `dropped=` pair S5, S6 and
+/// S7 report on their stage-done line (`scan.py`'s `_sp_done` details).
+fn kept_dropped_counts(
+    kept_name: &'static str,
+    kept: &[Finding],
+    dropped: &[DroppedFinding],
+) -> Vec<(&'static str, u64)> {
+    vec![
+        (kept_name, telemetry::count(kept.len())),
+        ("dropped", telemetry::count(dropped.len())),
+    ]
 }
 
 /// S6 has no degrade concept of its own (see the original, unchecked-
@@ -1395,6 +1638,18 @@ pub async fn run_scan(
     }
     let checkpoint = config.checkpoint.as_deref();
     let progress = config.progress.as_ref();
+    let mut stage_timings = telemetry::StageTimings::new();
+    // One accumulator per scan, filled as each stage returns its own typed
+    // counters. A stage restored from a checkpoint did not run this time
+    // and contributes nothing.
+    let mut pipeline_diag = diagnostics::seeded(&config.autoexclude);
+    // Checked at every stage boundary: a canceled run starts no further
+    // stage, and saves no checkpoint for a gated stage (S4-S7) it may have
+    // cut short, so a later `--resume` re-runs that stage in full rather
+    // than inheriting its partial result.
+    let cancel = config.cancel.clone();
+    let canceled_now = || bc_pipeline_core::canceled(cancel.as_ref());
+    let live_checkpoint = || checkpoint.filter(|_| canceled_now().is_none());
 
     // ── Step 0 — Static seed (profile-controlled) ────────────────────
     // `rules` mode is pure static analysis (zero tokens); `llm` mode
@@ -1403,13 +1658,10 @@ pub async fn run_scan(
     // `Stage0::run` never degrades (an empty seed on any failure is
     // itself a valid, non-degraded outcome — see `bc_stage_s0::
     // SeedPackage::has_content`), so nothing to add to `errors_by_stage`.
-    let seed = if config.step0_enabled {
-        bc_pipeline_core::emit(
-            progress,
-            bc_pipeline_core::ScanEvent::StageStarted {
-                stage: Stage0::NAME,
-            },
-        );
+    let s0_skip = canceled_now()
+        .or_else(|| (!config.step0_enabled).then(|| "disabled in config".to_string()));
+    let seed = if s0_skip.is_none() {
+        let s0_run = StageRun::start(progress, Stage0::NAME);
         // The seed plane walks the SAME scope the survey does: S1 reuses
         // the seed's file inventory when one is present, so a step-0 walk
         // that ignored `step1.exclude_dirs` would silently widen the whole
@@ -1429,73 +1681,83 @@ pub async fn run_scan(
             Stage0::NAME,
             tracker.take(),
         );
-        bc_pipeline_core::emit(
+        s0_run.finish(
             progress,
-            bc_pipeline_core::ScanEvent::StageFinished {
-                stage: Stage0::NAME,
-                degraded: false,
-            },
+            &mut stage_timings,
+            StageStatus::Completed,
+            vec![
+                ("entry_points", telemetry::count(outcome.entry_points.len())),
+                ("sinks", telemetry::count(outcome.unsafe_sinks.len())),
+            ],
+            None,
         );
         Some(outcome)
     } else {
+        telemetry::record_unstarted(
+            progress,
+            &mut stage_timings,
+            Stage0::NAME,
+            StageStatus::Skipped,
+            s0_skip,
+        );
         None
     };
 
     // ── Step 1 — Pre-process ────────────────────────────────────────
-    bc_pipeline_core::emit(
-        progress,
-        bc_pipeline_core::ScanEvent::StageStarted {
-            stage: Stage1::NAME,
-        },
-    );
-    let mut ctx = if let Some(cached) =
-        load_checkpoint::<Step1Checkpoint>(checkpoint, config.resume, &run_id, "s1")
-    {
-        if cached.degraded {
-            errors_by_stage.insert("s1".to_string(), 1);
-        }
-        bc_pipeline_core::emit(
-            progress,
-            bc_pipeline_core::ScanEvent::StageFinished {
-                stage: Stage1::NAME,
-                degraded: cached.degraded,
-            },
-        );
-        cached.ctx
+    let mut ctx = if let Some(reason) = canceled_now() {
+        cancellation::skip_stages(progress, &mut stage_timings, &[Stage1::NAME], &reason);
+        cancellation::empty_context(&input.repo_root)
     } else {
-        let stage1 = Stage1::new(llm.clone(), tools.clone(), config.step1);
-        let s1_input = Step1Input {
-            repo_root: input.repo_root.clone(),
-            known_cves: input.known_cves.clone(),
-            design_controls: input.design_controls.clone(),
-            changed_files: input.changed_files.clone(),
-            diff_scope_active: input.diff_scope_active,
-            compliance_guidance: bc_compliance::combined_guidance(&input.compliance),
-            seed,
-        };
-        let s1_outcome = stage1.run(s1_input).await?;
-        let degraded = s1_outcome.is_degraded();
-        if degraded {
-            errors_by_stage.insert("s1".to_string(), 1);
+        let s1_run = StageRun::start(progress, Stage1::NAME);
+        if let Some(cached) =
+            load_checkpoint::<Step1Checkpoint>(checkpoint, config.resume, &run_id, "s1")
+        {
+            if cached.degraded {
+                errors_by_stage.insert("s1".to_string(), 1);
+            }
+            s1_run.finish(
+                progress,
+                &mut stage_timings,
+                StageStatus::Cached,
+                vec![("files", telemetry::count(cached.ctx.all_files.len()))],
+                None,
+            );
+            cached.ctx
+        } else {
+            let stage1 = Stage1::new(llm.clone(), tools.clone(), config.step1);
+            let s1_input = Step1Input {
+                repo_root: input.repo_root.clone(),
+                known_cves: input.known_cves.clone(),
+                design_controls: input.design_controls.clone(),
+                changed_files: input.changed_files.clone(),
+                diff_scope_active: input.diff_scope_active,
+                compliance_guidance: bc_compliance::combined_guidance(&input.compliance),
+                seed,
+            };
+            let s1_outcome = stage1.run(s1_input).await?;
+            let degraded = s1_outcome.is_degraded();
+            if degraded {
+                errors_by_stage.insert("s1".to_string(), 1);
+            }
+            let ctx = s1_outcome.into_value();
+            save_checkpoint(
+                checkpoint,
+                &run_id,
+                "s1",
+                &Step1Checkpoint {
+                    ctx: ctx.clone(),
+                    degraded,
+                },
+            );
+            s1_run.finish(
+                progress,
+                &mut stage_timings,
+                StageStatus::from_degraded(degraded),
+                vec![("files", telemetry::count(ctx.all_files.len()))],
+                None,
+            );
+            ctx
         }
-        let ctx = s1_outcome.into_value();
-        save_checkpoint(
-            checkpoint,
-            &run_id,
-            "s1",
-            &Step1Checkpoint {
-                ctx: ctx.clone(),
-                degraded,
-            },
-        );
-        bc_pipeline_core::emit(
-            progress,
-            bc_pipeline_core::ScanEvent::StageFinished {
-                stage: Stage1::NAME,
-                degraded,
-            },
-        );
-        ctx
     };
     ctx.app_profile = app_profile.clone();
     record_usage(
@@ -1510,31 +1772,39 @@ pub async fn run_scan(
     }
 
     // ── Step 2 — Threat model (optional; catch-and-continue) ────────
-    let threat_model = if !config.step2_enabled {
+    let threat_model = if let Some(reason) = canceled_now() {
+        cancellation::skip_stages(progress, &mut stage_timings, &[Stage2::NAME], &reason);
+        None
+    } else if !config.step2_enabled {
+        telemetry::record_unstarted(
+            progress,
+            &mut stage_timings,
+            Stage2::NAME,
+            StageStatus::Skipped,
+            Some("disabled in config".to_string()),
+        );
         None
     } else {
-        bc_pipeline_core::emit(
-            progress,
-            bc_pipeline_core::ScanEvent::StageStarted {
-                stage: Stage2::NAME,
-            },
-        );
+        let s2_run = StageRun::start(progress, Stage2::NAME);
         if let Some(cached) =
             load_checkpoint::<Step2Checkpoint>(checkpoint, config.resume, &run_id, "s2")
         {
             if cached.degraded {
                 errors_by_stage.insert("s2".to_string(), 1);
             }
-            bc_pipeline_core::emit(
+            s2_run.finish(
                 progress,
-                bc_pipeline_core::ScanEvent::StageFinished {
-                    stage: Stage2::NAME,
-                    degraded: cached.degraded,
-                },
+                &mut stage_timings,
+                StageStatus::Cached,
+                threat_model_counts(cached.threat_model.as_ref()),
+                None,
             );
             cached.threat_model
         } else {
-            let stage2 = Stage2::new(llm.clone(), config.step2);
+            // `with_tools` is what lets `step2.agentic: true` run its
+            // read-only, repo-jailed session; without it S2 is always
+            // single-shot.
+            let stage2 = Stage2::new(llm.clone(), config.step2).with_tools(tools.clone());
             let s2_input = Step2Input {
                 repo_root: input.repo_root.clone(),
                 repo_name: input.repo_name.clone(),
@@ -1543,29 +1813,50 @@ pub async fn run_scan(
                 ctx: ctx.clone(),
                 app_profile: app_profile.clone(),
             };
-            let s2_result = stage2.run(s2_input).await;
-            let degraded = s2_result.as_ref().map(|o| o.is_degraded()).unwrap_or(true);
+            // `run_detailed` rather than `PipelineStage::run`: the same
+            // stage, but it hands back the counters `run` drops. S2 has no
+            // degraded-`Ok` outcome of its own, so `Err` is the only way it
+            // degrades, exactly as before.
+            let s2_result = stage2.run_detailed(s2_input).await;
+            let degraded = s2_result.is_err();
             if degraded {
                 errors_by_stage.insert("s2".to_string(), 1);
             }
-            let threat_model = s2_result
-                .ok()
-                .map(bc_pipeline_core::StageOutcome::into_value);
-            save_checkpoint(
-                checkpoint,
-                &run_id,
-                "s2",
-                &Step2Checkpoint {
-                    threat_model: threat_model.clone(),
-                    degraded,
-                },
+            // An `Err` is Python's `outcome="error"` branch: the stage
+            // failed and the scan continues with no threat model at all.
+            let (status, detail) = match &s2_result {
+                Ok(_) => (StageStatus::Completed, None),
+                Err(e) => (StageStatus::Error, Some(bc_redact::redact(&e.to_string()))),
+            };
+            let (threat_model, s2_diag) = match s2_result {
+                Ok((tm, diag)) => (Some(tm), diag),
+                Err(_) => (None, bc_stage_s2::ThreatModelDiagnostics::default()),
+            };
+            pipeline_diag.threat_model = diagnostics::threat_model_counts(
+                &s2_diag,
+                threat_model.as_ref().is_none_or(|tm| tm.threats.is_empty()),
             );
-            bc_pipeline_core::emit(
+            // Only a real, non-degraded model is worth resuming from
+            // (`scan.py`: checkpointing an empty model "would make
+            // `--resume` inherit it forever and s2 would never re-run").
+            // A degraded or failed S2 is left for the next run to retry.
+            if !degraded && threat_model.as_ref().is_some_and(threat_model_has_content) {
+                save_checkpoint(
+                    checkpoint,
+                    &run_id,
+                    "s2",
+                    &Step2Checkpoint {
+                        threat_model: threat_model.clone(),
+                        degraded,
+                    },
+                );
+            }
+            s2_run.finish(
                 progress,
-                bc_pipeline_core::ScanEvent::StageFinished {
-                    stage: Stage2::NAME,
-                    degraded,
-                },
+                &mut stage_timings,
+                status,
+                threat_model_counts(threat_model.as_ref()),
+                detail,
             );
             threat_model
         }
@@ -1583,51 +1874,54 @@ pub async fn run_scan(
     }
 
     // ── Step 3 — Decompose ───────────────────────────────────────────
-    bc_pipeline_core::emit(
-        progress,
-        bc_pipeline_core::ScanEvent::StageStarted {
-            stage: Stage3::NAME,
-        },
-    );
-    let manifest = if let Some(cached) =
-        load_checkpoint::<Step3Checkpoint>(checkpoint, config.resume, &run_id, "s3")
-    {
-        if cached.degraded {
-            errors_by_stage.insert("s3".to_string(), 1);
-        }
-        bc_pipeline_core::emit(
-            progress,
-            bc_pipeline_core::ScanEvent::StageFinished {
-                stage: Stage3::NAME,
-                degraded: cached.degraded,
-            },
-        );
-        cached.manifest
+    let manifest = if let Some(reason) = canceled_now() {
+        cancellation::skip_stages(progress, &mut stage_timings, &[Stage3::NAME], &reason);
+        cancellation::empty_manifest()
     } else {
-        let stage3 = Stage3::new(llm.clone(), config.step3);
-        let s3_outcome = stage3.run(Step3Input { ctx: ctx.clone() }).await?;
-        let degraded = s3_outcome.is_degraded();
-        if degraded {
-            errors_by_stage.insert("s3".to_string(), 1);
+        let s3_run = StageRun::start(progress, Stage3::NAME);
+        if let Some(cached) =
+            load_checkpoint::<Step3Checkpoint>(checkpoint, config.resume, &run_id, "s3")
+        {
+            if cached.degraded {
+                errors_by_stage.insert("s3".to_string(), 1);
+            }
+            s3_run.finish(
+                progress,
+                &mut stage_timings,
+                StageStatus::Cached,
+                vec![("chunks", telemetry::count(cached.manifest.chunks.len()))],
+                None,
+            );
+            cached.manifest
+        } else {
+            let stage3 = Stage3::new(llm.clone(), config.step3);
+            let (s3_outcome, s3_diag) = stage3
+                .run_with_diagnostics(Step3Input { ctx: ctx.clone() })
+                .await?;
+            pipeline_diag.decompose = diagnostics::decompose_counts(&s3_diag);
+            let degraded = s3_outcome.is_degraded();
+            if degraded {
+                errors_by_stage.insert("s3".to_string(), 1);
+            }
+            let manifest = s3_outcome.into_value();
+            save_checkpoint(
+                checkpoint,
+                &run_id,
+                "s3",
+                &Step3Checkpoint {
+                    manifest: manifest.clone(),
+                    degraded,
+                },
+            );
+            s3_run.finish(
+                progress,
+                &mut stage_timings,
+                StageStatus::from_degraded(degraded),
+                vec![("chunks", telemetry::count(manifest.chunks.len()))],
+                None,
+            );
+            manifest
         }
-        let manifest = s3_outcome.into_value();
-        save_checkpoint(
-            checkpoint,
-            &run_id,
-            "s3",
-            &Step3Checkpoint {
-                manifest: manifest.clone(),
-                degraded,
-            },
-        );
-        bc_pipeline_core::emit(
-            progress,
-            bc_pipeline_core::ScanEvent::StageFinished {
-                stage: Stage3::NAME,
-                degraded,
-            },
-        );
-        manifest
     };
     record_usage(
         &mut tokens_by_phase,
@@ -1683,22 +1977,27 @@ pub async fn run_scan(
 
     'pipeline: {
         // ── Step 4 — Deep-dive ───────────────────────────────────────
-        bc_pipeline_core::emit(
-            progress,
-            bc_pipeline_core::ScanEvent::StageStarted {
-                stage: Stage4::NAME,
-            },
-        );
-        let deepdive_findings: Vec<Finding> = if let Some(cached) =
-            load_checkpoint::<Step4Checkpoint>(checkpoint, config.resume, &run_id, "s4")
-        {
-            chunk_outcomes = BTreeMap::new();
-            bc_pipeline_core::emit(
+        let s4_run = StageRun::start(progress, Stage4::NAME);
+        let s4_checkpoint =
+            load_checkpoint::<Step4Checkpoint>(checkpoint, config.resume, &run_id, "s4");
+        // Resume chaining (`scan.py`: "A valid S5 row can only be reused
+        // when its S4 prerequisite was also restored"): a downstream
+        // checkpoint is only consulted when the stage feeding it was
+        // itself restored. Once any stage re-runs, every later row
+        // describes inputs this run no longer has and is stale.
+        let s4_resumed = s4_checkpoint.is_some();
+        let deepdive_findings: Vec<Finding> = if let Some(cached) = s4_checkpoint {
+            chunk_outcomes = cached
+                .outcomes
+                .into_iter()
+                .map(|(id, outcome)| (id, outcome.into()))
+                .collect();
+            s4_run.finish(
                 progress,
-                bc_pipeline_core::ScanEvent::StageFinished {
-                    stage: Stage4::NAME,
-                    degraded: false,
-                },
+                &mut stage_timings,
+                StageStatus::Cached,
+                s4_counts(cached.findings.len(), &chunk_outcomes),
+                None,
             );
             cached.findings
         } else {
@@ -1708,6 +2007,7 @@ pub async fn run_scan(
                 &tracker,
                 &tokens_by_phase,
                 scan_start,
+                cancel.as_ref(),
             );
             let stage4 = Stage4::new(llm.clone(), step4).with_progress(progress.cloned());
             let chunks: Vec<Chunk> = manifest.sorted_chunks().into_iter().cloned().collect();
@@ -1721,21 +2021,30 @@ pub async fn run_scan(
             if let Some(reason) = deepdive.budget_stop.clone() {
                 budget_stop.get_or_insert(format!("S4: {reason}"));
             }
+            pipeline_diag.deepdive = diagnostics::deepdive_counts(&deepdive.diagnostics);
             chunk_outcomes = deepdive.outcomes.clone();
             save_checkpoint(
-                checkpoint,
+                live_checkpoint(),
                 &run_id,
                 "s4",
                 &Step4Checkpoint {
                     findings: deepdive.findings.clone(),
+                    outcomes: chunk_outcomes
+                        .iter()
+                        .map(|(id, outcome)| (id.clone(), (*outcome).into()))
+                        .collect(),
                 },
             );
-            bc_pipeline_core::emit(
+            let counts = s4_counts(deepdive.findings.len(), &chunk_outcomes);
+            let lost_chunks = counts
+                .iter()
+                .any(|(name, n)| *name == "chunks_failed" && *n > 0);
+            s4_run.finish(
                 progress,
-                bc_pipeline_core::ScanEvent::StageFinished {
-                    stage: Stage4::NAME,
-                    degraded: deepdive.budget_stop.is_some(),
-                },
+                &mut stage_timings,
+                StageStatus::from_degraded(lost_chunks || deepdive.budget_stop.is_some()),
+                counts,
+                deepdive.budget_stop.as_deref().map(bc_redact::redact),
             );
             deepdive.findings
         };
@@ -1758,34 +2067,41 @@ pub async fn run_scan(
         if stop_after == Some(StopAfter::S4) {
             return Ok(stopped(StopAfter::S4));
         }
-        if let Some(reason) =
-            spend_cap_exceeded(config.spend_cap.as_ref(), &tokens_by_phase, scan_start)
-        {
+        if let Some(reason) = boundary_stop(
+            cancel.as_ref(),
+            config.spend_cap.as_ref(),
+            &tokens_by_phase,
+            scan_start,
+        ) {
             budget_stop.get_or_insert(format!("{reason}; stopped before S5"));
             all_dropped.extend(unverified_by_budget(&mut canonical, &reason));
+            cancellation::skip_stages(
+                progress,
+                &mut stage_timings,
+                &[Stage5::NAME, Stage6::NAME, Stage7::NAME],
+                &reason,
+            );
             break 'pipeline;
         }
 
         // ── Step 5 — Pre-filter ──────────────────────────────────────
-        bc_pipeline_core::emit(
-            progress,
-            bc_pipeline_core::ScanEvent::StageStarted {
-                stage: Stage5::NAME,
-            },
+        let s5_run = StageRun::start(progress, Stage5::NAME);
+        let s5_checkpoint = load_checkpoint::<Step5Checkpoint>(
+            checkpoint, // `s4_resumed` already implies `config.resume`.
+            s4_resumed, &run_id, "s5",
         );
+        let s5_resumed = s5_checkpoint.is_some();
         let (mut prefiltered_findings, prefiltered_dropped): (Vec<Finding>, Vec<DroppedFinding>) =
-            if let Some(cached) =
-                load_checkpoint::<Step5Checkpoint>(checkpoint, config.resume, &run_id, "s5")
-            {
+            if let Some(cached) = s5_checkpoint {
                 if cached.degraded {
                     errors_by_stage.insert("s5".to_string(), 1);
                 }
-                bc_pipeline_core::emit(
+                s5_run.finish(
                     progress,
-                    bc_pipeline_core::ScanEvent::StageFinished {
-                        stage: Stage5::NAME,
-                        degraded: cached.degraded,
-                    },
+                    &mut stage_timings,
+                    StageStatus::Cached,
+                    kept_dropped_counts("kept", &cached.findings, &cached.dropped),
+                    None,
                 );
                 (cached.findings, cached.dropped)
             } else {
@@ -1798,23 +2114,28 @@ pub async fn run_scan(
                     &tracker,
                     &tokens_by_phase,
                     scan_start,
+                    cancel.as_ref(),
                 );
-                let stage5 = Stage5::new(llm.clone(), step5);
                 let s5_input = Step5Input {
                     findings: deepdive_findings,
                     ctx: ctx.clone(),
                 };
-                let s5_outcome = stage5.run(s5_input).await?;
-                let degraded = s5_outcome.is_degraded();
+                // The free function behind `Stage5::run`, called directly
+                // for the counters `run` drops; its degrade reason is the
+                // one `run` would have wrapped in `StageOutcome::Degraded`.
+                let (prefiltered, s5_reason, s5_diag) =
+                    bc_stage_s5::run_prefilter_with_diagnostics(llm.as_ref(), &s5_input, &step5)
+                        .await;
+                pipeline_diag.prefilter = diagnostics::prefilter_counts(&s5_diag);
+                let degraded = s5_reason.is_some();
                 if degraded {
                     errors_by_stage.insert("s5".to_string(), 1);
                     budget_stop = budget_stop
                         .take()
-                        .or_else(|| budget_skip_reason("S5", s5_outcome.reason()));
+                        .or_else(|| budget_skip_reason("S5", s5_reason.as_deref()));
                 }
-                let prefiltered = s5_outcome.into_value();
                 save_checkpoint(
-                    checkpoint,
+                    live_checkpoint(),
                     &run_id,
                     "s5",
                     &Step5Checkpoint {
@@ -1823,12 +2144,12 @@ pub async fn run_scan(
                         degraded,
                     },
                 );
-                bc_pipeline_core::emit(
+                s5_run.finish(
                     progress,
-                    bc_pipeline_core::ScanEvent::StageFinished {
-                        stage: Stage5::NAME,
-                        degraded,
-                    },
+                    &mut stage_timings,
+                    StageStatus::from_degraded(degraded),
+                    kept_dropped_counts("kept", &prefiltered.findings, &prefiltered.dropped),
+                    None,
                 );
                 (prefiltered.findings, prefiltered.dropped)
             };
@@ -1871,26 +2192,35 @@ pub async fn run_scan(
         if stop_after == Some(StopAfter::S5) {
             return Ok(stopped(StopAfter::S5));
         }
-        if let Some(reason) =
-            spend_cap_exceeded(config.spend_cap.as_ref(), &tokens_by_phase, scan_start)
-        {
+        if let Some(reason) = boundary_stop(
+            cancel.as_ref(),
+            config.spend_cap.as_ref(),
+            &tokens_by_phase,
+            scan_start,
+        ) {
             budget_stop.get_or_insert(format!("{reason}; stopped before S6"));
             all_dropped.extend(prefiltered_dropped);
             all_dropped.extend(unverified_by_budget(&mut canonical, &reason));
+            cancellation::skip_stages(
+                progress,
+                &mut stage_timings,
+                &[Stage6::NAME, Stage7::NAME],
+                &reason,
+            );
             break 'pipeline;
         }
 
         // ── Step 6 — Verify ────────────────────────────────────────────
-        bc_pipeline_core::emit(
-            progress,
-            bc_pipeline_core::ScanEvent::StageStarted {
-                stage: Stage6::NAME,
-            },
-        );
+        let s6_run = StageRun::start(progress, Stage6::NAME);
+        let s6_checkpoint =
+            load_checkpoint::<Step6Checkpoint>(checkpoint, s5_resumed, &run_id, "s6");
+        let s6_resumed = s6_checkpoint.is_some();
+        // S6's status: cached, or a budget stop inside it (the one way it
+        // returns having done less than it was asked).
+        let mut s6_status = StageStatus::Cached;
+        let mut s6_detail = None;
         let (verified_findings, verified_dropped): (Vec<Finding>, Vec<DroppedFinding>) =
-            if let Some(cached) =
-                load_checkpoint::<Step6Checkpoint>(checkpoint, config.resume, &run_id, "s6")
-            {
+            if let Some(cached) = s6_checkpoint {
                 (cached.verified, cached.dropped)
             } else {
                 let mut step6 = config.step6;
@@ -1899,18 +2229,23 @@ pub async fn run_scan(
                     &tracker,
                     &tokens_by_phase,
                     scan_start,
+                    cancel.as_ref(),
                 );
-                let stage6 = Stage6::new(llm.clone(), tools.clone(), step6);
+                let stage6 =
+                    Stage6::new(llm.clone(), tools.clone(), step6).with_progress(progress.cloned());
                 let s6_input = Step6Input {
                     findings: prefiltered_findings,
                     ctx: ctx.clone(),
                 };
                 let verified = stage6.run(s6_input).await?.into_value();
+                s6_status = StageStatus::from_degraded(verified.budget_stop.is_some());
+                s6_detail = verified.budget_stop.as_deref().map(bc_redact::redact);
                 if let Some(reason) = verified.budget_stop.clone() {
                     budget_stop.get_or_insert(format!("S6: {reason}"));
                 }
+                pipeline_diag.verify = diagnostics::verify_counts(&verified.diagnostics);
                 save_checkpoint(
-                    checkpoint,
+                    live_checkpoint(),
                     &run_id,
                     "s6",
                     &Step6Checkpoint {
@@ -1930,12 +2265,12 @@ pub async fn run_scan(
         // which is exactly what an out-of-diff-scope finding looks like to
         // it, since it never reached S6. Re-assert the real reason.
         provider_assessment::mark_out_of_diff_scope(&mut provider_ledger, &out_of_diff_scope);
-        bc_pipeline_core::emit(
+        s6_run.finish(
             progress,
-            bc_pipeline_core::ScanEvent::StageFinished {
-                stage: Stage6::NAME,
-                degraded: false,
-            },
+            &mut stage_timings,
+            s6_status,
+            kept_dropped_counts("verified", &verified_findings, &verified_dropped),
+            s6_detail,
         );
         bc_pipeline_core::emit(
             progress,
@@ -1968,35 +2303,40 @@ pub async fn run_scan(
             .filter(|d| d.reason == DropReason::FalsePositive)
             .count() as i64;
         canonical = verified_findings.clone();
-        if let Some(reason) =
-            spend_cap_exceeded(config.spend_cap.as_ref(), &tokens_by_phase, scan_start)
-        {
+        if let Some(reason) = boundary_stop(
+            cancel.as_ref(),
+            config.spend_cap.as_ref(),
+            &tokens_by_phase,
+            scan_start,
+        ) {
             budget_stop.get_or_insert(format!("{reason}; stopped before S7"));
             all_dropped.extend(prefiltered_dropped);
             all_dropped.extend(verified_dropped);
+            cancellation::skip_stages(progress, &mut stage_timings, &[Stage7::NAME], &reason);
             break 'pipeline;
         }
 
         // ── Step 7 — Dedup ─────────────────────────────────────────────
-        bc_pipeline_core::emit(
-            progress,
-            bc_pipeline_core::ScanEvent::StageStarted {
-                stage: Stage7::NAME,
-            },
-        );
+        let s7_run = StageRun::start(progress, Stage7::NAME);
+        let s7_counts = |kept: &[Finding], dropped: &[DroppedFinding]| {
+            vec![
+                ("canonical", telemetry::count(kept.len())),
+                ("dup_dropped", telemetry::count(dropped.len())),
+            ]
+        };
         let (deduped_findings, deduped_dropped): (Vec<Finding>, Vec<DroppedFinding>) =
             if let Some(cached) =
-                load_checkpoint::<Step7Checkpoint>(checkpoint, config.resume, &run_id, "s7")
+                load_checkpoint::<Step7Checkpoint>(checkpoint, s6_resumed, &run_id, "s7")
             {
                 if cached.degraded {
                     errors_by_stage.insert("s7".to_string(), 1);
                 }
-                bc_pipeline_core::emit(
+                s7_run.finish(
                     progress,
-                    bc_pipeline_core::ScanEvent::StageFinished {
-                        stage: Stage7::NAME,
-                        degraded: cached.degraded,
-                    },
+                    &mut stage_timings,
+                    StageStatus::Cached,
+                    s7_counts(&cached.findings, &cached.dropped),
+                    None,
                 );
                 (cached.findings, cached.dropped)
             } else {
@@ -2006,6 +2346,7 @@ pub async fn run_scan(
                     &tracker,
                     &tokens_by_phase,
                     scan_start,
+                    cancel.as_ref(),
                 );
                 let stage7 = Stage7::new(llm.clone(), step7);
                 let s7_outcome = stage7
@@ -2023,7 +2364,7 @@ pub async fn run_scan(
                 }
                 let deduped = s7_outcome.into_value();
                 save_checkpoint(
-                    checkpoint,
+                    live_checkpoint(),
                     &run_id,
                     "s7",
                     &Step7Checkpoint {
@@ -2032,12 +2373,12 @@ pub async fn run_scan(
                         degraded,
                     },
                 );
-                bc_pipeline_core::emit(
+                s7_run.finish(
                     progress,
-                    bc_pipeline_core::ScanEvent::StageFinished {
-                        stage: Stage7::NAME,
-                        degraded,
-                    },
+                    &mut stage_timings,
+                    StageStatus::from_degraded(degraded),
+                    s7_counts(&deduped.findings, &deduped.dropped),
+                    None,
                 );
                 (deduped.findings, deduped.dropped)
             };
@@ -2087,7 +2428,7 @@ pub async fn run_scan(
     // `end_ts` captured here (post-enrichment, pre-Step-8), matching
     // `scan.py`'s own capture point exactly.
     let end_ts = bc_metrics::now_iso();
-    let metrics = build_metrics(
+    let mut metrics = build_metrics(
         &ctx,
         &manifest,
         &input.repo_root,
@@ -2104,15 +2445,20 @@ pub async fn run_scan(
         errors_by_stage,
         budget_stop,
     );
+    metrics.pipeline_diagnostics = pipeline_diag;
+    // Read once, here: a cancellation that lands during S8 or later finds
+    // a report that already holds everything the pipeline set out to do,
+    // so it is not marked partial (the run itself still exits 130).
+    cancellation::mark_canceled(&mut metrics, canceled_now());
 
     // ── Step 8 — Chain ───────────────────────────────────────────────
-    bc_pipeline_core::emit(
-        progress,
-        bc_pipeline_core::ScanEvent::StageStarted {
-            stage: Stage8::NAME,
-        },
+    let s8_run = StageRun::start(progress, Stage8::NAME);
+    // Refuses the chain call once canceled, so S8 falls back to its own
+    // unranked report and the tail needs no model after a Ctrl-C.
+    let stage8 = Stage8::new(
+        cancellation::CancelAwareClient::wrap(llm.clone(), cancel.clone()),
+        config.step8,
     );
-    let stage8 = Stage8::new(llm.clone(), config.step8);
     let s8_input = Step8Input {
         findings: canonical,
         ctx: ctx.clone(),
@@ -2123,13 +2469,26 @@ pub async fn run_scan(
     let s8_outcome = stage8.run(s8_input).await?;
     let s8_degraded = s8_outcome.is_degraded();
     let mut report = s8_outcome.into_value();
-    bc_pipeline_core::emit(
+    // S8's own spend reaches the event stream (and so the run manifest)
+    // but not `report.metrics.tokens_by_phase`: those metrics are an
+    // input to S8, built before it runs. Its truncations are added below
+    // because a lost S8 reply explains a gap in this very report.
+    let s8_usage = tracker.take();
+    record_usage(&mut tokens_by_phase, progress, "s8", Stage8::NAME, s8_usage);
+    s8_run.finish(
         progress,
-        bc_pipeline_core::ScanEvent::StageFinished {
-            stage: Stage8::NAME,
-            degraded: s8_degraded,
-        },
+        &mut stage_timings,
+        StageStatus::from_degraded(s8_degraded),
+        vec![
+            ("findings", telemetry::count(report.findings.len())),
+            ("chains", telemetry::count(report.chains.len())),
+        ],
+        None,
     );
+    if let Some(metrics) = report.metrics.as_mut() {
+        metrics.llm_truncated_replies += s8_usage.truncated_replies as i64;
+        metrics.stage_timings = stage_timings;
+    }
     bc_pipeline_core::emit(
         progress,
         bc_pipeline_core::ScanEvent::FindingsCount {
@@ -2164,25 +2523,22 @@ pub async fn run_scan(
         });
     }
 
-    // S9 is a distinct deterministic pipeline stage; it spends no model tokens.
-    bc_pipeline_core::emit(
-        progress,
-        bc_pipeline_core::ScanEvent::StageStarted {
-            stage: Stage9::NAME,
-        },
-    );
+    // S9 is a distinct deterministic pipeline stage; it spends no model
+    // tokens. Its timing goes to the event stream only: the report it
+    // renders cannot contain its own duration.
+    let s9_run = StageRun::start(progress, Stage9::NAME);
     let rendered = Stage9 {
         tool_version: config.tool_version.clone(),
     }
     .run(report)
     .await?
     .into_value();
-    bc_pipeline_core::emit(
+    s9_run.finish(
         progress,
-        bc_pipeline_core::ScanEvent::StageFinished {
-            stage: Stage9::NAME,
-            degraded: false,
-        },
+        &mut telemetry::StageTimings::new(),
+        StageStatus::Completed,
+        vec![("findings", telemetry::count(rendered.report.findings.len()))],
+        None,
     );
     Ok(ScanOutcome {
         provider_writeback_plan: Some(rendered.provider_writeback_plan),
@@ -2290,12 +2646,20 @@ pub fn redact_remediate_outcome(mut outcome: RemediateOutcome) -> RemediateOutco
 /// round-trip technique `run_scan` uses for `FinalReport` applies here
 /// unchanged — a future field addition is covered for free rather than
 /// silently bypassing redaction if a hand-rolled per-field pass forgot it.
+///
+/// The diff is the one exception: `redact_tree` would redact it as plain
+/// text, and a multi-line match (a PEM block) collapses hunk lines and
+/// breaks the patch framing that `--post-fixes-from`, `git apply` and
+/// S11's diff tools all parse. It is redacted structure-aware instead.
 fn redact_remediation_record(
     record: &bc_stage_s10::RemediationRecord,
 ) -> bc_stage_s10::RemediationRecord {
     let json = serde_json::to_value(record).expect("RemediationRecord always serializes");
-    serde_json::from_value(bc_redact::redact_tree(&json))
-        .expect("redact_tree preserves JSON shape, so RemediationRecord deserializes back")
+    let mut redacted: bc_stage_s10::RemediationRecord =
+        serde_json::from_value(bc_redact::redact_tree(&json))
+            .expect("redact_tree preserves JSON shape, so RemediationRecord deserializes back");
+    redacted.diff = record.diff.as_deref().map(bc_redact::redact_diff);
+    redacted
 }
 
 /// `bc_validation_scoring::ValidationScore` deliberately has no
@@ -2482,7 +2846,145 @@ pub async fn remediate(
     checkpoint: Option<Arc<dyn bc_checkpoint::CheckpointStore>>,
     validate: Option<ValidateConfig<'_>>,
 ) -> RemediateOutcome {
+    remediate_observed(
+        llm,
+        tools,
+        repo,
+        report,
+        config,
+        policy,
+        checkpoint,
+        validate,
+        &RemediateTelemetry::default(),
+    )
+    .await
+}
+
+/// The S10/S11 stage names on the [`bc_pipeline_core::ScanEvent`] stream,
+/// shaped like the S1-S8 stage crates' own `NAME`s.
+pub const S10_STAGE: &str = "s10-remediate";
+pub const S11_STAGE: &str = "s11-validate";
+
+/// Where [`remediate_observed`] reports S10/S11 telemetry, and how it
+/// prices their model calls. A separate bundle rather than more
+/// [`RemediateConfig`] fields because it is the scan's (the same sink and
+/// pricing [`ScanConfig`] carried), not remediation's own settings. The
+/// [`Default`] observes nothing and prices nothing, which is exactly what
+/// [`remediate`] passes.
+#[derive(Debug, Clone, Default)]
+pub struct RemediateTelemetry {
+    pub progress: Option<bc_pipeline_core::ProgressSink>,
+    pub pricing: pricing::PricingConfig,
+    /// The run's cooperative cancellation (the scan's own token). Once it
+    /// trips, remediation does not start, S10 starts no further finding
+    /// and refuses the running agent's next model call (its own error
+    /// path then rolls the partial patch back), the verify command is
+    /// killed, and S11 is skipped.
+    pub cancel: Option<bc_pipeline_core::CancelTokenRef>,
+}
+
+/// Closes S10 and S11 as skipped because the run was canceled before
+/// remediation could start: the caller's counterpart of
+/// [`remediation_not_requested`], so the manifest still accounts for both.
+pub fn remediation_canceled(progress: Option<&bc_pipeline_core::ProgressSink>, reason: &str) {
+    cancellation::skip_stages(
+        progress,
+        &mut telemetry::StageTimings::new(),
+        &[S10_STAGE, S11_STAGE],
+        reason,
+    );
+}
+
+/// Closes S10 and S11 as `disabled` for a scan that reached S9 and was not
+/// asked to remediate: Python's `_sp_done("s10", outcome="disabled")` when
+/// `--remediate` is off, so the stage list and the run manifest account
+/// for all twelve stages rather than silently stopping at S9.
+pub fn remediation_not_requested(progress: Option<&bc_pipeline_core::ProgressSink>) {
+    let mut timings = telemetry::StageTimings::new();
+    for stage in [S10_STAGE, S11_STAGE] {
+        telemetry::record_unstarted(
+            progress,
+            &mut timings,
+            stage,
+            StageStatus::Disabled,
+            Some("remediation not requested".to_string()),
+        );
+    }
+}
+
+/// Emits one remediation stage's spend. `record_usage` without the
+/// `tokens_by_phase` map: S10/S11 run after the report's metrics exist,
+/// so there is no map to fold them into, only the event stream (and
+/// through it the run manifest, the one output that sees the whole run).
+fn emit_usage(
+    progress: Option<&bc_pipeline_core::ProgressSink>,
+    stage: &'static str,
+    usage: PhaseUsage,
+) {
+    bc_pipeline_core::emit(
+        progress,
+        bc_pipeline_core::ScanEvent::UsageUpdate {
+            stage,
+            usage: stage_usage(usage),
+        },
+    );
+}
+
+/// [`remediate`], additionally reporting S10 and S11 as stages on
+/// `telemetry.progress`: start/finish events with Python's stage-done
+/// counters (`orchestrator/scan.py:846-902`: S10 `attempted`/`fixed`/
+/// `not_fixed`, plus `failed` here; S11 `validated`/`passed`/`failed`)
+/// and per-stage token spend. The remediation client is wrapped in the
+/// same [`UsageTrackingClient`] the scan uses, so S10 and S11 are metered
+/// and priced as their own phases instead of going unrecorded.
+///
+/// A refused run (stale HEAD) reports both stages `disabled` with the
+/// reason, and a report with nothing to remediate does too, matching
+/// Python's `_sp_done("s10", outcome="disabled")`; S11 is `disabled`
+/// whenever `validate` is `None`.
+#[allow(clippy::too_many_arguments)]
+pub async fn remediate_observed(
+    llm: Arc<dyn LlmClient>,
+    tools: Arc<dyn ToolExecutor>,
+    repo: &Path,
+    report: &FinalReport,
+    config: &RemediateConfig,
+    policy: Option<&bc_stage_s10::PolicyContext>,
+    checkpoint: Option<Arc<dyn bc_checkpoint::CheckpointStore>>,
+    validate: Option<ValidateConfig<'_>>,
+    telemetry: &RemediateTelemetry,
+) -> RemediateOutcome {
+    let progress = telemetry.progress.as_ref();
+    // S10/S11 finish after the report was built, so their timings have no
+    // `ScanMetrics` to land in; the events carry them instead.
+    let mut timings = telemetry::StageTimings::new();
+    let disable_both = |timings: &mut telemetry::StageTimings, reason: &str| {
+        telemetry::record_unstarted(
+            progress,
+            timings,
+            S10_STAGE,
+            StageStatus::Disabled,
+            Some(bc_redact::redact(reason)),
+        );
+        telemetry::record_unstarted(
+            progress,
+            timings,
+            S11_STAGE,
+            StageStatus::Disabled,
+            Some("remediation did not run".to_string()),
+        );
+    };
+    // Before anything else, the staleness check included: remediation must
+    // never START after a cancellation.
+    if let Some(reason) = bc_pipeline_core::canceled(telemetry.cancel.as_ref()) {
+        remediation_canceled(progress, &reason);
+        return RemediateOutcome {
+            refused: Some(reason),
+            ..RemediateOutcome::default()
+        };
+    }
     if let Some(reason) = stale_refusal(report, repo, config.force) {
+        disable_both(&mut timings, &reason);
         return RemediateOutcome {
             refused: Some(reason),
             outcomes: Vec::new(),
@@ -2502,6 +3004,13 @@ pub async fn remediate(
         .into_iter()
         .map(|pos| ((pos + 1) as i64, report.findings[pos].clone()))
         .collect();
+    // Nothing to remediate is Python's `not (rem_on and report.findings)`
+    // branch: both stages close `disabled`. The walk below still runs (a
+    // no-op) so checkpoint registration behaves exactly as before.
+    let nothing_selected = selected.is_empty();
+    if nothing_selected {
+        disable_both(&mut timings, "no findings selected for remediation");
+    }
 
     // Ported from `orchestrator/scan.py`'s own pre-remediation warning: the
     // one place a scan stops being read-only. It goes to stderr, before any
@@ -2559,6 +3068,17 @@ pub async fn remediate(
     // `baselines` is aligned 1:1 with `outcomes` and never leaves this
     // function: it holds each finding's pre-remediation file bytes purely
     // so `revert_if_validation_failed` below can undo a patch without git.
+    //
+    // Metered like the scan's own client (see `UsageTrackingClient`), so
+    // S10 and S11 are attributed as phases of their own; `llm` is shadowed
+    // so both stages' calls below go through it unchanged.
+    let tracker = Arc::new(UsageTrackingClient::new(llm, &telemetry.pricing));
+    let llm = cancel_aware_client(tracker.clone(), telemetry.cancel.clone());
+    // S10 checks the same token between findings and while its verify
+    // command runs; see `Step10Config::cancel`.
+    let mut step10 = config.step10.clone();
+    step10.cancel = telemetry.cancel.clone();
+    let s10_run = (!nothing_selected).then(|| StageRun::start(progress, S10_STAGE));
     let bc_stage_s10::RemediationRun {
         mut outcomes,
         baselines,
@@ -2567,14 +3087,55 @@ pub async fn remediate(
         tools.as_ref(),
         repo,
         &selected,
-        &config.step10,
+        &step10,
         policy,
         checkpoint.as_deref(),
         &run_id,
         config.resume,
     )
     .await;
+    if let Some(run) = s10_run {
+        emit_usage(progress, S10_STAGE, tracker.take());
+        let counts = telemetry::remediation_counts(&outcomes);
+        // An agent session that errored is lost work, Python's
+        // `completed_with_errors`; a finding the agent looked at and did
+        // not fix is a verdict, not an error.
+        let failed = outcomes
+            .iter()
+            .any(|o| matches!(o, bc_stage_s10::RemediationOutcome::Failed { .. }));
+        run.finish(
+            progress,
+            &mut timings,
+            StageStatus::from_degraded(failed),
+            counts,
+            None,
+        );
+    }
 
+    // A cancellation during S10 skips S11 outright: validating patches the
+    // operator has just asked the run to stop producing is new work.
+    let s11_cancel = bc_pipeline_core::canceled(telemetry.cancel.as_ref())
+        .filter(|_| validate.is_some() && !nothing_selected);
+    let validate = validate.filter(|_| s11_cancel.is_none());
+    if let Some(reason) = &s11_cancel {
+        cancellation::skip_stages(progress, &mut timings, &[S11_STAGE], reason);
+    }
+    // S11's own stage: only when S10 had something to hand it (otherwise
+    // `disable_both` already closed it) and validation was asked for.
+    let s11_run = match (&validate, nothing_selected || s11_cancel.is_some()) {
+        (Some(_), false) => Some(StageRun::start(progress, S11_STAGE)),
+        (None, false) => {
+            telemetry::record_unstarted(
+                progress,
+                &mut timings,
+                S11_STAGE,
+                StageStatus::Disabled,
+                Some("validation disabled".to_string()),
+            );
+            None
+        }
+        (_, true) => None,
+    };
     let mut validations = Vec::new();
     let mut validation_failures = 0usize;
     if let Some(v) = validate {
@@ -2611,18 +3172,27 @@ pub async fn remediate(
         .collect();
 
         for (pos, (i, record)) in validatable.iter().enumerate() {
-            if !chosen_positions.contains(&pos) {
+            // Stop starting validation sessions once canceled; the ones
+            // not reached stay `None`, "not validated".
+            let canceled = bc_pipeline_core::canceled(telemetry.cancel.as_ref()).is_some();
+            if canceled || !chosen_positions.contains(&pos) {
                 continue;
             }
             let i = *i;
             let finding = &selected[i].1;
-            match bc_stage_s11::validate_finding(
+            // Checkpointed per (finding, redacted diff, persona models), so
+            // `--resume` reuses a panel's score instead of re-running it
+            // (vvaharness v1.3 `validate_` steps).
+            match bc_stage_s11::validate_finding_checkpointed(
                 llm.as_ref(),
                 v.tools,
                 repo,
                 finding,
                 record,
                 v.step11,
+                checkpoint.as_deref(),
+                &run_id,
+                config.resume,
             )
             .await
             {
@@ -2667,6 +3237,17 @@ pub async fn remediate(
             }
         }
     }
+    if let Some(run) = s11_run {
+        emit_usage(progress, S11_STAGE, tracker.take());
+        run.finish(
+            progress,
+            &mut timings,
+            StageStatus::from_degraded(validation_failures > 0),
+            telemetry::validation_counts(&validations, validation_failures),
+            (validation_failures > 0)
+                .then(|| format!("{validation_failures} validation session(s) errored")),
+        );
+    }
 
     redact_remediate_outcome(RemediateOutcome {
         refused: None,
@@ -2687,6 +3268,14 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+
+    /// Cooperative Ctrl-C through the pipeline, and the pipeline
+    /// diagnostics' path into the report.
+    mod cancel_scan;
+    /// Resume chaining, stage telemetry and S10/S11 metering, kept in
+    /// their own file (`src/tests/run_telemetry.rs`) rather than grown
+    /// onto this one; as a child module it reuses every fixture here.
+    mod run_telemetry;
 
     // Boxed trait object (not a generic type param) so every test's
     // routing closure shares one compiled `chat` body — see
@@ -2745,6 +3334,7 @@ mod tests {
             calls: 1,
             calls_with_usage: 1,
             cost: pricing::PhaseCost::default(),
+            truncated_replies: 0,
         }
     }
 
@@ -2755,7 +3345,7 @@ mod tests {
         let config = pricing::PricingConfig::for_provider(provider);
         phase
             .cost
-            .record_call(&config.pricer(), provider, model, usage);
+            .record_call(&config.pricer(), provider, model, usage, config.cache_ttl);
         phase
     }
 
@@ -2787,7 +3377,7 @@ mod tests {
     const S8_SYSTEM_MARK: &str = "exploit development strategist";
 
     const S1_JSON: &str = r#"{"language":"python","modules":[],"entry_points":[],"unsafe_sinks":[],"call_graph":{},"notes":""}"#;
-    const S2_JSON: &str = r#"{"system_context":"ctx","assets":[],"trust_boundaries":[],"threats":[],"open_questions":[]}"#;
+    const S2_JSON: &str = r#"{"system_context":"ctx","assets":[{"name":"user records"}],"trust_boundaries":[],"threats":[],"open_questions":[]}"#;
     const S3_GARBAGE: &str = "not valid json at all, deliberately garbage so s3 degrades to its deterministic catchall sweep";
     const S4_EMPTY: &str = r#"{"findings": []}"#;
     const GOOD_CVSS: &str = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H";
@@ -2983,6 +3573,8 @@ mod tests {
         let mut step8 = Step8Config::new("m");
         step8.retry_backoff_base = std::time::Duration::ZERO;
         ScanConfig {
+            autoexclude: Default::default(),
+            cancel: None,
             step0_enabled: false,
             step0: Step0Config::new(),
             step1,
@@ -3672,7 +4264,7 @@ mod tests {
     async fn a_false_positive_verdict_is_dropped_and_counted_in_metrics() {
         let dir = setup_repo();
         let s6_false_positive = format!(
-            "traced it\nVERDICT: FALSE_POSITIVE (confidence: 9/10) — input is sanitised\nCVSS: {GOOD_CVSS}\n"
+            "traced it\nVERDICT: FALSE_POSITIVE (confidence: 9/10) — input is sanitized\nCVSS: {GOOD_CVSS}\n"
         );
         let s8_no_findings = json!({
             "summary": "No confirmed findings.",
@@ -3892,14 +4484,144 @@ mod tests {
         assert_eq!(sarif["version"], "2.1.0");
         let events: Vec<_> = rx.try_iter().collect();
         assert_eq!(
-            &events[events.len() - 2..],
-            &[
-                bc_pipeline_core::ScanEvent::StageStarted { stage: "s9" },
-                bc_pipeline_core::ScanEvent::StageFinished {
-                    stage: "s9",
-                    degraded: false
-                },
+            events[events.len() - 2],
+            bc_pipeline_core::ScanEvent::StageStarted { stage: "s9" }
+        );
+        assert!(matches!(
+            &events[events.len() - 1],
+            bc_pipeline_core::ScanEvent::StageFinished {
+                stage: "s9",
+                status: StageStatus::Completed,
+                duration: Some(_),
+                ..
+            }
+        ));
+    }
+
+    /// Every stage's `(name, status)` from a run's `StageFinished` events,
+    /// in order, for asserting the whole lifecycle at once.
+    fn finished_stages(events: &[bc_pipeline_core::ScanEvent]) -> Vec<(&'static str, StageStatus)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                bc_pipeline_core::ScanEvent::StageFinished { stage, status, .. } => {
+                    Some((*stage, *status))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The counters one stage reported on its `StageFinished` event.
+    fn finished_counts(
+        events: &[bc_pipeline_core::ScanEvent],
+        wanted: &str,
+    ) -> Vec<(&'static str, u64)> {
+        let missing = format!("no StageFinished for {wanted}");
+        events
+            .iter()
+            .find_map(|e| match e {
+                bc_pipeline_core::ScanEvent::StageFinished { stage, counts, .. }
+                    if *stage == wanted =>
+                {
+                    Some(counts.clone())
+                }
+                _ => None,
+            })
+            .expect(&missing)
+    }
+
+    #[tokio::test]
+    async fn a_full_scan_closes_every_stage_with_a_status_and_its_counters() {
+        let dir = setup_repo();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut config = scan_config();
+        config.progress = Some(tx);
+        let outcome = run_scan(
+            one_finding_client(),
+            Arc::new(NoTools),
+            scan_input(dir.path()),
+            config,
+            None,
+        )
+        .await
+        .unwrap();
+        let events: Vec<_> = rx.try_iter().collect();
+        let stages: Vec<&str> = finished_stages(&events).iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            stages,
+            [
+                "s0-seed",
+                "s1-preprocess",
+                "s2-threatmodel",
+                "s3-decompose",
+                "s4-deepdive",
+                "s5-prefilter",
+                "s6-verify",
+                "s7-dedup",
+                "s8-chain",
+                "s9"
             ]
+        );
+        assert_eq!(
+            finished_counts(&events, "s6-verify"),
+            vec![("verified", 1), ("dropped", 0)]
+        );
+        assert_eq!(finished_counts(&events, "s8-chain")[0], ("findings", 1));
+        // Timings for everything the report could know about (S0-S8),
+        // recorded in the report itself.
+        let timings = outcome.report.unwrap().metrics.unwrap().stage_timings;
+        assert_eq!(
+            timings.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8"]
+        );
+        // `scan_config` switches S0 off: skipped, so no duration.
+        assert_eq!(timings["s0"].outcome, "skipped");
+        assert_eq!(timings["s0"].duration_sec, None);
+        assert!(timings
+            .iter()
+            .filter(|(id, _)| *id != "s0")
+            .all(|(_, t)| t.duration_sec.is_some()));
+        // S8's spend now reaches the stream too.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            bc_pipeline_core::ScanEvent::UsageUpdate {
+                stage: "s8-chain",
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn switched_off_stages_close_as_skipped_without_starting() {
+        let dir = setup_repo();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut config = scan_config();
+        config.progress = Some(tx);
+        config.step0_enabled = false;
+        config.step2_enabled = false;
+        run_scan(
+            empty_findings_client(),
+            Arc::new(NoTools),
+            scan_input(dir.path()),
+            config,
+            Some(StopAfter::S2),
+        )
+        .await
+        .unwrap();
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            finished_stages(&events),
+            [
+                ("s0-seed", StageStatus::Skipped),
+                ("s1-preprocess", StageStatus::Completed),
+                ("s2-threatmodel", StageStatus::Skipped),
+            ]
+        );
+        assert!(
+            !events.contains(&bc_pipeline_core::ScanEvent::StageStarted {
+                stage: "s2-threatmodel"
+            })
         );
     }
 
@@ -4005,6 +4727,7 @@ mod tests {
                 "s4",
                 &serde_json::to_vec(&Step4Checkpoint {
                     findings: Vec::new(),
+                    outcomes: BTreeMap::new(),
                 })
                 .unwrap(),
             )
@@ -4109,6 +4832,7 @@ mod tests {
             &tracker,
             &tokens_by_phase,
             std::time::Instant::now(),
+            None,
         )
         .unwrap();
         assert!(!gate.should_stop(), "40 of 100 recorded, nothing live yet");
@@ -4144,6 +4868,7 @@ mod tests {
             &tracker,
             &BTreeMap::new(),
             std::time::Instant::now(),
+            None,
         )
         .unwrap();
         assert!(gate.should_stop());
@@ -4167,8 +4892,14 @@ mod tests {
             client_with(Vec::new()),
             &pricing::PricingConfig::default(),
         ));
-        let gate = budget_gate(None, &tracker, &BTreeMap::new(), std::time::Instant::now())
-            .expect("an uncapped scan still gets a gate");
+        let gate = budget_gate(
+            None,
+            &tracker,
+            &BTreeMap::new(),
+            std::time::Instant::now(),
+            None,
+        )
+        .expect("an uncapped scan still gets a gate");
         assert!(
             !gate.should_stop(),
             "nothing caps it and nothing tripped it"
@@ -4192,8 +4923,14 @@ mod tests {
             client_with(Vec::new()),
             &pricing::PricingConfig::default(),
         ));
-        let gate =
-            budget_gate(None, &tracker, &BTreeMap::new(), std::time::Instant::now()).unwrap();
+        let gate = budget_gate(
+            None,
+            &tracker,
+            &BTreeMap::new(),
+            std::time::Instant::now(),
+            None,
+        )
+        .unwrap();
         gate.trip("provider quota exhausted — first".to_string());
         gate.trip("provider quota exhausted — second".to_string());
         assert_eq!(gate.stop_reason(), "provider quota exhausted — first");
@@ -4223,6 +4960,7 @@ mod tests {
             &tracker,
             &BTreeMap::new(),
             std::time::Instant::now(),
+            None,
         )
         .unwrap();
         assert!(gate.stop_reason().starts_with("time budget of 0s reached"));
@@ -4253,6 +4991,7 @@ mod tests {
             &tracker,
             &BTreeMap::new(),
             std::time::Instant::now(),
+            None,
         )
         .unwrap();
         assert!(!gate.should_stop());
@@ -4316,7 +5055,7 @@ mod tests {
     }
 
     /// A cap already spent by the time S4 starts now stops S4 itself —
-    /// its `BudgetGate` declines every chunk rather than analysing all of
+    /// its `BudgetGate` declines every chunk rather than analyzing all of
     /// them and only noticing at the boundary afterwards. The scan still
     /// falls through to the S8 + redact + SARIF tail and produces a real
     /// report, rather than returning `stop_after`'s bare `report: None`;
@@ -4396,7 +5135,9 @@ mod tests {
         assert!(
             metrics
                 .budget_stop
-                .contains("0 of 2 deep-dive chunk(s) analysed, 2 skipped"),
+                // The two original chunks plus the v1.3 `injection` specialist
+                // chunk that the `.execute(` sink gates in.
+                .contains("0 of 3 deep-dive chunk(s) analyzed, 3 skipped"),
             "{}",
             metrics.budget_stop
         );
@@ -4558,7 +5299,9 @@ mod tests {
         assert!(
             metrics
                 .budget_stop
-                .ends_with("1 of 2 deep-dive chunk(s) analysed, 1 skipped"),
+                // The two original chunks plus the v1.3 `injection` specialist
+                // chunk that the `.execute(` sinks gate in.
+                .ends_with("1 of 3 deep-dive chunk(s) analyzed, 2 skipped"),
             "{}",
             metrics.budget_stop
         );
@@ -4624,7 +5367,7 @@ mod tests {
             metrics.budget_stop
         );
         // Exactly one finding was actually confirmed; the other is
-        // present, and honestly labelled.
+        // present, and honestly labeled.
         assert_eq!(metrics.true_positive_count, 1);
         assert_eq!(metrics.raw_findings_count, 2);
         let unverified: Vec<&DroppedFinding> = report
@@ -5014,6 +5757,7 @@ mod tests {
                 "s4",
                 &serde_json::to_vec(&Step4Checkpoint {
                     findings: vec![finding.clone()],
+                    outcomes: BTreeMap::new(),
                 })
                 .unwrap(),
             )
@@ -5159,17 +5903,26 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn resolve_app_profile_with_an_unreadable_cmdb_file_is_none() {
-        use std::os::unix::fs::PermissionsExt;
+        // The same id resolves from a readable CMDB, so the `None` below
+        // is the read failure's doing, not a missing row.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cmdb.csv");
-        std::fs::write(&path, "id,name\n1,Acme\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = resolve_app_profile(Some("42"), Some(&path));
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(result, (None, None));
+        let readable = dir.path().join("cmdb.csv");
+        std::fs::write(
+            &readable,
+            "id,name,externally_facing,pci,pan,pii,parent_id\n1,Acme,yes,no,no,no,\n",
+        )
+        .unwrap();
+        assert!(resolve_app_profile(Some("1"), Some(&readable)).0.is_some());
+        // A regular file no user can read: the kernel refuses reads of this
+        // write-only sysctl even for root, unlike a chmod-000 file.
+        let unreadable = std::path::Path::new("/proc/sys/vm/drop_caches");
+        assert_eq!(
+            resolve_app_profile(Some("1"), Some(unreadable)),
+            (None, None)
+        );
     }
 
     #[test]
@@ -5298,6 +6051,31 @@ mod tests {
         input.checkmarx_xml = vec![checkmarx_path];
         input.snyk_json = vec![snyk_path];
         assert_eq!(load_third_party_findings(&input).await.len(), 2);
+    }
+
+    /// The read itself is capped, not just the size check before it:
+    /// `/proc/self/status` reports a length of 0 but reads as hundreds of
+    /// bytes, as a file growing after the check would.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_bounded_export_caps_the_read_when_the_size_check_underreports() {
+        let refused =
+            read_bounded_export(std::path::Path::new("/proc/self/status"), 16).unwrap_err();
+        assert_eq!(refused, "larger than the 16-byte limit for a vendor export");
+    }
+
+    #[test]
+    fn read_bounded_export_refuses_a_file_over_the_limit_and_non_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.json");
+        std::fs::write(&path, "0123456789").unwrap();
+        assert_eq!(read_bounded_export(&path, 10).unwrap(), "0123456789");
+        let refused = read_bounded_export(&path, 9).unwrap_err();
+        assert_eq!(refused, "larger than the 9-byte limit for a vendor export");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(read_bounded_export(&path, 10).is_err());
+        let missing = dir.path().join("missing.json");
+        assert!(read_bounded_export(&missing, 10).is_err());
     }
 
     #[tokio::test]
@@ -5474,6 +6252,7 @@ mod tests {
             source_ref: String::new(),
             sink_ref: String::new(),
             sink_cwe: Vec::new(),
+            shard_id: String::new(),
         }
     }
 
@@ -5641,6 +6420,7 @@ mod tests {
                 calls: 3,
                 calls_with_usage: 0,
                 cost: pricing::PhaseCost::default(),
+                truncated_replies: 0,
             },
         );
         let metrics = build_metrics(
@@ -7350,7 +8130,8 @@ mod tests {
 
         assert_eq!(outcome.outcomes.len(), 1);
         let run_id = bc_checkpoint::run_id_for(dir.path());
-        assert!(store.load(&run_id, "remediate_1").is_some());
+        let step = bc_stage_s10::remediation_step_key(&s10_config().step10, 1, &report.findings[0]);
+        assert!(store.load(&run_id, &step).is_some());
     }
 
     #[tokio::test]
@@ -7608,7 +8389,11 @@ mod tests {
         let store: Arc<dyn bc_checkpoint::CheckpointStore> =
             Arc::new(bc_checkpoint::SqliteCheckpointStore::new(&db_path).unwrap());
         let run_id = bc_checkpoint::run_id_for(dir.path());
-        store.save(&run_id, "remediate_99", b"stale").unwrap();
+        // A stage checkpoint, not a `remediate_*` row: S10 itself prunes
+        // `remediate_*` rows no live finding claims (engine-keyed steps,
+        // see `bc_stage_s10::remediation_step_key`), which is a different
+        // thing from the whole-run reset this test pins.
+        store.save(&run_id, "s1", b"stale").unwrap();
 
         let mut cfg = s10_config();
         cfg.resume = true;
@@ -7625,7 +8410,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(store.load(&run_id, "remediate_99"), Some(b"stale".to_vec()));
+        assert_eq!(store.load(&run_id, "s1"), Some(b"stale".to_vec()));
     }
 
     // ---- S11's post-validation rollback -------------------------------

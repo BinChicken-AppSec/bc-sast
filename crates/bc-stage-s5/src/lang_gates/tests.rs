@@ -178,13 +178,13 @@ fn a_declaration_is_not_a_callback_shaped_call() {
     assert!(drops_race("a.ts", "const cb = (a) => a;\n  counter += 1"));
 }
 
-/// A keyword taking a parenthesised operand is not a call taking a
+/// A keyword taking a parenthesized operand is not a call taking a
 /// callback. `return (req, res) => { … }` is how an Express middleware
 /// factory is written, and it wraps the actual field case
 /// (`routes/captcha.ts:11`) — reading it as a callback-shaped call would
 /// have kept every finding inside one.
 #[test]
-fn a_keyword_taking_a_parenthesised_operand_is_not_a_call() {
+fn a_keyword_taking_a_parenthesized_operand_is_not_a_call() {
     assert!(drops_race(
         "routes/captcha.ts",
         "  return (req, res) => {\n    req.app.locals.captchaId++\n  }"

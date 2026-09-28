@@ -1759,15 +1759,18 @@ rules:
         assert!(source_specs.is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn load_rulepacks_propagates_an_io_error_when_the_file_is_unreadable() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_yaml(dir.path(), "sources.yaml", "rules: []\n");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let err = load_rulepacks(Some(&path), None, &langs(&["python"]));
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // A regular file nobody can open for reading. The kernel checks a
+        // sysctl's mode bits itself, without the CAP_DAC_OVERRIDE bypass a
+        // chmod 000 file gets, so the read fails for root as well.
+        let path = Path::new("/proc/sys/vm/drop_caches");
+        assert!(
+            path.is_file(),
+            "the fixture must pass the is_file pre-check"
+        );
+        let err = load_rulepacks(Some(path), None, &langs(&["python"]));
         assert!(err.unwrap_err().to_string().contains("cannot read"));
     }
 

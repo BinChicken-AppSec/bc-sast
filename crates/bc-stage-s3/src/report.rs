@@ -29,6 +29,30 @@ pub fn drop_unknown_threat_ids(chunks: &mut [Chunk], ctx: &ContextPackage) {
     }
 }
 
+/// `(covered, counted)`: how many threats have at least one chunk citing
+/// them, over how many count toward coverage at all. Baseline dispositions
+/// that name no code surface are left out of both, as upstream v1.3's
+/// `_report_threat_coverage` does, so one never reads as permanently
+/// uncovered. Call after [`drop_unknown_threat_ids`].
+pub fn threat_coverage(chunks: &[Chunk], ctx: &ContextPackage) -> (usize, usize) {
+    let Some(tm) = &ctx.threat_model else {
+        return (0, 0);
+    };
+    let all_files: HashSet<&str> = ctx.all_files.iter().map(String::as_str).collect();
+    let counted: HashSet<&str> = tm
+        .threats
+        .iter()
+        .filter(|t| !crate::fallback::is_unmatched_baseline_threat(t, &all_files))
+        .map(|t| t.id.as_str())
+        .collect();
+    let covered: HashSet<&str> = chunks
+        .iter()
+        .filter_map(|c| c.threat_id.as_deref())
+        .filter(|id| counted.contains(id))
+        .collect();
+    (covered.len(), counted.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +116,7 @@ mod tests {
             source_ref: String::new(),
             sink_ref: String::new(),
             sink_cwe: Vec::new(),
+            shard_id: String::new(),
         }
     }
 
@@ -154,5 +179,22 @@ mod tests {
         let mut chunks = vec![chunk(None)];
         drop_unknown_threat_ids(&mut chunks, &ctx);
         assert_eq!(chunks[0].threat_id, None);
+    }
+
+    #[test]
+    fn threat_coverage_excludes_unmatched_baseline_threats_from_both_sides() {
+        let mut filler = threat("T2");
+        filler.evidence = "baseline: BL-DEP-01".to_string();
+        filler.surface = "npm dependencies".to_string();
+        let ctx = ctx_with_threats(vec![threat("T1"), filler, threat("T3")]);
+        let chunks = vec![chunk(Some("T1")), chunk(Some("T2")), chunk(None)];
+        assert_eq!(threat_coverage(&chunks, &ctx), (1, 2));
+    }
+
+    #[test]
+    fn threat_coverage_is_zero_over_zero_without_a_threat_model() {
+        let mut ctx = ctx_with_threats(Vec::new());
+        ctx.threat_model = None;
+        assert_eq!(threat_coverage(&[chunk(Some("T1"))], &ctx), (0, 0));
     }
 }

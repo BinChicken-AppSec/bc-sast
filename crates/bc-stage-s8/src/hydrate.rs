@@ -139,6 +139,10 @@ fn valid_index(item: &Value) -> Option<usize> {
 /// original (currently: a non-string `blocked_by_controls` entry) — the
 /// caller degrades to [`unranked_report`] in that case, exactly mirroring
 /// the Python original's broad `except Exception` around this hydration.
+///
+/// Alongside the report it returns how many findings the chain pass
+/// actually ranked, so the caller can tell a working reply from one whose
+/// entries were all discarded (upstream v1.4.0 returns the `covered` set).
 pub fn hydrate_report(
     data: &Value,
     ctx: &ContextPackage,
@@ -146,7 +150,7 @@ pub fn hydrate_report(
     dropped: &[DroppedFinding],
     raw_findings_count: i64,
     metrics: Option<ScanMetrics>,
-) -> Result<FinalReport, String> {
+) -> Result<(FinalReport, usize), String> {
     let mut ranked: Vec<RankedFinding> = Vec::new();
     let mut ranked_orig_idx: Vec<usize> = Vec::new();
     let mut covered: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -286,21 +290,25 @@ pub fn hydrate_report(
         .unwrap_or("")
         .to_string();
 
-    Ok(FinalReport {
-        provider_ledger: Default::default(),
-        repo_root: ctx.repo_root.clone(),
-        repo_name: None,
-        git_sha: None,
-        findings: ranked,
-        chains,
-        dropped: dropped_out,
-        raw_findings_count,
-        metrics,
-        threat_model: None,
-        app_profile: None,
-        summary,
-        degraded: false,
-        degraded_reason: String::new(),
-        unreachable_files: Vec::new(),
-    })
+    let covered_count = covered.len();
+    Ok((
+        FinalReport {
+            provider_ledger: Default::default(),
+            repo_root: ctx.repo_root.clone(),
+            repo_name: None,
+            git_sha: None,
+            findings: ranked,
+            chains,
+            dropped: dropped_out,
+            raw_findings_count,
+            metrics,
+            threat_model: None,
+            app_profile: None,
+            summary,
+            degraded: false,
+            degraded_reason: String::new(),
+            unreachable_files: Vec::new(),
+        },
+        covered_count,
+    ))
 }

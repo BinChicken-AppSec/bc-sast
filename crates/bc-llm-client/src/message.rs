@@ -36,11 +36,64 @@ pub enum ContentBlock {
         content: String,
         is_error: bool,
     },
+    /// A provider-specific block that carries no text or tool-call signal
+    /// of its own but must be sent back to the SAME provider, byte for
+    /// byte, on the next turn of a multi-turn conversation: an OpenAI
+    /// Responses API `reasoning` item (whose `encrypted_content` is the
+    /// only way a `store: false` request keeps the model's chain of
+    /// thought across tool calls), or an Anthropic `thinking` /
+    /// `redacted_thinking` block (whose `signature` the Messages API
+    /// verifies when extended thinking and tool use are combined).
+    ///
+    /// `bc-llm-agentic` already pushes every assistant response's content
+    /// into its history unchanged, so capturing these here is all it takes
+    /// for reasoning to survive a tool round trip. Each dialect replays
+    /// only blocks tagged with its own [`OpaqueDialect`] and silently
+    /// drops the rest: a history built against one provider and replayed
+    /// against another (never done today, but not prevented by the types)
+    /// loses the reasoning, never corrupts the request.
+    ///
+    /// [`crate::ChatResponse::text`] and
+    /// [`crate::ChatResponse::tool_uses`] ignore this variant, so no stage
+    /// can mistake a reasoning trace for an answer.
+    Opaque {
+        dialect: OpaqueDialect,
+        payload: Value,
+    },
+}
+
+/// Which wire dialect produced a [`ContentBlock::Opaque`] block, and so
+/// the only dialect allowed to replay it. A closed enum rather than a
+/// string so a typo cannot silently turn a replayable block into one
+/// every dialect drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OpaqueDialect {
+    /// An OpenAI Responses API output item (today only `type:
+    /// "reasoning"`). Replayed as an `input` item by the Responses
+    /// request builder; the Chat Completions shape has no place for it.
+    OpenAiResponses,
+    /// An Anthropic Messages API content block (`thinking` or
+    /// `redacted_thinking`), replayed verbatim inside the assistant
+    /// message it came from.
+    Anthropic,
 }
 
 impl ContentBlock {
     pub fn text(s: impl Into<String>) -> Self {
         ContentBlock::Text(s.into())
+    }
+
+    /// The payload of an [`ContentBlock::Opaque`] block, if this is one
+    /// AND it belongs to `dialect`. Every request builder filters with
+    /// this, so the "replay only your own blocks" rule lives in one place.
+    pub fn opaque_for(&self, dialect: OpaqueDialect) -> Option<&Value> {
+        match self {
+            ContentBlock::Opaque {
+                dialect: d,
+                payload,
+            } if *d == dialect => Some(payload),
+            _ => None,
+        }
     }
 }
 
@@ -135,6 +188,23 @@ mod tests {
         assert_ne!(Role::User, Role::Assistant);
         let block = ContentBlock::text("x");
         assert_eq!(block.clone(), block);
+    }
+
+    #[test]
+    fn opaque_for_returns_the_payload_only_to_its_own_dialect() {
+        let block = ContentBlock::Opaque {
+            dialect: OpaqueDialect::Anthropic,
+            payload: serde_json::json!({"type": "thinking"}),
+        };
+        assert_eq!(
+            block.opaque_for(OpaqueDialect::Anthropic),
+            Some(&serde_json::json!({"type": "thinking"}))
+        );
+        assert_eq!(block.opaque_for(OpaqueDialect::OpenAiResponses), None);
+        assert_eq!(
+            ContentBlock::text("x").opaque_for(OpaqueDialect::Anthropic),
+            None
+        );
     }
 
     #[test]

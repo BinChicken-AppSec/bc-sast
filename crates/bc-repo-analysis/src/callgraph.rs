@@ -340,6 +340,11 @@ pub struct CallGraphReport {
     pub added: usize,
     pub source_files_scanned: usize,
     pub located_functions: usize,
+    /// How many repo-defined function names seeded the supplement because
+    /// the agent supplied no seeds at all (`0` on an agent-seeded run).
+    /// A non-zero value means the call graph came from the deterministic
+    /// backstop alone.
+    pub backstop_seeds: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -449,6 +454,31 @@ pub fn supplement_call_graph(
         config.max_targets,
     );
 
+    // Deterministic backstop: when the agent produced nothing to seed from
+    // (a refusal parsed down to an empty map, or a gap-fill run with no
+    // entry points or sinks yet), seed the expansion from the definition
+    // index this function just built from the files on disk. `fn_locs` is
+    // agent-independent, so an empty agent map still yields a call graph.
+    // Gating the supplement on `!seeds.is_empty()` (as v1.2 did) made the
+    // backstop a no-op exactly when it was needed most. Agent-seeded runs
+    // are unaffected: this only fires when `seeds` is empty. Ported from
+    // upstream v1.3 `s1_preprocess.py`.
+    let mut backstop_seeds = 0;
+    if config.supplement && seeds.is_empty() {
+        seeds = fn_locs
+            .keys()
+            .filter(|n| n.len() >= 3 && !NOT_A_DEF.contains(n.as_str()))
+            .cloned()
+            .collect();
+        backstop_seeds = seeds.len();
+        if backstop_seeds > 0 {
+            tracing::info!(
+                backstop_seeds,
+                "[s1] call-graph supplement: no agent seeds; seeding from repo-defined \
+                 function names (deterministic backstop)"
+            );
+        }
+    }
     let added = if config.supplement && !seeds.is_empty() {
         run_supplement_rounds(&mut cg, &seeds, &seen_any, &src_files, &def_files, config)
     } else {
@@ -487,6 +517,7 @@ pub fn supplement_call_graph(
             added,
             source_files_scanned: src_files.len(),
             located_functions: call_graph_files.len(),
+            backstop_seeds,
         },
         call_graph,
         call_graph_files,
@@ -1146,6 +1177,83 @@ mod tests {
             supplement_call_graph(&raw, &[], &[], &["a.py".to_string()], dir.path(), &config);
         assert!(result.call_graph.is_empty());
         assert_eq!(result.report.added, 0);
+        // The backstop still seeded from the one repo-defined name; it
+        // just found no call to it.
+        assert_eq!(result.report.backstop_seeds, 1);
+    }
+
+    #[test]
+    fn no_agent_seeds_backstops_the_supplement_from_repo_definitions() {
+        // Regression for the v1.2 gate: an agent that produced nothing
+        // (no call graph, no entry points, no sinks) used to leave the
+        // regex supplement a no-op, so the scan ran with no call graph.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "a.py",
+            "def handler():\n    helper()\n\ndef helper():\n    pass\n",
+        );
+        let raw = BTreeMap::new();
+        let config = CallGraphConfig::new();
+        let result =
+            supplement_call_graph(&raw, &[], &[], &["a.py".to_string()], dir.path(), &config);
+        assert_eq!(
+            result.call_graph.get("a.py::handler"),
+            Some(&vec!["a.py::helper".to_string()])
+        );
+        assert_eq!(result.report.backstop_seeds, 2);
+        assert!(result.report.added > 0);
+    }
+
+    #[test]
+    fn a_backstop_over_a_repo_with_no_definitions_seeds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.py", "x = 1\n");
+        let config = CallGraphConfig::new();
+        let result = supplement_call_graph(
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &["a.py".to_string()],
+            dir.path(),
+            &config,
+        );
+        assert_eq!(result.report.backstop_seeds, 0);
+        assert!(result.call_graph.is_empty());
+    }
+
+    #[test]
+    fn agent_seeds_never_trigger_the_backstop() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.py", "def handler():\n    helper()\n");
+        let config = CallGraphConfig::new();
+        let result = supplement_call_graph(
+            &BTreeMap::new(),
+            &strs(&["handler"]),
+            &[],
+            &["a.py".to_string()],
+            dir.path(),
+            &config,
+        );
+        assert_eq!(result.report.backstop_seeds, 0);
+    }
+
+    #[test]
+    fn a_disabled_supplement_never_backstops() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.py", "def handler():\n    helper()\n");
+        let mut config = CallGraphConfig::new();
+        config.supplement = false;
+        let result = supplement_call_graph(
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &["a.py".to_string()],
+            dir.path(),
+            &config,
+        );
+        assert_eq!(result.report.backstop_seeds, 0);
+        assert!(result.call_graph.is_empty());
     }
 
     #[test]

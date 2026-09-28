@@ -27,7 +27,7 @@ static PAN_RX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(?:\d[\s\-]?){1
 
 /// A card-context keyword sitting just before the digit run (e.g. `pan =`,
 /// `cardNumber:`, `acct_no`, `credit_card`) — matched in a short window
-/// preceding the match so a labelled-but-non-Luhn test PAN is still
+/// preceding the match so a labeled-but-non-Luhn test PAN is still
 /// caught.
 static CARD_CTX_RX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(pan|card(?:[\s_-]*(?:no|num|number))?|cc(?:[\s_-]*(?:no|num|number))?|credit[\s_-]*card|acct|account(?:[\s_-]*(?:no|num|number))?)\b")
@@ -73,11 +73,19 @@ fn mask_pan(matched: &str, preceding_window: &str) -> String {
     out
 }
 
-/// Mask sensitive data before `text` (the contents of `rel`, only used by
-/// the Python original for its dropped stderr log) is packed into the
-/// prompt. Preserves line structure (no newlines added/removed) so
-/// finding line numbers stay accurate.
-pub fn redact_source(text: &str) -> String {
+/// Mask sensitive data before `text` (the contents of `rel`) is packed
+/// into the prompt. Preserves line structure (no newlines added/removed)
+/// so finding line numbers stay accurate.
+///
+/// This is the single choke point where every S4 loader turns file bytes
+/// into prompt text, so the binary/data-URI guard
+/// ([`crate::packed_text::sanitize_packed_text`]) runs here first, as
+/// upstream v1.4.0 `_redact_source` does: a binary file collapses to a
+/// one-line elision marker naming `rel`, and data-URIs are elided in
+/// place.
+pub fn redact_source(text: &str, rel: &str) -> String {
+    let text = crate::packed_text::sanitize_packed_text(text, rel);
+    let text = text.as_str();
     let mut out = String::with_capacity(text.len());
     let mut last_end = 0;
     for m in PAN_RX.find_iter(text) {
@@ -98,7 +106,7 @@ mod tests {
     #[test]
     fn digit_run_under_13_is_never_touched() {
         let input = "port = 123456789012"; // 12 digits
-        assert_eq!(redact_source(input), input);
+        assert_eq!(redact_source(input, "f"), input);
     }
 
     #[test]
@@ -119,7 +127,7 @@ mod tests {
     #[test]
     fn luhn_valid_card_is_masked_regardless_of_context() {
         let input = "x = 4111111111111111"; // Visa test PAN, Luhn-valid
-        let out = redact_source(input);
+        let out = redact_source(input, "f");
         assert!(out.contains("4111XXXXXXXXXXXX"));
         assert!(!out.contains("4111111111111111"));
     }
@@ -128,7 +136,7 @@ mod tests {
     fn non_luhn_digit_run_with_card_context_keyword_is_masked() {
         let input = "cardNumber = 1234567890123456"; // 16 digits, not Luhn-valid
         assert!(!bc_redact::luhn("1234567890123456"));
-        let out = redact_source(input);
+        let out = redact_source(input, "f");
         assert!(out.contains("1234XXXXXXXXXXXX"));
     }
 
@@ -136,14 +144,14 @@ mod tests {
     fn non_luhn_digit_run_without_context_is_left_unchanged() {
         let input = "timestamp = 1699999999999999"; // 16 digits, not Luhn-valid, no context keyword
         assert!(!bc_redact::luhn("1699999999999999"));
-        let out = redact_source(input);
+        let out = redact_source(input, "f");
         assert_eq!(out, input);
     }
 
     #[test]
     fn separators_within_the_digit_run_are_preserved_verbatim() {
         let input = "4111-1111-1111-1111"; // Luhn-valid with hyphen separators
-        let out = redact_source(input);
+        let out = redact_source(input, "f");
         assert!(out.contains("4111-XXXX-XXXX-XXXX") || out.contains("4111-XXXXXXXXXXXXXXX"));
     }
 
@@ -152,14 +160,14 @@ mod tests {
         // An SSN is not a 13-19 digit run at all, so layer 1 leaves it
         // alone; layer 2 (the shared redactor) must still catch it.
         let input = "ssn = 123-45-6789";
-        let out = redact_source(input);
+        let out = redact_source(input, "f");
         assert_ne!(out, input);
     }
 
     #[test]
     fn no_newlines_are_added_or_removed() {
         let input = "line one\nline two 4111111111111111\nline three\n";
-        let out = redact_source(input);
+        let out = redact_source(input, "f");
         assert_eq!(out.matches('\n').count(), input.matches('\n').count());
     }
 
@@ -170,26 +178,38 @@ mod tests {
         // window (this is exactly the case a byte-offset slice would break
         // on for arbitrary text).
         let input = "café☕️ résumé naïve 日本語のテキストがここにあります 4111111111111111";
-        let out = redact_source(input);
+        let out = redact_source(input, "f");
         assert!(out.contains("4111XXXXXXXXXXXX"));
     }
 
     #[test]
     fn context_keyword_immediately_preceding_a_short_multibyte_prefix_is_detected() {
         let input = "café pan: 1234567890123456";
-        let out = redact_source(input);
+        let out = redact_source(input, "f");
         assert!(out.contains("1234XXXXXXXXXXXX"));
     }
 
     #[test]
+    fn binary_text_and_data_uris_are_elided_before_redaction() {
+        assert_eq!(
+            redact_source("\0\0\0 4111111111111111", "img.bin"),
+            "[binary content elided: img.bin is not text]"
+        );
+        assert_eq!(
+            redact_source("x = \"data:image/gif;base64,R0lGOD==\"", "t.js"),
+            "x = \"[data-uri image/gif elided: 8 chars]\""
+        );
+    }
+
+    #[test]
     fn empty_input_is_unchanged() {
-        assert_eq!(redact_source(""), "");
+        assert_eq!(redact_source("", "f"), "");
     }
 
     #[test]
     fn multiple_matches_in_one_string_are_each_handled_independently() {
         let input = "a=4111111111111111 b=1699999999999999";
-        let out = redact_source(input);
+        let out = redact_source(input, "f");
         assert!(out.contains("4111XXXXXXXXXXXX"));
         assert!(out.contains("1699999999999999")); // untouched, no context/luhn
     }

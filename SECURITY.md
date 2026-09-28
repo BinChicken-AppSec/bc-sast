@@ -30,7 +30,7 @@ rather than needing a fresh report. Read that first.
 
 ## Supported versions
 
-`1.0.0` is the current release. Only that tag and the latest commit on the
+`1.1.0` is the current release. Only that tag and the latest commit on the
 default branch are supported; there is no backport branch for anything
 older.
 

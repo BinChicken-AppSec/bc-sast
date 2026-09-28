@@ -33,6 +33,7 @@ use async_trait::async_trait;
 use bc_llm_client::{ChatRequest, ChatResponse, LlmClient, LlmError, SseDecoder};
 use serde_json::Value;
 
+use crate::auth::auth_headers;
 use crate::request::build_request_body;
 use crate::response::{classify_http_error, parse_response_body, parse_retry_after};
 use crate::stream::StreamAssembler;
@@ -116,23 +117,22 @@ impl LlmClient for AnthropicClient {
             }
         }
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        // Exactly one same-call correction is possible (dropping
-        // `temperature`), and it removes the very key it acts on, so the
-        // same correction can never fire twice.
-        let mut retries_left = 1u8;
+        // One same-call correction per rejectable parameter (`temperature`
+        // here; `top_p`, `output_config` and `thinking` in
+        // `crate::corrections`), each removing or rewriting the very key
+        // it acts on, so the same correction can never fire twice.
+        let mut retries_left = 4u8;
+        // `x-api-key` for a static key, or `Authorization: Bearer` plus
+        // the OAuth beta for an `sk-ant-oat` token (see `crate::auth`).
+        let auth = auth_headers(self.api_key.as_deref(), &request.betas)?;
 
         loop {
             let mut req = self
                 .http
                 .post(&url)
                 .header("anthropic-version", ANTHROPIC_VERSION)
+                .headers(auth.clone())
                 .json(&body);
-            if let Some(key) = &self.api_key {
-                req = req.header("x-api-key", key);
-            }
-            if !request.betas.is_empty() {
-                req = req.header("anthropic-beta", request.betas.join(","));
-            }
             // Per-request deadline overriding the shared client's own
             // default (`bc_gateway_http::GatewayConfig::timeout`, 300 s),
             // mirroring `backends/sdk.py:274`'s
@@ -153,7 +153,8 @@ impl LlmClient for AnthropicClient {
                 let text = resp.text().await.map_err(map_reqwest_error)?;
                 if status.as_u16() == 400
                     && retries_left > 0
-                    && self.drop_rejected_temperature(&request.model, &mut body, &text)
+                    && (self.drop_rejected_temperature(&request.model, &mut body, &text)
+                        || crate::corrections::correct(&request.model, &mut body, &text))
                 {
                     retries_left -= 1;
                     continue;
@@ -203,16 +204,12 @@ async fn read_stream(resp: &mut reqwest::Response) -> Result<Value, LlmError> {
     Ok(assembler.finish())
 }
 
+/// A proxy/TLS cause anywhere in the error chain is VVAH-E002; otherwise
+/// a connect failure or timeout stays a retryable connection error. See
+/// [`bc_llm_client::classify_transport_error`].
 fn map_reqwest_error(e: reqwest::Error) -> LlmError {
-    if e.is_timeout() || e.is_connect() {
-        LlmError::ConnectionError {
-            message: e.to_string(),
-        }
-    } else {
-        LlmError::Other {
-            message: e.to_string(),
-        }
-    }
+    let connect_or_timeout = e.is_timeout() || e.is_connect();
+    bc_llm_client::classify_transport_error(&e, connect_or_timeout)
 }
 
 #[cfg(test)]
@@ -262,7 +259,7 @@ mod tests {
 
     /// Serves `events` as a real `text/event-stream` body, including the
     /// `event:` name line the Messages API sends (which this port
-    /// deliberately ignores in favour of the payload's own `type`).
+    /// deliberately ignores in favor of the payload's own `type`).
     fn sse(events: &[&str]) -> ResponseTemplate {
         let body: String = events
             .iter()
@@ -441,6 +438,77 @@ mod tests {
         let client = AnthropicClient::new(reqwest::Client::new(), server.uri(), None);
         let resp = client.chat(&request()).await.unwrap();
         assert_eq!(resp.text(), "ok");
+    }
+
+    /// An `sk-ant-oat` token is a bearer credential with its own beta,
+    /// merged with any betas the request asked for, and is never sent as
+    /// `x-api-key` (the 401 this port used to earn for it).
+    #[tokio::test]
+    async fn an_oauth_token_is_sent_as_a_bearer_credential_with_the_oauth_beta() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("authorization", "Bearer sk-ant-oat01-test"))
+            .and(headers(
+                "anthropic-beta",
+                vec!["beta-one", "oauth-2025-04-20"],
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = AnthropicClient::new(
+            reqwest::Client::new(),
+            server.uri(),
+            Some("sk-ant-oat01-test".to_string()),
+        );
+        let mut req = request();
+        req.betas = vec!["beta-one".to_string()];
+        let resp = client.chat(&req).await.unwrap();
+        assert_eq!(resp.text(), "ok");
+        let received = server.received_requests().await.unwrap();
+        assert!(
+            received[0].headers.get("x-api-key").is_none(),
+            "an OAuth token must not also travel as x-api-key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_that_cannot_be_a_header_fails_before_any_request_is_sent() {
+        let server = MockServer::start().await;
+        let client = AnthropicClient::new(
+            reqwest::Client::new(),
+            server.uri(),
+            Some("bad\u{7f}key".to_string()),
+        );
+        let err = client.chat(&request()).await.unwrap_err();
+        assert!(matches!(err, LlmError::InvalidRequest { .. }), "{err:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_401_is_an_authentication_error_that_halts_the_scan() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(
+                r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server).chat(&request()).await.unwrap_err();
+        assert_eq!(
+            err,
+            LlmError::Authentication {
+                status: Some(401),
+                message: r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#.to_string(),
+            }
+        );
+        assert_eq!(err.code(), Some("VVAH-E001"));
     }
 
     #[tokio::test]

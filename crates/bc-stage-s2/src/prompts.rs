@@ -2,8 +2,9 @@
 // SAST harness: Copyright 2026 Visa, Inc., licensed under the Apache
 // License, Version 2.0. Reimplemented in Rust and modified; see the module
 // documentation below, and NOTICE for the full attribution.
-//! S2's system/user prompts, ported verbatim from
-//! `s2_threatmodel.py`'s `SYSTEM` constant and `_build_user_prompt`.
+//! S2's system/user/repair prompts, ported verbatim from v1.4.0
+//! `s2_threatmodel.py`'s `SYSTEM`, `_build_user_prompt`,
+//! `_repair_json_prompt` and `_AGENTIC_SYSTEM_LINE`.
 
 use bc_model::{AppProfile, Control, Cve};
 
@@ -39,8 +40,12 @@ Work through these stages:
    Repudiation, Info-disclosure, DoS, Elevation) and emit the plausible ones.
    Use prior CVEs as EVIDENCE that raises likelihood; design controls LOWER it.
    Score impact (low|medium|high|critical|existential) and likelihood
-   (very_rare|rare|possible|likely|almost_certain). Sort by (impact,likelihood)
-   descending and assign ids T1, T2, …
+   (very_rare|rare|possible|likely|almost_certain). Assign ids T1, T2, … in the
+   order you emit them; ordering does not matter — the caller ranks
+   deterministically. Do NOT drop a threat because you are unsure: a plausible
+   threat with likelihood \"rare\" is useful, a missing threat is not. Downstream
+   stages re-check every threat against the real source code and discard the ones
+   that do not hold up.
 
 5. OPEN QUESTIONS — things the snapshot can't tell you (deployment exposure,
    upstream WAF, who supplies inputs, risk appetite).
@@ -61,7 +66,49 @@ Respond with ONLY a JSON object — no prose, no markdown fences:
   \"open_questions\": [\"str\"]
 }
 
-Coverage rule: every trust_boundary MUST appear as the surface of ≥1 threat.";
+Every element of \"assets\", \"trust_boundaries\" and \"threats\" MUST be an object
+carrying the keys shown above — never a bare string. A bare string where an
+object is required fails schema validation and discards the ENTIRE response;
+it is the one malformation observed to do so in production runs.
+
+Coverage rules:
+  - Every trust_boundary MUST appear as the surface of ≥1 threat.
+  - Every MINIMUM BASELINE item, if any are supplied, MUST be either the basis of
+    a threat (with \"evidence\" starting \"baseline: <ID>\") or named in
+    open_questions with a one-clause reason. Never drop a baseline item without a
+    written trace.";
+
+/// The one line appended to [`SYSTEM`] when `step2.agentic` is on: the
+/// model may now open the configuration files the evidence lists by path.
+pub const AGENTIC_SYSTEM_LINE: &str =
+    "\n\nYou have read-only tools (Read, Glob, Grep): you may open the \
+     configuration files listed by path in the evidence — and any other repository file — to \
+     confirm details before emitting the JSON.";
+
+/// One-shot repair prompt after a parse or validation failure. It covers
+/// schema shape, not just syntax (the observed failures are mostly bare
+/// strings where an object is required), and forbids inventing content:
+/// the repair restructures what the model already said, it is not a
+/// second chance to hallucinate.
+pub fn repair_json_prompt(raw: &str, err: &str) -> String {
+    format!(
+        "REPAIR TASK:
+The previous threat-model response failed to parse against the required
+schema. Return ONLY a corrected JSON object that (a) is syntactically valid
+JSON and (b) matches the schema in the system prompt exactly — in particular,
+every element of \"assets\", \"trust_boundaries\" and \"threats\" must be an object
+with the keys shown there, never a bare string. Preserve the original content
+faithfully: do not add, remove, or reword any asset, boundary, or threat
+beyond what restructuring requires.
+
+PARSE/VALIDATION ERROR:
+{err}
+
+BROKEN RESPONSE:
+{raw}
+"
+    )
+}
 
 /// Ported from `AppProfile.to_prompt_block()` — kept as a free function
 /// here (not on `bc_model::AppProfile`) matching this project's
@@ -109,9 +156,12 @@ pub fn app_profile_prompt_block(ap: &AppProfile) -> String {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The user prompt. Block order is non-increasing staticness across
+/// re-runs of the same repository (baseline, CMDB and shape blocks first,
+/// the AST frontier last), and the absolute `repo_root` is deliberately not
+/// rendered: it tells the model nothing `repo_name` does not and was the
+/// biggest obstacle to a stable cross-run prefix (upstream v1.4.0).
 pub fn build_user_prompt(
-    repo_root: &str,
     repo_name: &str,
     ev: &Evidence,
     cves: &[Cve],
@@ -192,12 +242,21 @@ pub fn build_user_prompt(
             .join("\n")
     };
 
+    // A representative that was read gets a header and its redacted body;
+    // one beyond `max_config_rep_bodies` (or refused by containment) stays
+    // a bare path bullet.
     let cfg_block = if ev.config_reps.is_empty() {
         "  (none)".to_string()
     } else {
         ev.config_reps
             .iter()
-            .map(|p| format!("  - {p}"))
+            .map(|(p, body)| {
+                if body.is_empty() {
+                    format!("  - {p}")
+                } else {
+                    format!("  === {p} ===\n{body}")
+                }
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -290,15 +349,37 @@ pub fn build_user_prompt(
     };
 
     format!(
-        "TARGET: {repo_name}  ({repo_root})\n\
-         PRIMARY LANGUAGE: {}\n\
-         FILES IN AST FRONTIER: {} (from {} total in-scope files)\n\
-         \n\
-         {cmdb_block}LANGUAGE BREAKDOWN:\n\
+        "{baseline_block}{cmdb_block}LANGUAGE BREAKDOWN:\n\
          {lang_block}\n\
          \n\
          COMPONENTS (top-level directories):\n\
          {comp_block}\n\
+         \n\
+         REPRESENTATIVE CONFIGURATION (one per component, post-dedup — entries under a\n\
+         \"=== path ===\" header carry redacted, length-capped file contents revealing\n\
+         data stores, message buses, key/secret managers, TLS posture, external\n\
+         endpoints; entries listed as \"- path\" are present by name only):\n\
+         {cfg_block}\n\
+         \n\
+         API CONTRACT ARTEFACTS (OpenAPI/Swagger/Protobuf/GraphQL/WSDL/META-INF — the\n\
+         explicit external interface):\n\
+         {api_block}\n\
+         \n\
+         DOCUMENTATION:\n\
+         {docs_block}\n\
+         \n\
+         BUILD / DEPENDENCY MANIFESTS:\n\
+         {manifest_block}\n\
+         \n\
+         KNOWN PRIOR CVEs (use as evidence; raises likelihood):\n\
+         {cve_block}\n\
+         \n\
+         DESIGN CONTROLS (lower likelihood where they apply):\n\
+         {ctl_block}\n\
+         \n\
+         TARGET: {repo_name}\n\
+         PRIMARY LANGUAGE: {}\n\
+         FILES IN AST FRONTIER: {} (from {} total in-scope files)\n\
          \n\
          MODULES (s1-mapped — treat as asset candidates):\n\
          {mod_block}\n\
@@ -311,27 +392,7 @@ pub fn build_user_prompt(
          \n\
          AST CALL EDGES (bounded frontier, one edge per line):\n\
          {edge_block}\n\
-         \n\
-         REPRESENTATIVE CONFIGURATION (one per component, post-dedup — reveals data\n\
-         stores, message buses, key/secret managers, TLS posture, external endpoints):\n\
-         {cfg_block}\n\
-         \n\
-         API CONTRACT ARTEFACTS (OpenAPI/Swagger/Protobuf/GraphQL/WSDL/META-INF — the\n\
-         explicit external interface):\n\
-         {api_block}\n\
          {notes_block}\n\
-         DOCUMENTATION:\n\
-         {docs_block}\n\
-         \n\
-         BUILD / DEPENDENCY MANIFESTS:\n\
-         {manifest_block}\n\
-         \n\
-         KNOWN PRIOR CVEs (use as evidence; raises likelihood):\n\
-         {cve_block}\n\
-         \n\
-         DESIGN CONTROLS (lower likelihood where they apply):\n\
-         {ctl_block}\n\
-         {baseline_block}\n\
          Produce the threat model JSON now. Anchor each trust_boundary.entry_point to\n\
          one of the ENTRY POINTS above where possible; use the STRIDE hint to seed\n\
          threats per boundary.",
@@ -405,8 +466,12 @@ mod tests {
     #[test]
     fn build_user_prompt_uses_defaults_for_empty_evidence() {
         let ev = empty_evidence();
-        let prompt = build_user_prompt("/repo", "myrepo", &ev, &[], &[], None, "");
-        assert!(prompt.contains("TARGET: myrepo  (/repo)"));
+        let prompt = build_user_prompt("myrepo", &ev, &[], &[], None, "");
+        assert!(prompt.contains("TARGET: myrepo\n"));
+        assert!(
+            !prompt.contains("/repo"),
+            "the absolute root is never rendered"
+        );
         assert!(prompt.contains("PRIMARY LANGUAGE: unknown"));
         assert!(prompt.contains("FILES IN AST FRONTIER: 0 (from 0 total in-scope files)"));
         assert!(prompt.contains("(none detected)"));
@@ -425,7 +490,7 @@ mod tests {
         let mut ev = empty_evidence();
         ev.file_count = 40;
         ev.original_file_count = 900;
-        let prompt = build_user_prompt("/repo", "myrepo", &ev, &[], &[], None, "");
+        let prompt = build_user_prompt("myrepo", &ev, &[], &[], None, "");
         assert!(prompt.contains("FILES IN AST FRONTIER: 40 (from 900 total in-scope files)"));
     }
 
@@ -438,7 +503,7 @@ mod tests {
             " lines 10-20".to_string(),
         )];
         ev.call_edges = vec![("caller".to_string(), "callee".to_string())];
-        let prompt = build_user_prompt("/repo", "myrepo", &ev, &[], &[], None, "");
+        let prompt = build_user_prompt("myrepo", &ev, &[], &[], None, "");
         assert!(prompt.contains("  - app.py::handler @ a.py:1, b.py:2 lines 10-20"));
         assert!(prompt.contains("  - caller -> callee"));
     }
@@ -455,7 +520,7 @@ mod tests {
             pii: false,
             source: "cmdb".to_string(),
         };
-        let prompt = build_user_prompt("/repo", "myrepo", &ev, &[], &[], Some(&ap), "");
+        let prompt = build_user_prompt("myrepo", &ev, &[], &[], Some(&ap), "");
         assert!(prompt.contains("CMDB APPLICATION PROFILE"));
         assert!(prompt.contains("Use externally_facing to set default actor"));
     }
@@ -480,7 +545,7 @@ mod tests {
             ),
         ];
         ev.entry_points_truncated = true;
-        let prompt = build_user_prompt("/repo", "myrepo", &ev, &[], &[], None, "");
+        let prompt = build_user_prompt("myrepo", &ev, &[], &[], None, "");
         assert!(prompt.contains("…(truncated)"));
         assert!(prompt.contains("UNAUTH"));
         assert!(prompt.contains("auth  "));
@@ -490,14 +555,19 @@ mod tests {
     fn build_user_prompt_renders_non_empty_top_dirs_api_docs_and_manifests() {
         let mut ev = empty_evidence();
         ev.top_dirs = vec!["src".to_string(), "tests".to_string()];
-        ev.config_reps = vec!["src/config.yaml".to_string()];
+        ev.config_reps = vec![
+            ("src/config.yaml".to_string(), String::new()),
+            ("WEB-INF/web.xml".to_string(), "<web-app/>".to_string()),
+        ];
         ev.api_artefacts = vec!["openapi.yaml".to_string()];
         ev.docs = vec![("README.md".to_string(), "hello world".to_string())];
         ev.manifests = vec![("Cargo.toml".to_string(), "[package]".to_string())];
-        let prompt = build_user_prompt("/repo", "myrepo", &ev, &[], &[], None, "");
+        let prompt = build_user_prompt("myrepo", &ev, &[], &[], None, "");
         assert!(prompt.contains("  - src/"));
         assert!(prompt.contains("  - tests/"));
         assert!(prompt.contains("  - src/config.yaml"));
+        assert!(prompt.contains("  === WEB-INF/web.xml ===\n<web-app/>"));
+        assert!(prompt.contains("carry redacted, length-capped file contents"));
         assert!(prompt.contains("  - openapi.yaml"));
         assert!(prompt.contains("=== README.md ===\nhello world"));
         assert!(prompt.contains("=== Cargo.toml ===\n[package]"));
@@ -519,7 +589,7 @@ mod tests {
             protects: vec!["app.py".to_string()],
             notes: "blocks XSS".to_string(),
         }];
-        let prompt = build_user_prompt("/repo", "myrepo", &ev, &cves, &controls, None, "");
+        let prompt = build_user_prompt("myrepo", &ev, &cves, &controls, None, "");
         assert!(prompt.contains("CVE-1 (CVSS 7.5, UNPATCHED): a bug"));
         assert!(prompt.contains("[auth] WAF → protects: app.py — blocks XSS"));
     }
@@ -534,7 +604,7 @@ mod tests {
             cvss: None,
             patched: true,
         }];
-        let prompt = build_user_prompt("/repo", "myrepo", &ev, &cves, &[], None, "");
+        let prompt = build_user_prompt("myrepo", &ev, &cves, &[], None, "");
         assert!(prompt.contains("CVE-2 (CVSS None, patched): unscored"));
     }
 
@@ -547,7 +617,7 @@ mod tests {
             protects: vec![],
             notes: String::new(),
         }];
-        let prompt = build_user_prompt("/repo", "myrepo", &ev, &[], &controls, None, "");
+        let prompt = build_user_prompt("myrepo", &ev, &[], &controls, None, "");
         assert!(prompt.contains("Global WAF → protects: global"));
     }
 
@@ -555,8 +625,25 @@ mod tests {
     fn build_user_prompt_includes_notes_and_baseline_block() {
         let mut ev = empty_evidence();
         ev.s1_notes = "some free-form notes".to_string();
-        let prompt = build_user_prompt("/repo", "myrepo", &ev, &[], &[], None, "\nBASELINE TEXT\n");
+        let prompt = build_user_prompt("myrepo", &ev, &[], &[], None, "\nBASELINE TEXT\n");
         assert!(prompt.contains("MAPPER OBSERVATIONS (s1 free-form):\nsome free-form notes"));
-        assert!(prompt.contains("BASELINE TEXT"));
+        assert!(prompt.starts_with("\nBASELINE TEXT\nLANGUAGE BREAKDOWN:"));
+    }
+
+    #[test]
+    fn system_prompt_requires_object_elements_and_baseline_dispositions() {
+        assert!(SYSTEM.contains("never a bare string"));
+        assert!(SYSTEM.contains("\"evidence\" starting \"baseline: <ID>\""));
+        assert!(SYSTEM.contains("the caller ranks\n   deterministically"));
+        assert!(!SYSTEM.contains("Sort by (impact,likelihood)"));
+        assert!(AGENTIC_SYSTEM_LINE.starts_with("\n\nYou have read-only tools (Read, Glob, Grep)"));
+    }
+
+    #[test]
+    fn repair_prompt_names_the_error_and_carries_the_broken_response() {
+        let p = repair_json_prompt("{\"assets\": [\"db\"]}", "assets[0]: expected an object");
+        assert!(p.starts_with("REPAIR TASK:\n"));
+        assert!(p.contains("PARSE/VALIDATION ERROR:\nassets[0]: expected an object\n"));
+        assert!(p.ends_with("BROKEN RESPONSE:\n{\"assets\": [\"db\"]}\n"));
     }
 }

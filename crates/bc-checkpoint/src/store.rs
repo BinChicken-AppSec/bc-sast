@@ -4,7 +4,8 @@ use crate::error::CheckpointError;
 /// `orchestrator/checkpoints.py`'s `save_ckpt`/`load_ckpt`: keyed by
 /// `(run_id, step)` — `run_id` derived per scanned-repo-path, `step` a
 /// fixed stage name (`"s1"`..`"s9"`) or a dynamic per-finding key
-/// (`"remediate_<idx>"`, `"validate_<id>"`) — carrying already-serialized
+/// (`"remediate_<digest>"`, `"validate_<digest>"`, see
+/// [`crate::step_key_for`]) — carrying already-serialized
 /// JSON bytes rather than a generic type, so the trait stays `dyn`-safe
 /// (a real implementation is selected at runtime from config, the same
 /// reason `LlmClient` in `bc-llm-client` is `dyn`-dispatched rather than
@@ -54,7 +55,7 @@ pub trait CheckpointStore: Send + Sync {
     }
 
     /// Clear every checkpoint row for `run_id` — both the fixed step keys
-    /// and the dynamic per-finding (`remediate_<idx>`) ones — ported from
+    /// and the dynamic per-finding (`remediate_<digest>`) ones — ported from
     /// `store.py::reset_run`. Called by a FRESH (non-`--resume`) run so
     /// stale rows from an earlier run of the same repo (same `run_id`,
     /// since it's derived purely from the resolved repo path) can never
@@ -64,5 +65,21 @@ pub trait CheckpointStore: Send + Sync {
     /// no-op (`0`) default.
     fn reset_run(&self, _run_id: &str) -> usize {
         0
+    }
+
+    /// Delete every checkpoint row of `run_id` whose step starts with
+    /// `prefix` but is not one of `live_keys`, returning the removed step
+    /// keys. Ported from `checkpoints.py::prune_stale_steps`.
+    ///
+    /// Engine-keyed steps ([`crate::step_key_for`]) are never overwritten
+    /// by a run under a different model or engine version; they just stop
+    /// being found. Without a prune they would accumulate for as long as
+    /// the run id lives, and a `--resume` that switched back to the old
+    /// model would find a result nobody expects it to. Callers pass the
+    /// keys the CURRENT run will use, so only rows no live finding claims
+    /// go. Best effort, like every other store write: a failure removes
+    /// nothing and is never fatal. A no-op (nothing removed) default.
+    fn prune_stale(&self, _run_id: &str, _prefix: &str, _live_keys: &[String]) -> Vec<String> {
+        Vec::new()
     }
 }

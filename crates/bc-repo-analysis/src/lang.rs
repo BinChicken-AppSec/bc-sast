@@ -72,7 +72,7 @@ pub fn ext_to_lang(ext: &str) -> Option<&'static str> {
 /// `"c"` and `"cpp"` are the one addition to the Python table: they are
 /// not `ext_to_lang` outputs, but `bc_stage_s4::hints::hint_key_for_path`
 /// splits `"c-cpp"` into them per file to pick a research lens, and that
-/// lens is labelled with this function.
+/// lens is labeled with this function.
 pub fn lang_display(key: &str) -> &str {
     match key {
         "c-cpp" => "C/C++",
@@ -159,9 +159,14 @@ static ANSIBLE_BODY_RX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\s*-?\s*(hosts|tasks|handlers|become|gather_facts|ansible\.[\w.]+)\s*:")
         .unwrap()
 });
+// The `COPY` alternative is anchored to a line start within the COBOL
+// sequence area (upstream v1.3): unanchored, any extension-less file that
+// merely contained prose like "COPY config." sniffed as COBOL, which then
+// pulled in the COBOL lens and the batch-etl specialist for a shell script
+// or a README-shaped file.
 static COBOL_BODY_RX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?im)IDENTIFICATION\s+DIVISION|PROCEDURE\s+DIVISION|WORKING-STORAGE\s+SECTION|^.{0,7}\d{2}\s+\S+.*\bPIC(?:TURE)?\s+[X9SVA]|^.{0,7}\d{2}\s+FILLER\b|\bCOPY\s+\w+\s*\.",
+        r"(?im)IDENTIFICATION\s+DIVISION|PROCEDURE\s+DIVISION|WORKING-STORAGE\s+SECTION|^.{0,7}\d{2}\s+\S+.*\bPIC(?:TURE)?\s+[X9SVA]|^.{0,7}\d{2}\s+FILLER\b|^.{0,7}\s+COPY\s+\w+\s*\.",
     )
     .unwrap()
 });
@@ -647,6 +652,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sniff_lang("SOMEPROG", Some(dir.path())), Some("cobol"));
+    }
+
+    #[test]
+    fn cobol_copy_statement_only_counts_at_a_line_start() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("MEMBER"), "       COPY CUSTREC.\n").unwrap();
+        assert_eq!(sniff_lang("MEMBER", Some(dir.path())), Some("cobol"));
+
+        // Prose that happens to say "copy x." mid-line is not COBOL.
+        std::fs::write(
+            dir.path().join("NOTES"),
+            "Remember to copy config. before running\n",
+        )
+        .unwrap();
+        assert_eq!(sniff_lang("NOTES", Some(dir.path())), None);
     }
 
     #[test]

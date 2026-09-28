@@ -94,7 +94,7 @@ fn walk(node: Node, src: &[u8], ctx: &Ctx, facts: &mut Facts) {
             return;
         }
         "function_declaration" => spring_function(node, src, ctx, facts),
-        // A recognised Ktor DSL call has already walked its own lambda.
+        // A recognized Ktor DSL call has already walked its own lambda.
         "call_expression" if ktor_call(node, src, ctx, facts) => return,
         _ => {}
     }

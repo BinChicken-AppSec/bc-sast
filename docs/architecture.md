@@ -23,9 +23,11 @@ crates/
     bc-prompts: shared, byte-identical prompt-cache-friendly prompt blocks
     bc-redact: card/PII/credential redaction (Luhn/IIN/SSN-gated)
     bc-validation-scoring: deterministic S11 fix-scoring engine (4 weighted gates)
-    bc-yaml: purpose-built YAML subset parser for this project's own configs
+    bc-yaml: purpose-built YAML subset parser for this project's own configs, with a strict mode for third-party files
+    bc-xml: purpose-built XML 1.0 reader/writer for SOAP/WSDL, XSD and OData CSDL (no DTDs, bounded, namespace-aware, span-based minimal edits)
 
   Tier 1: I/O boundaries and cross-cutting infrastructure
+    bc-api-spec: pure API description support (OpenAPI, GraphQL, AsyncAPI, OpenRPC, Protocol Buffers, RAML, API Blueprint, WSDL, OData CSDL): detection, placement, validation, emission and repair checks (bc-yaml, bc-xml, bc-redact, regex)
     bc-model: cross-stage domain model (ContextPackage, Finding, FinalReport)
     bc-config: YAML config load + step-defaults merge + ${VAR} env expansion (bc-yaml, bc-pathjail)
     bc-checkpoint: CheckpointStore trait + Null/SQLite implementations
@@ -37,7 +39,7 @@ crates/
                   evidence engine behind S0 (bc-json-repair, bc-yaml)
 
   Tier 2: dialect/tool implementations and report builders
-    bc-llm-anthropic / bc-llm-openai: Anthropic Messages / OpenAI Chat Completions LlmClient dialects
+    bc-llm-anthropic / bc-llm-openai: Anthropic Messages / OpenAI Chat Completions + Responses LlmClient dialects
     bc-llm-agentic: dialect-agnostic multi-turn agentic tool-use loop
     bc-sandbox-tools: jailed local Read/Glob/Grep(/Edit/Write) ToolExecutor
     bc-enrich: post-S7 CMDB-driven environmental CVSS + OffensivePriority
@@ -101,9 +103,9 @@ per its own doc comment:
 | **bc-stage-s0** seed | LLM-free (in `rules` mode) tree-sitter scan producing a `SeedPackage` S1 merges: entry points, unsafe sinks, taint paths, structured taint evidence, framework entry points, and a reusable call graph. | Empty `SeedPackage` on *any* failure (disabled, no supported language, no applicable rules, nothing matched) | none |
 | **bc-stage-s1** preprocess | Agentic Read/Glob/Grep exploration builds a rough structural map (language, modules, entry points, unsafe sinks, seed call graph); validated/filled out against ground truth by `bc-repo-analysis`'s deterministic passes. CMDB lookup and threat-model generation are explicitly *not* this stage's job. | Partial map on bad LLM response | none |
 | **bc-stage-s2** threatmodel | Single-shot, non-agentic LLM call over deterministically gathered evidence produces a `ThreatModel`. | **No internal degrade**. Errors propagate as `Err`; `bc-orchestrator` catches and falls back to `threat_model = None`. | any parse/shape failure |
-| **bc-stage-s3** decompose | Single-shot LLM call produces a risk-ranked manifest; a fully deterministic pipeline (taint-path chunks, oversize splitting, catch-all sweep, specialist passes) then fills coverage gaps in the eligible file inventory. Assignment to a chunk is not proof of complete analysis or vulnerability coverage. | Empty manifest + rationale, whether the *call* failed or the *response* was malformed. Both take the same path | none |
-| **bc-stage-s4** deepdive | N sequential LLM calls per chunk, majority-voted within the chunk then collapsed across chunks. `config.parallel` chunks in flight via `tokio::sync::Semaphore`/`JoinSet`. Each parsed finding passes through `bc-stage-s4::reanchor` before the vote (see "Temporal anchoring" below). | Per-chunk outcomes carried as data on `DeepdiveOutput.outcomes`, not a stage degrade | guardrail-abort gate |
-| **bc-stage-s5** prefilter | Deterministic gates (test/mock paths; hallucinated files, though a wrong directory on a real file is repaired when it resolves to exactly one inventory path; low confidence; missing evidence; then the language and route-guard gates below) cut obvious false positives without a model call, then S7's trivial-dup filter, then, past `pre_verify_threshold`, S7's semantic dedup. | Inherits S7's degrade transitively | none of its own |
+| **bc-stage-s3** decompose | Single-shot LLM call produces a risk-ranked manifest, grounded in a `F###`/`E###`/`K###` id inventory the reply must cite (ids resolve only to inventory files; a stray path is suffix-matched or dropped); a fully deterministic pipeline (taint-path chunks, oversize splitting, catch-all sweep, eleven surface-gated specialist lenses emitted shard-major, threat fallback) then fills coverage gaps in the eligible file inventory. Assignment to a chunk is not proof of complete analysis or vulnerability coverage. | Per chunk: an off-schema chunk is dropped and the rest kept. Empty manifest + rationale only when no usable `chunks` list exists, whether the *call* failed or the *response* was malformed | none |
+| **bc-stage-s4** deepdive | N sequential LLM calls per chunk, majority-voted within the chunk then collapsed across chunks. `config.parallel` chunks in flight via `tokio::sync::Semaphore`/`JoinSet`, dispatched in risk-rank order; a shard's specialist lenses share a cached prompt prefix and wait (without a permit) for the shard's first lens to return (`bc-stage-s4::shard_gate`). Each parsed finding passes through `bc-stage-s4::reanchor` before the vote (see "Temporal anchoring" below). | Per-chunk outcomes carried as data on `DeepdiveOutput.outcomes`, not a stage degrade | guardrail-abort gate |
+| **bc-stage-s5** prefilter | Deterministic gates (test/mock paths; hallucinated files, though a wrong directory on a real file is repaired when it resolves to exactly one inventory path; low confidence; missing evidence, except for point-of-occurrence findings such as hardcoded credentials and missing controls, which have no flow to cite; then the language and route-guard gates below) cut obvious false positives without a model call, then S7's trivial-dup filter, then, past `pre_verify_threshold`, S7's semantic dedup. | Inherits S7's degrade transitively | none of its own |
 | **bc-stage-s6** verify | For every S4/S5 survivor, a fresh agentic session (jailed to the repo) tries to *prove the finding wrong*, emitting TRUE/FALSE_POSITIVE + CVSS 3.1; only TRUE_POSITIVE above `min_confidence` continues. Concurrency mirrors S4. | Rejections become `DroppedFinding`, not a degrade | `max(3, parallel)` guardrail-blocked sessions with zero successes |
 | **bc-stage-s7** dedup | Deterministic same-file/vuln-class/line-tolerance pre-filter (`bc-dedup-core`), then an optional single-shot semantic LLM pass for what's left. The survivor of any cluster is chosen by content (sink-anchored end, then most severe, then the most specific/lowest CWE), never by arrival order, so back-to-back scans keep the same identity. | Deterministic-only result if the semantic call fails | none |
 | **bc-stage-s8** chain | Final analysis stage: one LLM call over all verified findings finds multi-step exploit chains, re-ranks severity by exploitability + design controls, checks combination with known unpatched CVEs. | Unranked `FinalReport` (`.degraded`/`.degraded_reason` fields) on call/parse/hydration failure | none; it always produces a valid report |
@@ -530,6 +532,16 @@ drives **bc-stage-s11**:
   `--auto-step1`/`step1.auto_exclude`, applied in `bc-cli::autoexclude`).
   Deliberately does not log anything itself; it reports what happened via
   `LoadedConfig` so a higher-tier caller decides how to surface it.
+- **Untrusted XML** (`bc-xml`): SOAP/WSDL, XSD and OData CSDL files in a
+  target repository, and Checkmarx `--checkmarx-xml` reports, are read
+  with the project's own XML 1.0 reader rather than a third-party engine,
+  for the same supply-chain reasons as `bc-yaml`. It fails closed: any
+  DOCTYPE is refused (so no external entities and no entity expansion),
+  only the five predefined entities exist, and input size, nesting depth,
+  attributes per element, node count and namespace bindings are all
+  bounded by a caller-supplied `Limits`.
+  Parsed elements and attributes keep their byte spans, so a repair is
+  applied as a minimal text edit instead of a re-serialized file.
 - **Redaction** (`bc-redact`): applied **once**, on the assembled
   `FinalReport` in `bc-orchestrator` (`redact_tree`, a JSON round-trip
   in S9, or for the typed S8 early-stop result), so downstream scan formats (Markdown, SARIF, CSV,
@@ -591,12 +603,19 @@ drives **bc-stage-s11**:
   wiring it to the run summary is separate work.
 - **LLM transport** (`bc-llm-client` + `bc-llm-anthropic`/`bc-llm-openai`):
   one dialect-agnostic `LlmClient` trait, implemented once per wire dialect
-  (Anthropic Messages API, OpenAI-compatible Chat Completions), either able
-  to point at a direct provider endpoint or an OpenAI/Anthropic-compatible
-  AI gateway (Bifrost, Portkey, etc). The agentic multi-turn tool-use loop
-  (`bc-llm-agentic::run_agentic`) is written once against this trait so it
-  runs identically regardless of dialect, unlike the Python original's
-  per-backend duplicated `agentic()` copies.
+  (Anthropic Messages API; OpenAI Chat Completions or the Responses API),
+  either able to point at a direct provider endpoint or an
+  OpenAI/Anthropic-compatible AI gateway (Bifrost, Portkey, etc). The
+  agentic multi-turn tool-use loop (`bc-llm-agentic::run_agentic`) is
+  written once against this trait so it runs identically regardless of
+  dialect, unlike the Python original's per-backend duplicated `agentic()`
+  copies. Provider-specific reasoning state (OpenAI reasoning items,
+  Anthropic thinking blocks) rides through that loop as opaque content
+  blocks each dialect replays verbatim. `bc_llm_client::capabilities`
+  decides per model which parameters are sent, a per-model quirk memory
+  learns what the table gets wrong, and `bc_llm_client::CachePolicy`
+  governs prompt caching on both providers. See
+  [`llm-transport.md`](llm-transport.md).
 - **Sandboxed tool execution** (`bc-sandbox-tools`): `Read`/`Glob`/`Grep`
   are available to read-only sessions; `Edit`/`Write` require
   `SandboxTools::new_with_write`, used by S10 and the controlled application
@@ -634,7 +653,10 @@ rebuild.
 `bc-target-tests` performs bounded static discovery. The CLI's
 `target_testing` module prepares baseline evidence, invokes read-only
 generation and review sessions, applies accepted tests, protects bound test
-bytes through S10, and records validation status. `target_executor` runs
+bytes through S10, and records validation status. Its `api_spec` submodule
+creates, repairs or relocates the target's API specification through the
+same generation and review discipline, with the deterministic rules in
+`bc-api-spec`. `target_executor` runs
 only approved commands in restricted Linux containers, with a network in
 the provisioning phase alone and a state that keeps an unprepared
 environment distinguishable from a failing test. This remains

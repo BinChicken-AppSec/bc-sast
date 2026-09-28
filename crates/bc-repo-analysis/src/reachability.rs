@@ -8,18 +8,7 @@ use bc_model::ContextPackage;
 
 use crate::callgraph::{q_file, q_name};
 use crate::graph_view::seed_reachable_files;
-use crate::lang::ext_to_lang;
-
-fn lang_of_file(f: &str) -> Option<&'static str> {
-    let ext = Path::new(f)
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
-        .unwrap_or_default();
-    if ext.is_empty() {
-        return None;
-    }
-    ext_to_lang(&ext)
-}
+use crate::source::lang_of_file;
 
 fn bfs(seeds: &HashSet<String>, graph: &HashMap<String, HashSet<String>>) -> HashSet<String> {
     let mut seen: HashSet<String> = seeds.clone();
@@ -57,7 +46,7 @@ fn bfs(seeds: &HashSet<String>, graph: &HashMap<String, HashSet<String>>) -> Has
 ///   a reachable function name is pulled in too, so an interface call
 ///   keeps every implementation file in scope;
 /// - S0 seed-taint-path files (widen-only, call-graph-blind evidence);
-/// - files in a language the S0 engine has no call-graph plugin for at
+/// - files in a language the call-graph engine produced no node for at
 ///   all (an "unknown", not a proven-unreachable, state).
 pub fn reachable_files(ctx: &ContextPackage) -> HashSet<String> {
     let mut fwd: HashMap<String, HashSet<String>> = HashMap::new();
@@ -118,12 +107,21 @@ pub fn reachable_files(ctx: &ContextPackage) -> HashSet<String> {
         .collect();
     let seed_files = seed_reachable_files(&ctx.seed_taint_paths);
 
-    let mut graph_node_files: HashSet<String> = ep_files
-        .iter()
-        .chain(sk_files.iter())
-        .chain(seed_files.iter())
-        .cloned()
-        .collect();
+    // Unknown-language fail-safe: the call graph only covers languages the
+    // S0/S1 engines parse, and a file in a language that contributed ZERO
+    // graph nodes is unreachable for lack of a parser, not by proof. Such
+    // files are treated as reachable, so `reachable_only` never drops a
+    // whole language.
+    //
+    // `covered_langs` is derived ONLY from files the call-graph engine
+    // itself produced a node or def-site for, never from entry-point, sink
+    // or seed files (upstream v1.3 fix). Those come from separate detectors
+    // (an LLM mapper, S0's static rules) that can register a file in a
+    // language the graph engine never parsed: seeding the check with them
+    // meant ONE entry point in language X marked X "covered", so every
+    // other file in X lost the fail-safe in exactly the case it exists for.
+    let repo_root = (!ctx.repo_root.is_empty()).then(|| Path::new(ctx.repo_root.as_str()));
+    let mut graph_node_files: HashSet<String> = HashSet::new();
     for (caller, callees) in &ctx.call_graph {
         let cf = q_file(caller);
         if !cf.is_empty() {
@@ -146,12 +144,12 @@ pub fn reachable_files(ctx: &ContextPackage) -> HashSet<String> {
     }
     let covered_langs: HashSet<&'static str> = graph_node_files
         .iter()
-        .filter_map(|f| lang_of_file(f))
+        .filter_map(|f| lang_of_file(f, repo_root))
         .collect();
     let unknown_lang_files: HashSet<String> = ctx
         .all_files
         .iter()
-        .filter(|f| lang_of_file(f).is_some_and(|lang| !covered_langs.contains(lang)))
+        .filter(|f| lang_of_file(f, repo_root).is_some_and(|lang| !covered_langs.contains(lang)))
         .cloned()
         .collect();
 
@@ -362,10 +360,54 @@ mod tests {
     }
 
     #[test]
-    fn a_file_with_no_extension_never_triggers_the_unknown_language_fail_safe() {
+    fn a_file_with_no_known_language_never_triggers_the_unknown_language_fail_safe() {
         let mut c = ctx();
-        c.all_files = vec!["Makefile".to_string()];
-        assert!(!reachable_files(&c).contains("Makefile"));
+        c.all_files = vec!["NOTES".to_string()];
+        assert!(!reachable_files(&c).contains("NOTES"));
+    }
+
+    #[test]
+    fn a_convention_named_file_counts_as_its_language_for_the_fail_safe() {
+        // `Makefile` resolves to "make" through the basename table, which
+        // no call-graph file covers, so it is kept as an unknown.
+        let mut c = ctx();
+        c.all_files = vec!["Makefile".to_string(), ".env".to_string()];
+        let reach = reachable_files(&c);
+        assert!(reach.contains("Makefile"));
+        assert!(reach.contains(".env"));
+    }
+
+    #[test]
+    fn an_entry_point_alone_does_not_mark_its_language_as_covered() {
+        // Regression for the v1.2 bug: a single Ruby entry point used to
+        // mark "ruby" covered, so every other Ruby file lost the fail-safe
+        // even though the graph engine never parsed a line of Ruby.
+        let mut c = ctx();
+        c.entry_points = vec![ep("app/controller.rb")];
+        c.call_graph
+            .insert("a.py::f".to_string(), vec!["b.py::g".to_string()]);
+        c.all_files = vec![
+            "a.py".to_string(),
+            "b.py".to_string(),
+            "c.py".to_string(),
+            "app/controller.rb".to_string(),
+            "app/model.rb".to_string(),
+        ];
+        let reach = reachable_files(&c);
+        assert!(reach.contains("app/model.rb"));
+        // Python IS covered by the graph, so an unconnected Python file is
+        // still pruned.
+        assert!(!reach.contains("c.py"));
+    }
+
+    #[test]
+    fn a_shebang_script_is_classified_through_the_repo_root() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("deploy"), "#!/bin/sh\necho hi\n").unwrap();
+        let mut c = ctx();
+        c.repo_root = dir.path().to_string_lossy().into_owned();
+        c.all_files = vec!["deploy".to_string()];
+        assert!(reachable_files(&c).contains("deploy"));
     }
 
     // ── reachable_only_too_sparse ────────────────────────────────────────

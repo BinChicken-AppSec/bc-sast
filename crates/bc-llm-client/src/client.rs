@@ -18,6 +18,21 @@ use crate::error::LlmError;
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError>;
+
+    /// Told once for every confirmed truncation, the moment
+    /// `bc-llm-agentic` gives up on a reply and returns
+    /// [`LlmError::Truncated`] (VVAH-E005): the Rust counterpart of the
+    /// Python original's `COUNTERS.bump("llm_truncated_replies")`. A
+    /// truncation the doubled retry fixed is not counted, matching
+    /// Python.
+    ///
+    /// A hook on the client rather than a counter threaded through every
+    /// stage because the client is already the one object every call
+    /// passes through: a metrics decorator wrapped around it (the
+    /// orchestrator's usage tracker) sees every stage's truncations
+    /// without any stage knowing it exists. The default is a no-op, and a
+    /// decorator that wraps another client must forward it.
+    fn note_truncated_reply(&self) {}
 }
 
 /// The output-token budget at or above which a request is worth
@@ -90,10 +105,14 @@ impl LlmClient for StreamLargeResponses {
         streamed.stream = true;
         self.inner.chat(&streamed).await
     }
+
+    fn note_truncated_reply(&self) {
+        self.inner.note_truncated_reply();
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::chat::{StopReason, Usage};
     use crate::message::Message;
@@ -131,7 +150,7 @@ mod tests {
     // tests. Every fake `LlmClient` in this module resolves on its first
     // poll, so a single `poll()` call would suffice, but looping keeps this
     // driver correct if a future ever legitimately returns `Pending`.
-    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         use std::task::{Context, Poll, Waker};
 
         let waker = Waker::noop();
@@ -227,6 +246,40 @@ mod tests {
         let req = ChatRequest::new("m", vec![Message::user_text("hi")], 21_333);
         block_on(client.chat(&req)).unwrap();
         assert_eq!(*probe.0.lock().unwrap(), Some(true));
+    }
+
+    /// Counts the truncation notes it is handed.
+    struct TruncationCounter(std::sync::atomic::AtomicU32);
+
+    #[async_trait]
+    impl LlmClient for TruncationCounter {
+        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            Err(LlmError::Other {
+                message: "not a real client".to_string(),
+            })
+        }
+
+        fn note_truncated_reply(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn the_default_truncation_note_is_a_harmless_no_op() {
+        EchoClient.note_truncated_reply();
+    }
+
+    #[test]
+    fn the_streaming_wrapper_forwards_a_truncation_note_to_the_client_it_wraps() {
+        let counter = std::sync::Arc::new(TruncationCounter(std::sync::atomic::AtomicU32::new(0)));
+        let client = StreamLargeResponses::new(counter.clone());
+        client.note_truncated_reply();
+        client.note_truncated_reply();
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // Chatting through the wrapper is not a truncation note.
+        let req = ChatRequest::new("m", vec![Message::user_text("hi")], 1);
+        assert!(block_on(client.chat(&req)).is_err());
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[test]

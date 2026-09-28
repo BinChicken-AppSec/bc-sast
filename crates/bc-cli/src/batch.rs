@@ -396,7 +396,7 @@ pub async fn run_batch(cli: &Cli, manifest_path: &Path) -> Result<BatchSummary, 
         entry_cli.app_id = entry.app_id.clone();
         // Always from the manifest, never from the (refused above)
         // top-level flag — so an entry with no baseline column runs with
-        // no baseline at all rather than inheriting a neighbour's.
+        // no baseline at all rather than inheriting a neighbor's.
         entry_cli.baseline = entry.baseline.clone();
         // Never reuse a single shared `--out-dir`/`--out-*` override
         // across entries. Every entry falling back to its own

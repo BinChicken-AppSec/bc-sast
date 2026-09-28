@@ -69,7 +69,7 @@ jobs:
       # sha. It is also the sha `--git-sha` must be given, because
       # comments anchored to a commit that is not part of the PR are
       # rejected by GitHub's API.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
@@ -172,6 +172,6 @@ jobs:
       # still produces a report and partial results are worth surfacing.
       - name: Upload to Code Scanning
         if: always() && hashFiles('security-scan/report.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@87ef0dc97def48aa960fbf026a2563ee9dbdb470 # v3
         with:
           sarif_file: security-scan/report.sarif

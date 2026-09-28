@@ -2,8 +2,14 @@
 //! rather than by re-parsing a rendered Markdown report the way the
 //! Python original's `vvaharness/report/enrich.py::generate_sarif` does.
 //! See each submodule for the ported section; [`fingerprint`] is the one
-//! net-new addition (the Python source emits no `partialFingerprints` at
-//! all).
+//! net-new addition. It predates upstream having any equivalent, and the
+//! two have since diverged in a way worth keeping: upstream v1.4.0's
+//! `orchestrator/sarif_ids.py` stamps `vvaFindingId/v1` with the case id
+//! its run minted, matched onto results by location, whereas this emits a
+//! hash of the normalized path and the on-disk source text. A minted id is
+//! stable only within the run that minted it; a content hash survives the
+//! finding moving to a different line, which is what lets a code-scanning
+//! service recognize the same alert across commits.
 
 mod fingerprint;
 mod invocation;

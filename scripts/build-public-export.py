@@ -26,6 +26,15 @@ EXCLUDE = [
     ".github/workflows/terraform-apply.yml",      # our infrastructure pipeline
     "docs/discovered-execution-verification.md",  # internal verification record
     "docs/provider-writeback-plan.md",            # internal roadmap and pilots
+    # Raw image-generation prompt transcripts. Kept here as provenance for the
+    # artwork, but a published repository has no use for the prompts that made
+    # its diagrams, and README discloses that they are AI-generated anyway.
+    "docs/infographics/prompts.json",
+    "docs/infographics/edit-prompts.json",
+    "TODO.md",                                    # internal follow-ups; names the
+                                                  # private demo repo, and the public
+                                                  # statement of limits is README's
+                                                  # Status section
 ]
 
 # Passages that are true in the private repository and false in the public
@@ -68,6 +77,35 @@ DROP_LINES = [
     ("docs/README.md", "- [`provider-writeback-plan.md`](provider-writeback-plan.md)", 2),
     ("docs/README.md", "- `../terraform/`, an **optional internal example**", 4),
 ]
+
+
+# Commit-author addresses that may appear in a history this repository could
+# ever publish. The export itself never carries history (see `git archive`
+# below), so an address outside this set is not a leak in the exported tree;
+# it is a warning that publishing this repository's *history* instead of an
+# export would de-anonymize the maintainer.
+ANONYMOUS_AUTHORS = {
+    "189714617+BinChickens@users.noreply.github.com",
+    "BinChickens69@users.noreply.github.com",
+    "noreply@anthropic.com",
+}
+
+
+def audit_commit_authors(repo: pathlib.Path) -> list[str]:
+    """Addresses in this repository's history that are not anonymous.
+
+    Reported, not fatal. The export is a tree snapshot, so these never reach
+    the exported files; the check exists because the one publish path that
+    *would* carry them is a plain `git push` of this repository, and a
+    warning here is where someone about to publish will actually see it.
+    """
+    log = subprocess.run(
+        ["git", "-C", str(repo), "log", "--all", "--format=%ae"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return sorted({a for a in log.stdout.split() if a and a not in ANONYMOUS_AUTHORS})
 
 
 def main() -> int:
@@ -119,6 +157,18 @@ def main() -> int:
         path.write_text("\n".join(lines), encoding="utf-8")
 
     print(f"exported {sum(1 for _ in dest.rglob('*') if _.is_file())} files to {dest}")
+
+    leaks = audit_commit_authors(repo)
+    if leaks:
+        print(
+            "\nNOTE: this repository's history carries commit authors that are not\n"
+            "anonymous. The exported tree above does NOT contain them, because the\n"
+            "export is a tree snapshot. Publish the export, never this repository's\n"
+            "history, and keep this repository private:",
+            file=sys.stderr,
+        )
+        for address in leaks:
+            print(f"  {address}", file=sys.stderr)
     return 0
 
 

@@ -82,7 +82,7 @@ pub fn folders_scanned<'a>(files: impl IntoIterator<Item = &'a str>) -> Vec<Stri
 }
 
 /// A chunk's classification for its `ScopeEntry.kind`, mirroring the S3
-/// decompose stage's own specialist/catchall/risk labelling.
+/// decompose stage's own specialist/catchall/risk labeling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkKind {
     Risk,
@@ -115,7 +115,7 @@ pub fn chunk_kind(chunk_id: &str, specialist: bool) -> ChunkKind {
 
 /// Count of chunk outcomes that are anything other than `"completed"`.
 /// Matches the Python original's "absent entirely (legacy --resume) counts
-/// as zero failed, not a false alarm" behaviour by construction — an
+/// as zero failed, not a false alarm" behavior by construction — an
 /// absent chunk simply isn't in the iterator at all.
 pub fn count_failed_chunks<'a>(outcomes: impl IntoIterator<Item = &'a str>) -> usize {
     outcomes.into_iter().filter(|&v| v != "completed").count()

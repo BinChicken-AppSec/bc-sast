@@ -164,19 +164,26 @@ pub async fn semantic_dedup(
         temperature: config.temperature,
         top_p: config.top_p,
         seed: config.seed,
+        reasoning_effort: config.reasoning_effort,
+        openai_api: config.openai_api,
         thinking_budget: None,
         betas: Vec::new(),
         json_mode: false,
         timeout: config.timeout_secs.map(std::time::Duration::from_secs),
         stream: false,
+        cache_key: Some("s7".to_string()),
+        ..ChatRequest::default()
     };
-    let response = bc_llm_agentic::chat_with_retry(
-        client,
-        &request,
-        config.max_transient_retries,
-        config.retry_backoff_base,
-    )
-    .await?;
+    let response = bc_llm_agentic::salvage_truncated(
+        bc_llm_agentic::chat_with_retry(
+            client,
+            &request,
+            config.max_transient_retries,
+            config.retry_backoff_base,
+        )
+        .await,
+        "s7",
+    )?;
     Ok(parse_dedup_output(&response.text(), unresolved.len()))
 }
 

@@ -36,8 +36,9 @@ use fancy_regex::Regex as FancyRegex;
 use regex::Regex;
 use serde_json::{json, Value};
 
+use crate::pattern_scan::pattern_scan;
 use crate::schema::fact_tool_specs;
-use crate::walk::walk_jailed_files;
+use crate::scope::iter_in_scope_files;
 
 /// The five tool names, in `validation/constants/tools.py:22-31`'s order
 /// (after its three readers). Exported so `bc_stage_s11` can append them
@@ -54,7 +55,6 @@ pub const FACT_TOOL_NAMES: [&str; 5] = [
 
 // ── validation/constants/diff.py ────────────────────────────────────────
 
-const DIFF_PATCH_FILENAME: &str = "diff.patch";
 const GIT_HEADER_PREFIX: &str = "diff --git ";
 /// A well-formed `diff --git a/<old> b/<new>` header splits into at least
 /// 4 tokens; fewer means it is truncated and carries no usable new-side
@@ -78,60 +78,6 @@ static HUNK_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
         .expect("HUNK_HEADER_RE is a compile-time-constant valid regex")
 });
-
-// ── validation/constants/pattern_sets.py ────────────────────────────────
-
-/// Rule tag emitted for matches from the builtin pattern sets
-/// (`validation/constants/pattern_sets.py:34`).
-const BUILTIN_RULE: &str = "__builtin__";
-
-/// `s1_preprocess.py:329-342`'s `_SECRET_RX`, which
-/// `validation/constants/pattern_sets.py:25` reuses verbatim as the
-/// `secret_exposure` set. The negative lookaheads skip templated /
-/// encrypted refs (`{{var}}`, `${VAR}`, `CRYPT:…`, `ENC(…)`, `<%= … %>`,
-/// `vault:…`) and nested-key false positives (`auth-token:\n  timeout:` —
-/// a "value" that is really another key), which is why this needs
-/// `fancy-regex` rather than the `regex` crate.
-///
-/// Deliberately restated here rather than imported from
-/// `bc_repo_analysis`, where the same two patterns already live as
-/// private statics behind `dedup.rs`'s `suspicious_set`: Python has the
-/// import (`from ...s1_preprocess import _INSECURE_RX, _SECRET_RX`), but
-/// exporting them from `bc-repo-analysis` would widen that crate's public
-/// API for one consumer. The pairing is covered by
-/// `regexes_match_the_s1_preprocess_originals` below, which pins the exact
-/// pattern text this file must keep in step with.
-static SECRET_RX: LazyLock<FancyRegex> = LazyLock::new(|| {
-    FancyRegex::new(
-        r#"(?i)(?:password|passwd|pwd|secret|api[_-]?key|apikey|access[_-]?key|auth[_-]?token|private[_-]?key|client[_-]?secret|credential)s?[ \t]*[:=][ \t]*['"]?(?!CRYPT:|ENC\(|\{\{|\$\{|<%=|<%|vault:|secret:|file:|/)(?![\w.-]+[ \t]*:)[^\s'",}{]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b|\bxox[baprs]-[0-9A-Za-z-]{10,}\b|\bgh[pousr]_[0-9A-Za-z]{36,}\b|\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"#,
-    )
-    .expect("SECRET_RX is a compile-time-constant valid regex")
-});
-
-/// `s1_preprocess.py:345-355`'s `_INSECURE_RX`, reused by
-/// `validation/constants/pattern_sets.py:26` as the `insecure_value` set:
-/// insecure *values* (not secrets) — disabled TLS verification, `debug:
-/// true`, anonymous auth.
-static INSECURE_RX: LazyLock<FancyRegex> = LazyLock::new(|| {
-    FancyRegex::new(
-        r#"(?i)\b(?:verify|verif(?:y|ication)[_-]?ssl|ssl[_-]?verify|validate[_-]?cert\w*|tls[_-]?verify|check[_-]?hostname|reject[_-]?unauthori[sz]ed)\b\s*[:=]\s*['"]?(?:false|0|no|none|off)\b|\binsecure\w*\s*[:=]\s*['"]?(?:true|1|yes)\b|\bInsecureSkipVerify\s*[:=]\s*true\b|\b(?:auth|authentication|authn|security)\s*[:=]\s*['"]?(?:none|disabled|off|false)\b|\bdebug\s*[:=]\s*['"]?(?:true|1|yes)\b|\ballow[_-]?anonymous\s*[:=]\s*['"]?(?:true|1|yes)\b"#,
-    )
-    .expect("INSECURE_RX is a compile-time-constant valid regex")
-});
-
-/// `DEFAULT_PATTERN_SETS` (`validation/constants/pattern_sets.py:24-27`):
-/// set name -> (human description, compiled pattern).
-fn pattern_set(name: &str) -> Option<(&'static str, &'static FancyRegex)> {
-    match name {
-        "secret_exposure" => Some(("hardcoded secret or credential", &SECRET_RX)),
-        "insecure_value" => Some(("insecure configuration value", &INSECURE_RX)),
-        _ => None,
-    }
-}
-
-/// Sorted for the error message, matching Python's
-/// `sorted(DEFAULT_PATTERN_SETS)`.
-const PATTERN_SET_NAMES: [&str; 2] = ["insecure_value", "secret_exposure"];
 
 // ── validation/constants/test_inventory.py ──────────────────────────────
 
@@ -181,85 +127,6 @@ static MARKER_PATTERNS: LazyLock<Vec<(&'static str, FancyRegex)>> = LazyLock::ne
         .collect()
 });
 
-// ── validation/tools/_scope.py ──────────────────────────────────────────
-
-/// The production exclude set mixes infra/vendor dirs with test dirs. The
-/// secret scan wants both gone (tests are not production surface); the
-/// test inventory needs the test dirs kept. This is the test half of that
-/// partition (`validation/tools/_scope.py:36-39`); the infra half is
-/// whatever remains of [`bc_repo_analysis::DEFAULT_EXCLUDE_DIRS`].
-const TEST_DIRS: [&str; 11] = [
-    "test",
-    "tests",
-    "__tests__",
-    "__test__",
-    "e2e",
-    "testdata",
-    "fixtures",
-    "__fixtures__",
-    "mocks",
-    "__mocks__",
-    "stubs",
-];
-
-static INFRA_DIRS: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
-    bc_repo_analysis::DEFAULT_EXCLUDE_DIRS
-        .iter()
-        .map(|d| d.to_lowercase())
-        .filter(|d| !TEST_DIRS.contains(&d.as_str()))
-        .collect()
-});
-
-static EXCLUDE_EXTS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    bc_repo_analysis::DEFAULT_EXCLUDE_EXTS
-        .iter()
-        .map(|e| e.to_lowercase())
-        .collect()
-});
-
-/// Every file under `root` within the production scan scope, as
-/// `(repo-relative POSIX path, absolute path)` pairs sorted by absolute
-/// path — ported from `iter_in_scope_files`
-/// (`validation/tools/_scope.py:75-93`).
-///
-/// Always skips infra/vendor dirs and binary/media extensions; test dirs
-/// are skipped unless `include_tests`. The symlink-escape guard Python
-/// spells out as `_escapes_workspace` is already the standing behaviour of
-/// [`walk_jailed_files`], which re-confines every discovered entry through
-/// [`bc_pathjail::confine`] — so a symlink pointing at `/etc/shadow` never
-/// reaches the scanners here either.
-fn iter_in_scope_files(root: &Path, include_tests: bool) -> Vec<(String, PathBuf)> {
-    let mut out = Vec::new();
-    for path in walk_jailed_files(root, root) {
-        // `walk_jailed_files` only ever builds paths by extending `root`,
-        // so `strip_prefix` cannot actually fail; `unwrap_or` keeps that
-        // fact from becoming an untested error arm.
-        let rel_str = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let (dirs, name) = match rel_str.rsplit_once('/') {
-            Some((dirs, name)) => (dirs, name),
-            None => ("", rel_str.as_str()),
-        };
-        let in_excluded_dir = dirs.split('/').any(|part| {
-            let lowered = part.to_lowercase();
-            INFRA_DIRS.contains(&lowered)
-                || (!include_tests && TEST_DIRS.contains(&lowered.as_str()))
-        });
-        if in_excluded_dir {
-            continue;
-        }
-        let lowered_name = name.to_lowercase();
-        if EXCLUDE_EXTS.iter().any(|ext| lowered_name.ends_with(ext)) {
-            continue;
-        }
-        out.push((rel_str, path));
-    }
-    out
-}
-
 // ── validation/tools/diff_facts.py ──────────────────────────────────────
 
 /// One file's added line ranges, as parsed out of a unified diff
@@ -271,7 +138,7 @@ fn iter_in_scope_files(root: &Path, include_tests: bool) -> Vec<(String, PathBuf
 /// (`diff_facts.py:68-71`). The shape is part of the LLM-facing tool
 /// contract, so it is preserved exactly; the tool schema below says
 /// `[start_line, line_count]` in so many words, since a model handed a
-/// bare pair labelled "range" will otherwise read the second element as an
+/// bare pair labeled "range" will otherwise read the second element as an
 /// end line and cite the wrong code.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileChange {
@@ -438,70 +305,9 @@ pub fn diff_impact_map(diff: &str) -> Value {
 }
 
 // ── validation/tools/pattern_scanner.py ─────────────────────────────────
-
-/// Scan the in-scope tree under `root` with `set_name` and return ordered
-/// matches, ported from `pattern_scan`
-/// (`validation/tools/pattern_scanner.py:30-68`). An unknown set is an
-/// `Err` so the caller gets a signal rather than a clean-looking empty
-/// list — Python raises `ValueError` for the same reason.
-///
-/// **One deliberate divergence: match snippets are redacted.** Python
-/// hands the persona the literal matched text, which for the
-/// `secret_exposure` set IS the credential. Every other path by which
-/// source text reaches a model in this port goes through
-/// [`bc_redact::redact`] first (see [`crate::SandboxTools`]'s
-/// `redact_reads`), and the validator's own system prompt forbids echoing
-/// plaintext secrets — a tool that hands one over unmasked defeats both.
-/// The finding is unaffected: file, line, pattern set and description are
-/// all still exact, which is what the persona needs to go look.
-pub fn pattern_scan(root: &Path, set_name: &str) -> Result<Value, String> {
-    let Some((description, regex)) = pattern_set(set_name) else {
-        return Err(format!(
-            "unknown pattern_set '{set_name}'; available: {}",
-            PATTERN_SET_NAMES.join(", ")
-        ));
-    };
-
-    let mut matches: Vec<(String, usize, Value)> = Vec::new();
-    for (rel, path) in iter_in_scope_files(root, false) {
-        // `diff.patch` is the host's own artifact in Python's staged
-        // workspace, never target source. This port passes the diff in as
-        // text instead, but a scan target that happens to carry a file by
-        // that name is still not production surface — keeping the skip
-        // costs nothing and keeps the two implementations comparable.
-        if rel.rsplit('/').next() == Some(DIFF_PATCH_FILENAME) {
-            continue;
-        }
-        let Ok(raw_bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        if raw_bytes.contains(&0u8) {
-            continue; // a NUL byte means binary
-        }
-        let text = String::from_utf8_lossy(&raw_bytes);
-        // `map_while(Result::ok)` is `fancy-regex`'s backtrack-limit
-        // escape hatch: a pathological file stops contributing matches
-        // rather than failing the whole scan (Python's `re` has no such
-        // limit and simply never errors here).
-        for found in regex.find_iter(&text).map_while(Result::ok) {
-            let line = text[..found.start()].matches('\n').count() + 1;
-            matches.push((
-                rel.clone(),
-                line,
-                json!({
-                    "file": rel,
-                    "line": line,
-                    "snippet": bc_redact::redact(found.as_str()),
-                    "pattern_set": set_name,
-                    "rule": BUILTIN_RULE,
-                    "description": description,
-                }),
-            ));
-        }
-    }
-    matches.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
-    Ok(Value::Array(matches.into_iter().map(|m| m.2).collect()))
-}
+//
+// Lives in `crate::pattern_scan`: since v1.4 it is a bounded scanner with
+// its own limits and summary record, big enough to stand alone.
 
 // ── validation/tools/test_inventory.py ──────────────────────────────────
 

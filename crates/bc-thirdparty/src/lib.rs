@@ -22,7 +22,6 @@ pub mod checkmarx;
 pub mod semgrep;
 pub mod snyk;
 pub mod sonatype;
-mod xml;
 
 use bc_model::{Finding, VulnClass};
 

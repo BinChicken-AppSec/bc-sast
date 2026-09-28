@@ -21,7 +21,7 @@ use std::path::Path;
 
 use bc_model::ContextPackage;
 
-fn file_call_graph(ctx: &ContextPackage) -> BTreeMap<String, BTreeSet<String>> {
+pub(crate) fn file_call_graph(ctx: &ContextPackage) -> BTreeMap<String, BTreeSet<String>> {
     let mut adj: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (caller, callees) in &ctx.call_graph {
         let cf = bc_repo_analysis::q_file(caller);
@@ -39,12 +39,70 @@ fn file_call_graph(ctx: &ContextPackage) -> BTreeMap<String, BTreeSet<String>> {
     adj
 }
 
+/// Parent directory of a repo-relative path, `"."` for a root-level file
+/// (`PurePosixPath(f).parent`).
+fn parent_dir(f: &str) -> &str {
+    match f.rsplit_once('/') {
+        Some((parent, _)) if !parent.is_empty() => parent,
+        _ => ".",
+    }
+}
+
+/// Fold the smallest directory group into its own parent, one level at a
+/// time, until at most `max_groups` remain (or nothing more can merge).
+/// Smallest-first bounds how many files move per merge, and one level at a
+/// time (never straight to the root) means a handful of oversize monorepo
+/// directories do not all collapse into `"."` on the first pass. `0`
+/// disables the cap. Ported from upstream v1.3 `_merge_dir_groups_to_cap`.
+///
+/// Terminates: every iteration removes one non-root key and either merges
+/// it into an existing key (the count drops by one) or re-inserts it one
+/// path segment shorter, and a path has finitely many segments.
+fn merge_dir_groups_to_cap(
+    mut groups: BTreeMap<String, Vec<String>>,
+    max_groups: usize,
+) -> BTreeMap<String, Vec<String>> {
+    if max_groups == 0 {
+        return groups;
+    }
+    // Keys are unique, so while the count exceeds a cap of at least one
+    // there is always a non-root candidate; the `flatten` is what stops
+    // the loop, never a separate "nothing to merge" branch.
+    while let Some(smallest) = (groups.len() > max_groups)
+        .then(|| {
+            groups
+                .iter()
+                .filter(|(k, _)| k.as_str() != ".")
+                .min_by(|(ka, va), (kb, vb)| va.len().cmp(&vb.len()).then_with(|| ka.cmp(kb)))
+                .map(|(k, _)| k.clone())
+        })
+        .flatten()
+    {
+        let parent = parent_dir(&smallest).to_string();
+        let moved = groups.remove(&smallest).unwrap_or_default();
+        groups.entry(parent).or_default().extend(moved);
+    }
+    groups
+}
+
 /// Partition `files` into semantically related groups so a researcher sees
 /// callers and callees together. Preference order: `ctx.modules` (S1's
-/// agentic grouping), then call-graph connected components, then a
-/// depth-2-directory fallback for whatever has no graph edges. Every input
-/// file lands in exactly one group.
-pub fn cohesive_groups(files: &[String], ctx: &ContextPackage) -> Vec<(String, Vec<String>)> {
+/// agentic grouping), then call-graph connected components, then the
+/// file's immediate parent directory for whatever has no graph edges
+/// (`"."` for a root-level file). When the directory fallback alone
+/// yields more than `max_groups` groups, the smallest fold into their
+/// parents until the count fits (`0` disables the cap). Every input file
+/// lands in exactly one group.
+///
+/// Upstream v1.3 keys the fallback by the immediate parent rather than the
+/// first two path segments: the depth-2 key lumped whole subtrees (all of
+/// `src/main` in a Java monorepo) into one group, so unrelated packages were
+/// reviewed together, while the cap keeps the group count bounded.
+pub fn cohesive_groups(
+    files: &[String],
+    ctx: &ContextPackage,
+    max_groups: usize,
+) -> Vec<(String, Vec<String>)> {
     let mut pending: BTreeSet<String> = files.iter().cloned().collect();
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
 
@@ -103,15 +161,13 @@ pub fn cohesive_groups(files: &[String], ctx: &ContextPackage) -> Vec<(String, V
 
     let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for f in &pending {
-        let parts: Vec<&str> = f.split('/').collect();
-        let key = if parts.len() > 1 {
-            format!("{}/{}", parts[0], parts[1])
-        } else {
-            ".".to_string()
-        };
-        by_dir.entry(key).or_default().push(f.clone());
+        by_dir
+            .entry(parent_dir(f).to_string())
+            .or_default()
+            .push(f.clone());
     }
-    for (key, files) in by_dir {
+    for (key, mut files) in merge_dir_groups_to_cap(by_dir, max_groups) {
+        files.sort();
         groups.push((key, files));
     }
 
@@ -158,7 +214,7 @@ mod tests {
             purpose: "p".to_string(),
         }];
         let files = vec!["a.py".to_string(), "b.py".to_string(), "c.py".to_string()];
-        let groups = cohesive_groups(&files, &ctx);
+        let groups = cohesive_groups(&files, &ctx, 0);
         assert_eq!(
             groups[0],
             (
@@ -178,7 +234,7 @@ mod tests {
             purpose: "p".to_string(),
         }];
         let files = vec!["a.py".to_string()];
-        let groups = cohesive_groups(&files, &ctx);
+        let groups = cohesive_groups(&files, &ctx, 0);
         assert!(groups.iter().all(|(name, _)| name != "unrelated"));
         assert_eq!(groups, vec![(".".to_string(), vec!["a.py".to_string()])]);
     }
@@ -192,7 +248,7 @@ mod tests {
         ctx.call_graph
             .insert("bare_name".to_string(), vec!["b.py::helper".to_string()]);
         let files = vec!["b.py".to_string()];
-        let groups = cohesive_groups(&files, &ctx);
+        let groups = cohesive_groups(&files, &ctx, 0);
         // No graph edge reaches b.py (the caller side had no file), so it
         // falls through to the directory-bucket fallback.
         assert_eq!(groups, vec![(".".to_string(), vec!["b.py".to_string()])]);
@@ -206,28 +262,96 @@ mod tests {
             vec!["b.py::helper".to_string()],
         );
         let files = vec!["a.py".to_string(), "b.py".to_string()];
-        let groups = cohesive_groups(&files, &ctx);
+        let groups = cohesive_groups(&files, &ctx, 0);
         assert_eq!(groups.len(), 1);
         assert!(groups[0].0.starts_with("cg:"));
         assert_eq!(groups[0].1, vec!["a.py".to_string(), "b.py".to_string()]);
     }
 
+    fn strs(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn files_with_no_graph_edges_fall_back_to_depth_2_directory() {
+    fn files_with_no_graph_edges_fall_back_to_their_immediate_parent_directory() {
         let ctx = minimal_ctx();
-        let files = vec![
-            "src/pkg/a.py".to_string(),
-            "src/pkg/b.py".to_string(),
-            "top.py".to_string(),
-        ];
-        let groups = cohesive_groups(&files, &ctx);
+        let files = strs(&["src/pkg/a.py", "src/pkg/b.py", "src/pkg/sub/c.py", "top.py"]);
+        let groups = cohesive_groups(&files, &ctx, 0);
         let group_map: std::collections::HashMap<&str, &Vec<String>> =
             groups.iter().map(|(k, v)| (k.as_str(), v)).collect();
         assert_eq!(
             group_map["src/pkg"],
-            &vec!["src/pkg/a.py".to_string(), "src/pkg/b.py".to_string()]
+            &strs(&["src/pkg/a.py", "src/pkg/b.py"])
         );
-        assert_eq!(group_map["."], &vec!["top.py".to_string()]);
+        // Depth 3 is its own group now; the old depth-2 key merged it in.
+        assert_eq!(group_map["src/pkg/sub"], &strs(&["src/pkg/sub/c.py"]));
+        assert_eq!(group_map["."], &strs(&["top.py"]));
+    }
+
+    #[test]
+    fn parent_dir_is_the_root_for_a_top_level_or_leading_slash_path() {
+        assert_eq!(parent_dir("/a.py"), ".");
+        assert_eq!(parent_dir("a.py"), ".");
+        assert_eq!(parent_dir("x/y/a.py"), "x/y");
+    }
+
+    #[test]
+    fn the_group_cap_folds_the_smallest_directory_into_its_parent() {
+        let ctx = minimal_ctx();
+        let files = strs(&[
+            "app/a/1.py",
+            "app/a/2.py",
+            "app/a/3.py",
+            "app/b/1.py",
+            "app/b/2.py",
+            "lib/1.py",
+            "lib/2.py",
+            "lib/3.py",
+            "lib/4.py",
+            "app/c.py",
+        ]);
+        // Four directory groups (`app`, `app/a`, `app/b`, `lib`), cap
+        // three: `app` (1 file) is the smallest and folds into ".", which
+        // is a NEW key, so the count stays at four; the next-smallest,
+        // `app/b` (2 files), then folds into `app`... and so on until the
+        // count fits. The file set itself never changes.
+        let groups = cohesive_groups(&files, &ctx, 3);
+        assert_eq!(groups.len(), 3);
+        let keys: Vec<&str> = groups.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec![".", "app/a", "lib"]);
+        assert_eq!(groups[0].1, strs(&["app/b/1.py", "app/b/2.py", "app/c.py"]));
+        let mut flat: Vec<String> = groups.into_iter().flat_map(|(_, fs)| fs).collect();
+        flat.sort();
+        let mut want = files.clone();
+        want.sort();
+        assert_eq!(flat, want);
+    }
+
+    #[test]
+    fn merge_dir_groups_to_cap_breaks_size_ties_by_name() {
+        let mut by_dir = BTreeMap::new();
+        by_dir.insert("b".to_string(), strs(&["b/1.py"]));
+        by_dir.insert("a".to_string(), strs(&["a/1.py"]));
+        by_dir.insert(".".to_string(), strs(&["1.py", "2.py"]));
+        // Cap 2 from 3: "a" and "b" tie on size, "a" sorts first, and its
+        // parent is the existing root group.
+        let merged = merge_dir_groups_to_cap(by_dir, 2);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged["."], strs(&["1.py", "2.py", "a/1.py"]));
+        assert!(merged.contains_key("b"));
+    }
+
+    #[test]
+    fn merge_dir_groups_to_cap_never_moves_the_root_group_and_stops_there() {
+        let mut by_dir = BTreeMap::new();
+        by_dir.insert(".".to_string(), strs(&["1.py"]));
+        by_dir.insert("a/b".to_string(), strs(&["a/b/1.py", "a/b/2.py"]));
+        let merged = merge_dir_groups_to_cap(by_dir.clone(), 1);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged["."].len(), 3);
+        // A cap the map already fits is a no-op, and 0 disables the cap.
+        assert_eq!(merge_dir_groups_to_cap(by_dir.clone(), 5), by_dir);
+        assert_eq!(merge_dir_groups_to_cap(by_dir.clone(), 0), by_dir);
     }
 
     #[test]
@@ -236,7 +360,7 @@ mod tests {
         ctx.call_graph
             .insert("a.py::f1".to_string(), vec!["a.py::f2".to_string()]);
         let files = vec!["a.py".to_string()];
-        let groups = cohesive_groups(&files, &ctx);
+        let groups = cohesive_groups(&files, &ctx, 0);
         // No graph edge (same file), so it falls through to the directory bucket.
         assert_eq!(groups, vec![(".".to_string(), vec!["a.py".to_string()])]);
     }
@@ -258,7 +382,7 @@ mod tests {
             "c.py".to_string(),
             "d.py".to_string(),
         ];
-        let groups = cohesive_groups(&files, &ctx);
+        let groups = cohesive_groups(&files, &ctx, 0);
         let all: Vec<&String> = groups.iter().flat_map(|(_, fs)| fs.iter()).collect();
         assert_eq!(all.len(), 4);
     }
@@ -266,6 +390,6 @@ mod tests {
     #[test]
     fn empty_input_produces_no_groups() {
         let ctx = minimal_ctx();
-        assert!(cohesive_groups(&[], &ctx).is_empty());
+        assert!(cohesive_groups(&[], &ctx, 0).is_empty());
     }
 }

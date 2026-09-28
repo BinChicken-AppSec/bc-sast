@@ -54,6 +54,7 @@
 
 mod parse;
 mod prompts;
+mod repair;
 mod wire;
 
 use std::sync::Arc;
@@ -103,6 +104,16 @@ pub struct Step6Config {
     /// Deterministic-sampling seed, forwarded to [`AgenticConfig::seed`]
     /// (OpenAI dialect only). `None` (the default) sends no seed.
     pub seed: Option<u64>,
+    /// Reasoning-effort tier for this stage's calls (the Python
+    /// original's `models.<role>.effort`, else `--reasoning-effort`),
+    /// forwarded to [`bc_llm_client::ChatRequest::reasoning_effort`].
+    /// `None` (the default) sends none, leaving the provider's default.
+    pub reasoning_effort: Option<bc_llm_client::ReasoningEffort>,
+    /// Per-role OpenAI transport pin (Python's
+    /// `models.<role>.use_responses_api`), forwarded to
+    /// [`bc_llm_client::ChatRequest::openai_api`]. `None` (the default)
+    /// keeps the client-wide `--openai-api` choice.
+    pub openai_api: Option<bc_llm_client::OpenAiApi>,
     /// Per-turn wall-clock deadline in seconds, forwarded to
     /// [`AgenticConfig::timeout_secs`]. `None` (the default) keeps the
     /// shared gateway client's own 300 s default — matching Python's
@@ -120,6 +131,13 @@ pub struct Step6Config {
     /// worse, quietly counted as confirmed — would make the report claim
     /// something the scan never established.
     pub budget_gate: Option<bc_pipeline_core::BudgetGateRef>,
+    /// `step6_verify.progress_file` (Python `_S6Progress`, default off):
+    /// whether the caller should keep an on-disk progress file for this
+    /// stage. The stage itself only emits
+    /// [`bc_pipeline_core::ScanEvent::VerifyProgress`] (see
+    /// [`Stage6::with_progress`]); `bc-cli` owns the file, since writing
+    /// under the state directory is I/O this crate does not do.
+    pub progress_file: bool,
 }
 
 impl Step6Config {
@@ -148,8 +166,11 @@ impl Step6Config {
             temperature: None,
             top_p: None,
             seed: None,
+            reasoning_effort: None,
+            openai_api: None,
             timeout_secs: None,
             budget_gate: None,
+            progress_file: false,
         }
     }
 }
@@ -166,6 +187,22 @@ pub struct VerifyOutput {
     /// `Some(reason)` when [`Step6Config::budget_gate`] tripped part-way
     /// through, naming the budget and how many findings went unverified.
     pub budget_stop: Option<String>,
+    /// Counters for the pipeline diagnostics, see [`VerifyDiagnostics`].
+    pub diagnostics: VerifyDiagnostics,
+}
+
+/// Typed per-run counters from S6, for pipeline diagnostics. Plain data on
+/// the stage output (never process-global state) so concurrent scans
+/// cannot mix their numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VerifyDiagnostics {
+    /// Unparseable verifier replies that named a verdict token and so got
+    /// the one verdict-format repair re-ask (see `repair.rs`).
+    pub verdict_repairs_attempted: usize,
+    /// Repair replies that parsed and agreed with the primary reply's
+    /// commitment, so the finding was classified on the repaired verdict
+    /// instead of becoming `VERIFY_ERROR`.
+    pub verdict_repairs_adopted: usize,
 }
 
 fn truncate_chars(s: &str, n: usize) -> String {
@@ -221,27 +258,75 @@ fn classify(
     verified: &mut Vec<Finding>,
     dropped: &mut Vec<DroppedFinding>,
 ) {
-    let is_unparseable = parsed.reason == "verifier output unparseable" && parsed.confidence == 0;
-    if is_confirmed(&parsed, min_confidence) {
-        verified.push(finalize_finding(f, parsed));
+    match verdict_class(&parsed, min_confidence) {
+        VerdictClass::Confirmed => verified.push(finalize_finding(f, parsed)),
+        VerdictClass::Unconfirmed => {
+            let detail = format!(
+                "verifier confidence {}/10 below gate {min_confidence}",
+                parsed.confidence
+            );
+            let assessed = finalize_finding(f, parsed);
+            let mut record = drop_finding(&assessed, DropReason::Unconfirmed, detail);
+            record.verification = bc_model::VerificationEvidence::from_finding(&assessed);
+            dropped.push(record);
+        }
+        VerdictClass::Unparseable => {
+            let reason = parsed.reason.clone();
+            dropped.push(drop_finding(&f, DropReason::VerifyError, reason));
+        }
+        VerdictClass::FalsePositive => {
+            let reason = parsed.reason.clone();
+            let assessed = finalize_finding(f, parsed);
+            let mut record = drop_finding(&assessed, DropReason::FalsePositive, reason);
+            record.verification = bc_model::VerificationEvidence::from_finding(&assessed);
+            dropped.push(record);
+        }
+    }
+}
+
+/// Which of [`classify`]'s four ways a reply goes, decided once so the
+/// live progress stream ([`VerdictClass::outcome`]) and the classification
+/// itself can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerdictClass {
+    Confirmed,
+    Unconfirmed,
+    Unparseable,
+    FalsePositive,
+}
+
+impl VerdictClass {
+    /// Python's outcome string for the class (`_S6Progress.record`).
+    fn outcome(self) -> &'static str {
+        match self {
+            VerdictClass::Confirmed => "TRUE_POSITIVE",
+            VerdictClass::Unconfirmed => "UNCONFIRMED",
+            VerdictClass::Unparseable => "VERIFY_ERROR",
+            VerdictClass::FalsePositive => "FALSE_POSITIVE",
+        }
+    }
+}
+
+fn verdict_class(parsed: &parse::ParsedVerdict, min_confidence: i64) -> VerdictClass {
+    if is_confirmed(parsed, min_confidence) {
+        VerdictClass::Confirmed
     } else if parsed.verdict == Verdict::TruePositive {
-        let detail = format!(
-            "verifier confidence {}/10 below gate {min_confidence}",
-            parsed.confidence
-        );
-        let assessed = finalize_finding(f, parsed);
-        let mut record = drop_finding(&assessed, DropReason::Unconfirmed, detail);
-        record.verification = bc_model::VerificationEvidence::from_finding(&assessed);
-        dropped.push(record);
-    } else if is_unparseable {
-        let reason = parsed.reason.clone();
-        dropped.push(drop_finding(&f, DropReason::VerifyError, reason));
+        VerdictClass::Unconfirmed
+    } else if parsed.reason == repair::UNPARSEABLE && parsed.confidence == 0 {
+        VerdictClass::Unparseable
     } else {
-        let reason = parsed.reason.clone();
-        let assessed = finalize_finding(f, parsed);
-        let mut record = drop_finding(&assessed, DropReason::FalsePositive, reason);
-        record.verification = bc_model::VerificationEvidence::from_finding(&assessed);
-        dropped.push(record);
+        VerdictClass::FalsePositive
+    }
+}
+
+/// The outcome string a finished session reports on the progress stream,
+/// or `None` for a finding no verifier ever looked at.
+fn session_outcome(result: &SessionResult, min_confidence: i64) -> Option<&'static str> {
+    match result {
+        SessionResult::Verdict(parsed) => Some(verdict_class(parsed, min_confidence).outcome()),
+        SessionResult::Guardrail(_) => Some("GUARDRAIL_BLOCKED"),
+        SessionResult::Failed(_) => Some("VERIFY_ERROR"),
+        SessionResult::BudgetSkipped(_) => None,
     }
 }
 
@@ -262,7 +347,7 @@ enum SessionResult {
 /// the model or transport returned), or declined to start one because
 /// [`Step6Config::budget_gate`] had tripped by the time it held a permit.
 enum TaskOutcome {
-    Ran(Result<AgenticOutcome, LlmError>),
+    Ran(Result<(parse::ParsedVerdict, repair::RepairTrace), LlmError>),
     BudgetSkipped(String),
 }
 
@@ -287,6 +372,21 @@ pub async fn run_verify(
     tools: Arc<dyn ToolExecutor>,
     input: Step6Input,
     config: &Step6Config,
+) -> Result<VerifyOutput, StageError> {
+    run_verify_with_progress(client, tools, input, config, None).await
+}
+
+/// [`run_verify`], plus a [`bc_pipeline_core::ScanEvent::VerifyProgress`]
+/// each time one more finding reaches an outcome, in completion order
+/// (Python's `_S6Progress.record`). A finding the budget kept from the
+/// verifier reports nothing, so the stream's `completed` can end short of
+/// `total`, which is exactly what a stopped run should show.
+async fn run_verify_with_progress(
+    client: Arc<dyn LlmClient>,
+    tools: Arc<dyn ToolExecutor>,
+    input: Step6Input,
+    config: &Step6Config,
+    progress: Option<&bc_pipeline_core::ProgressSink>,
 ) -> Result<VerifyOutput, StageError> {
     if input.findings.is_empty() {
         return Ok(VerifyOutput::default());
@@ -313,7 +413,10 @@ pub async fn run_verify(
         agentic_cfg.retry_backoff_base = config.retry_backoff_base;
         agentic_cfg.temperature = config.temperature;
         agentic_cfg.seed = config.seed;
+        agentic_cfg.reasoning_effort = config.reasoning_effort;
+        agentic_cfg.openai_api = config.openai_api;
         agentic_cfg.timeout_secs = config.timeout_secs;
+        agentic_cfg.cache_key = Some("s6".to_string());
 
         let sem = semaphore.clone();
         let client = client.clone();
@@ -331,8 +434,25 @@ pub async fn run_verify(
                     return (index, f, TaskOutcome::BudgetSkipped(gate.stop_reason()));
                 }
             }
-            let outcome =
-                run_agentic(client.as_ref(), tools.as_ref(), &user_prompt, &agentic_cfg).await;
+            let outcome = match run_agentic(
+                client.as_ref(),
+                tools.as_ref(),
+                &user_prompt,
+                &agentic_cfg,
+            )
+            .await
+            {
+                Ok(AgenticOutcome { final_text, .. }) => Ok(repair::parse_with_repair(
+                    client.as_ref(),
+                    tools.as_ref(),
+                    &final_text,
+                    &agentic_cfg,
+                    || gate.as_ref().is_none_or(|g| !g.should_stop()),
+                    index,
+                )
+                .await),
+                Err(e) => Err(e),
+            };
             (index, f, TaskOutcome::Ran(outcome))
         });
     }
@@ -343,6 +463,19 @@ pub async fn run_verify(
     let mut confirmed = 0usize;
     let mut skipped = 0usize;
     let mut budget_reason: Option<String> = None;
+    let mut diagnostics = VerifyDiagnostics::default();
+    let mut completed = 0usize;
+    // Announces the total before any session finishes, so an observer
+    // can report "0 of N" for the whole of the first session.
+    bc_pipeline_core::emit(
+        progress,
+        bc_pipeline_core::ScanEvent::VerifyProgress {
+            stage: Stage6::NAME,
+            completed,
+            total,
+            outcome: None,
+        },
+    );
 
     while let Some(joined) = set.join_next().await {
         let (index, f, outcome) = joined.expect("verify task panicked");
@@ -357,8 +490,9 @@ pub async fn run_verify(
             }
         };
         let result = match outcome {
-            Ok(agentic_outcome) => {
-                let parsed = parse::parse_verdict(&agentic_outcome.final_text);
+            Ok((parsed, trace)) => {
+                diagnostics.verdict_repairs_attempted += usize::from(trace.attempted);
+                diagnostics.verdict_repairs_adopted += usize::from(trace.adopted);
                 if is_confirmed(&parsed, config.min_confidence) {
                     confirmed += 1;
                 }
@@ -373,18 +507,23 @@ pub async fn run_verify(
                 abort = guardrail_hits >= guardrail_gate && confirmed == 0;
                 SessionResult::Guardrail(truncate_chars(&message, 200))
             }
-            Err(LlmError::QuotaExhausted { message }) => {
+            Err(e) if e.halts_scan() => {
                 // Not this finding's failure: the provider has said the
-                // account cannot fund anything more, so every session
-                // still queued behind this one would fail identically.
-                // Trip the shared gate (the remaining tasks then decline
-                // to start at all) and record this finding the same way
-                // a budget skip is recorded — the verifier genuinely
-                // never reached a verdict on it.
-                let reason = format!(
-                    "provider quota exhausted — {}",
-                    truncate_chars(&message, 160)
-                );
+                // account cannot fund anything more, or rejected the
+                // credential, or the proxy/TLS path is broken
+                // (VVAH-E001/E002), so every session still queued behind
+                // this one would fail identically. Trip the shared gate
+                // (the remaining tasks then decline to start at all) and
+                // record this finding the same way a budget skip is
+                // recorded — the verifier genuinely never reached a
+                // verdict on it.
+                let reason = match e {
+                    LlmError::QuotaExhausted { message } => format!(
+                        "provider quota exhausted — {}",
+                        truncate_chars(&message, 160)
+                    ),
+                    other => truncate_chars(&other.to_string(), 200),
+                };
                 if let Some(gate) = &config.budget_gate {
                     gate.trip(reason.clone());
                 }
@@ -394,6 +533,18 @@ pub async fn run_verify(
             }
             Err(e) => SessionResult::Failed(truncate_chars(&e.to_string(), 200)),
         };
+        if let Some(outcome) = session_outcome(&result, config.min_confidence) {
+            completed += 1;
+            bc_pipeline_core::emit(
+                progress,
+                bc_pipeline_core::ScanEvent::VerifyProgress {
+                    stage: Stage6::NAME,
+                    completed,
+                    total,
+                    outcome: Some(outcome),
+                },
+            );
+        }
         results[index] = Some((f, result));
         if abort {
             set.abort_all();
@@ -453,6 +604,7 @@ pub async fn run_verify(
         verified,
         dropped,
         budget_stop,
+        diagnostics,
     })
 }
 
@@ -460,6 +612,7 @@ pub struct Stage6 {
     client: Arc<dyn LlmClient>,
     tools: Arc<dyn ToolExecutor>,
     config: Step6Config,
+    progress: Option<bc_pipeline_core::ProgressSink>,
 }
 
 impl Stage6 {
@@ -472,7 +625,16 @@ impl Stage6 {
             client,
             tools,
             config,
+            progress: None,
         }
+    }
+
+    /// Opts into per-finding [`bc_pipeline_core::ScanEvent::VerifyProgress`]
+    /// reporting, mirroring `Stage4::with_progress`. `None` (the
+    /// [`Stage6::new`] default) emits nothing.
+    pub fn with_progress(mut self, progress: Option<bc_pipeline_core::ProgressSink>) -> Self {
+        self.progress = progress;
+        self
     }
 }
 
@@ -482,8 +644,14 @@ impl PipelineStage for Stage6 {
     const NAME: &'static str = "s6-verify";
 
     async fn run(&self, input: Step6Input) -> Result<StageOutcome<VerifyOutput>, StageError> {
-        let output =
-            run_verify(self.client.clone(), self.tools.clone(), input, &self.config).await?;
+        let output = run_verify_with_progress(
+            self.client.clone(),
+            self.tools.clone(),
+            input,
+            &self.config,
+            self.progress.as_ref(),
+        )
+        .await?;
         match output.budget_stop.clone() {
             Some(reason) => Ok(StageOutcome::Degraded {
                 value: output,
@@ -894,6 +1062,45 @@ mod tests {
 
     /// A plain fn, not a per-test closure, for the same coverage reason
     /// `tp_reply` is one.
+    fn auth_rejected_reply(_: &str) -> Result<String, LlmError> {
+        Err(LlmError::Authentication {
+            status: Some(401),
+            message: "Incorrect API key provided".to_string(),
+        })
+    }
+
+    /// A rejected credential stops S6 the way an empty account does: the
+    /// gate trips with the coded reason and nothing counts as verified.
+    #[tokio::test]
+    async fn an_authentication_failure_trips_the_gate_and_leaves_the_rest_unverified() {
+        let client: Arc<dyn LlmClient> = Arc::new(RoutedClient::new(auth_rejected_reply));
+        let mut cfg = Step6Config::new("m");
+        cfg.parallel = 1;
+        cfg.retry_backoff_base = std::time::Duration::ZERO;
+        let gate = TrippableGate::untripped();
+        cfg.budget_gate = Some(gate.clone());
+        let findings: Vec<Finding> = (0..3).map(|i| finding(&format!("f{i}.py"), 10)).collect();
+        let out = run_verify(
+            client,
+            Arc::new(NoTools),
+            Step6Input {
+                findings,
+                ctx: minimal_ctx(),
+            },
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert!(gate.should_stop());
+        let reason = gate.stop_reason();
+        assert!(
+            reason.starts_with("[VVAH-E001] authentication failed"),
+            "{reason}"
+        );
+        assert_eq!(out.verified.len(), 0);
+        assert_eq!(out.dropped.len(), 3);
+    }
+
     fn quota_exhausted_reply(_: &str) -> Result<String, LlmError> {
         Err(LlmError::QuotaExhausted {
             message: "You exceeded your current quota, please check your plan and billing details"
@@ -1018,6 +1225,91 @@ mod tests {
         .unwrap();
         assert_eq!(out.verified.len(), 1);
         assert!(out.budget_stop.is_none());
+    }
+
+    /// One reply per line number, covering every outcome a session can
+    /// report on the progress stream.
+    fn every_outcome_reply(user_text: &str) -> Result<String, LlmError> {
+        if user_text.contains("Line: 10-") {
+            return tp_reply(user_text);
+        }
+        if user_text.contains("Line: 20-") {
+            return Ok(format!(
+                "VERDICT: TRUE_POSITIVE (confidence: 2/10) — weak\nCVSS: {GOOD_CVSS}\n"
+            ));
+        }
+        if user_text.contains("Line: 30-") {
+            return Ok("VERDICT: FALSE_POSITIVE (confidence: 9/10) — sanitized".to_string());
+        }
+        if user_text.contains("Line: 40-") {
+            return Ok("no verdict in this reply at all".to_string());
+        }
+        if user_text.contains("Line: 50-") {
+            return Err(LlmError::Other {
+                message: "backend exploded".to_string(),
+            });
+        }
+        Err(LlmError::GuardrailBlocked {
+            message: "Your request was not allowed".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn with_progress_reports_each_finished_verification_and_nothing_for_a_skipped_one() {
+        let client: Arc<dyn LlmClient> = Arc::new(RoutedClient::new(every_outcome_reply));
+        let mut cfg = Step6Config::new("m");
+        cfg.parallel = 1;
+        // Six sessions run; the seventh finding is kept from the verifier.
+        cfg.budget_gate = Some(AfterNGate::allowing(6));
+        let findings = (1..=7).map(|i| finding("src/app.py", 10 * i)).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outcome = Stage6::new(client, Arc::new(NoTools), cfg)
+            .with_progress(Some(tx))
+            .run(Step6Input {
+                findings,
+                ctx: minimal_ctx(),
+            })
+            .await
+            .unwrap();
+        assert!(outcome.is_degraded());
+        let events: Vec<bc_pipeline_core::ScanEvent> = rx.try_iter().collect();
+        let mut seen: Vec<(&str, usize, usize, Option<&str>)> = Vec::new();
+        for event in &events {
+            if let bc_pipeline_core::ScanEvent::VerifyProgress {
+                stage,
+                completed,
+                total,
+                outcome,
+            } = event
+            {
+                seen.push((stage, *completed, *total, *outcome));
+            }
+        }
+        assert_eq!(seen.len(), events.len(), "{events:?}");
+        let seen: Vec<(usize, usize, Option<&str>)> = seen
+            .into_iter()
+            .map(|(stage, completed, total, outcome)| {
+                assert_eq!(stage, Stage6::NAME);
+                (completed, total, outcome)
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (0, 7, None),
+                (1, 7, Some("TRUE_POSITIVE")),
+                (2, 7, Some("UNCONFIRMED")),
+                (3, 7, Some("FALSE_POSITIVE")),
+                (4, 7, Some("VERIFY_ERROR")),
+                (5, 7, Some("VERIFY_ERROR")),
+                (6, 7, Some("GUARDRAIL_BLOCKED")),
+            ]
+        );
+    }
+
+    #[test]
+    fn step6_config_keeps_the_progress_file_off_by_default() {
+        assert!(!Step6Config::new("m").progress_file);
     }
 
     #[tokio::test]
@@ -1222,7 +1514,7 @@ mod tests {
     #[tokio::test]
     async fn false_positive_is_dropped_with_the_verdict_reason() {
         let reply = format!(
-            "VERDICT: FALSE_POSITIVE (confidence: 9/10) — input is sanitised\nCVSS: {GOOD_CVSS}\n"
+            "VERDICT: FALSE_POSITIVE (confidence: 9/10) — input is sanitized\nCVSS: {GOOD_CVSS}\n"
         );
         let client: Arc<dyn LlmClient> = Arc::new(RoutedClient::new(move |_| Ok(reply.clone())));
         let out = run_verify(
@@ -1239,7 +1531,7 @@ mod tests {
         assert!(out.verified.is_empty());
         assert_eq!(out.dropped.len(), 1);
         assert_eq!(out.dropped[0].reason, DropReason::FalsePositive);
-        assert_eq!(out.dropped[0].detail, "input is sanitised");
+        assert_eq!(out.dropped[0].detail, "input is sanitized");
     }
 
     #[tokio::test]
@@ -1395,5 +1687,188 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
+    }
+    /// Answers the primary verification with `primary` and a verdict
+    /// REPAIR request with `repair`, recording how many repair calls were
+    /// made and whether any of them was offered tools.
+    struct RepairClient {
+        primary: String,
+        repair: Result<String, LlmError>,
+        repair_calls: std::sync::atomic::AtomicUsize,
+        repair_saw_tools: std::sync::atomic::AtomicBool,
+    }
+
+    impl RepairClient {
+        fn new(primary: &str, repair: Result<&str, LlmError>) -> Arc<Self> {
+            Arc::new(RepairClient {
+                primary: primary.to_string(),
+                repair: repair.map(str::to_string),
+                repair_calls: std::sync::atomic::AtomicUsize::new(0),
+                repair_saw_tools: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn repair_calls(&self) -> usize {
+            self.repair_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for RepairClient {
+        async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let text = if last_message_text(request).starts_with("REPAIR TASK:") {
+                self.repair_calls.fetch_add(1, SeqCst);
+                if !request.tools.is_empty() {
+                    self.repair_saw_tools.store(true, SeqCst);
+                }
+                self.repair.clone()?
+            } else {
+                self.primary.clone()
+            };
+            Ok(ChatResponse {
+                content: vec![ContentBlock::Text(text)],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    async fn verify_one(client: Arc<RepairClient>, config: &Step6Config) -> VerifyOutput {
+        run_verify(
+            client,
+            Arc::new(NoTools),
+            Step6Input {
+                findings: vec![finding("src/app.py", 10)],
+                ctx: minimal_ctx(),
+            },
+            config,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_committed_verdict_missing_its_prefix_is_repaired_and_adopted() {
+        let repaired =
+            format!("VERDICT: TRUE_POSITIVE (confidence: 9/10) — confirmed\nCVSS: {GOOD_CVSS}");
+        let client = RepairClient::new(
+            "Traced the route.\nTRUE_POSITIVE (confidence: 9/10) — Confirmed: unauth route",
+            Ok(&repaired),
+        );
+        let out = verify_one(client.clone(), &Step6Config::new("m")).await;
+        assert_eq!(client.repair_calls(), 1);
+        assert!(!client
+            .repair_saw_tools
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(out.verified.len(), 1);
+        assert_eq!(out.verified[0].verdict_reason, "confirmed");
+        assert_eq!(
+            out.diagnostics,
+            VerifyDiagnostics {
+                verdict_repairs_attempted: 1,
+                verdict_repairs_adopted: 1,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repair_that_flips_a_single_commitment_is_rejected() {
+        let client = RepairClient::new(
+            "My conclusion is TRUE_POSITIVE, the input is unsanitized.",
+            Ok("VERDICT: FALSE_POSITIVE (confidence: 9/10) — sanitized\nCVSS: n/a"),
+        );
+        let out = verify_one(client.clone(), &Step6Config::new("m")).await;
+        assert_eq!(client.repair_calls(), 1);
+        assert!(out.verified.is_empty());
+        assert_eq!(out.dropped[0].reason, DropReason::VerifyError);
+        assert!(out.dropped[0].detail.contains("unparseable"));
+        assert_eq!(out.diagnostics.verdict_repairs_attempted, 1);
+        assert_eq!(out.diagnostics.verdict_repairs_adopted, 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_weighing_both_verdicts_adopts_whichever_the_repair_commits_to() {
+        let client = RepairClient::new(
+            "Could be TRUE_POSITIVE, could be FALSE_POSITIVE; the guard looks complete.",
+            Ok("VERDICT: FALSE_POSITIVE (confidence: 8/10) — guard covers every route"),
+        );
+        let out = verify_one(client, &Step6Config::new("m")).await;
+        assert_eq!(out.dropped[0].reason, DropReason::FalsePositive);
+        assert_eq!(out.dropped[0].detail, "guard covers every route");
+        assert_eq!(out.diagnostics.verdict_repairs_adopted, 1);
+    }
+
+    #[tokio::test]
+    async fn a_verdict_free_reply_gets_no_repair_call() {
+        let client = RepairClient::new("I read the code but reached no conclusion.", Ok("unused"));
+        let out = verify_one(client.clone(), &Step6Config::new("m")).await;
+        assert_eq!(client.repair_calls(), 0);
+        assert_eq!(out.dropped[0].reason, DropReason::VerifyError);
+        assert_eq!(out.diagnostics, VerifyDiagnostics::default());
+    }
+
+    #[tokio::test]
+    async fn a_repair_that_stays_unparseable_keeps_verify_error() {
+        let client = RepairClient::new("TRUE_POSITIVE I think", Ok("still rambling"));
+        let out = verify_one(client, &Step6Config::new("m")).await;
+        assert_eq!(out.dropped[0].reason, DropReason::VerifyError);
+        assert_eq!(out.diagnostics.verdict_repairs_attempted, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_repair_call_keeps_verify_error_and_never_counts_as_a_guardrail_hit() {
+        // Three findings at parallel 3 would trip the guardrail-abort gate
+        // if a blocked REPAIR counted as a blocked session.
+        let client = RepairClient::new(
+            "FALSE_POSITIVE, clearly",
+            Err(LlmError::GuardrailBlocked {
+                message: "blocked".into(),
+            }),
+        );
+        let mut cfg = Step6Config::new("m");
+        cfg.parallel = 3;
+        cfg.retry_backoff_base = std::time::Duration::ZERO;
+        let out = run_verify(
+            client.clone(),
+            Arc::new(NoTools),
+            Step6Input {
+                findings: (1..=3).map(|i| finding("src/app.py", i * 10)).collect(),
+                ctx: minimal_ctx(),
+            },
+            &cfg,
+        )
+        .await
+        .expect("a failed repair must not abort the stage");
+        assert_eq!(client.repair_calls(), 3);
+        assert!(out
+            .dropped
+            .iter()
+            .all(|d| d.reason == DropReason::VerifyError));
+        assert_eq!(out.diagnostics.verdict_repairs_attempted, 3);
+        assert_eq!(out.diagnostics.verdict_repairs_adopted, 0);
+    }
+
+    #[tokio::test]
+    async fn a_tripped_budget_gate_skips_the_repair_call() {
+        let client = RepairClient::new("TRUE_POSITIVE", Ok("unused"));
+        let mut cfg = Step6Config::new("m");
+        // One allowance: the primary session's own check spends it, so the
+        // repair's check finds the gate shut.
+        cfg.budget_gate = Some(AfterNGate::allowing(1));
+        let out = verify_one(client.clone(), &cfg).await;
+        assert_eq!(client.repair_calls(), 0);
+        assert_eq!(out.dropped[0].reason, DropReason::VerifyError);
+        assert_eq!(out.diagnostics.verdict_repairs_attempted, 0);
+    }
+
+    #[test]
+    fn repair_prompt_restates_the_system_contract_lines_and_embeds_the_reply() {
+        let prompt = prompts::repair_verdict_prompt("PRIOR REPLY TEXT");
+        assert!(prompt.starts_with("REPAIR TASK:"));
+        assert!(prompt.ends_with("YOUR PREVIOUS REPLY:\nPRIOR REPLY TEXT\n"));
+        let contract = "VERDICT: TRUE_POSITIVE|FALSE_POSITIVE (confidence: N/10) — brief reason\nCVSS: CVSS:3.1/AV:_/AC:_/PR:_/UI:_/S:_/C:_/I:_/A:_";
+        assert!(prompt.contains(contract));
+        assert!(prompts::SYSTEM.ends_with(contract));
     }
 }

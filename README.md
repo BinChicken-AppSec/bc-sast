@@ -29,7 +29,7 @@ implementation uses a gateway-mediated `LlmClient` trait, a confined
 
 ## Status
 
-The package version is **1.0.0**.
+The package version is **1.1.0**.
 
 Two limits are worth knowing before you rely on target testing or remote
 delivery. The container execution path used by target testing has not been
@@ -130,6 +130,15 @@ scan to a pull request and comment on it, both opt-in),
 `--max-tokens`/`--max-scan-seconds` (spend caps), and
 `-i`/`--interactive` (a terminal picker for remediation).
 
+`--model` defaults to `gpt-5.6-luna`, a reasoning model, which the
+default `--openai-api auto` reaches over the OpenAI Responses API.
+`--reasoning-effort` sets every role's effort tier, `--no-cache-markers`
+switches prompt-cache markers off, and `--doctor` prints what each
+configured model accepts (add `--cache-probe` for a live, token-spending
+cache check). A retired model id stops the run before any token is spent
+unless `--allow-unsupported-model` is passed. See
+[`docs/llm-transport.md`](docs/llm-transport.md).
+
 ## Frameworks, testing and delivery
 
 Add these options to the configured scan command above:
@@ -139,6 +148,7 @@ Add these options to the configured scan command above:
 | Apply built-in framework guidance and mappings | `--scan-framework asvs` (also `pci-dss`, `ssdf`, or `soc2`; repeat to combine). |
 | Discover target tests without generation | `--remediate --target-tests discover`. |
 | Generate or extend target tests | `--remediate --target-tests unit`, `integration`, or `comprehensive`. A bare `--target-tests` selects `comprehensive`; `e2e` and `generate` are compatible names for that scope. |
+| Create, complete, repair or relocate the target's API descriptions (OpenAPI/Swagger, GraphQL SDL, AsyncAPI, OpenRPC, SOAP WSDL); repair OData CSDL; check Protocol Buffers, RAML and API Blueprint | On by default with `--target-tests integration` or wider when the target has API evidence or a description; `--api-spec off` skips it and `--api-spec-formats` narrows it. Static only: no request reaches the application or a broker, and no import is fetched. |
 | Produce reports and stop | `--stop-after s9`. S8 finishes analysis; S9 renders reports. `--stop-after s8` does not publish report files. |
 | Commit and push accepted changes on one new branch | `--remediate --remediation-delivery branch --delivery-remote origin --delivery-branch bc-sast/fixes-run-123`. |
 | Package updated source and tests for CI | `--remediate --remediation-delivery zip`. Writes `security-scan/remediated-source.zip`. |
@@ -222,10 +232,6 @@ deliberately **not** ported, each for a reason recorded in the code:
   does not ship it as a default either. A config that still sets it loads
   and warns. The spend knobs here are `--max-tokens` and
   `--max-scan-seconds`, which are enforced (see below).
-- **Ctrl-C mid-stage abort.** Python keeps a process-global `cli.aborted()`
-  flag that makes any *new* S4 chunk or S6 verification fail immediately
-  after an interrupt. This port has no cross-stage cancellation token yet,
-  so an interrupt ends the process rather than draining in-flight work.
 - **`--group-by-app`** in batch mode. Python's version changes
   scan scope, not a reporting grouping: every repo sharing an
   application id is staged under one directory and scanned as a single
@@ -284,8 +290,9 @@ The workspace groups crates by pure logic, I/O boundaries, pipeline stages,
 orchestration, and CLI integration. Detection uses `bc-stage-s0` through
 `bc-stage-s8`; S9 is implemented in `bc-orchestrator::reporting`, using the
 existing renderers. S10 and S11 have separate stage crates.
-`bc-target-tests` performs static test discovery; the CLI owns test
-orchestration, execution policy, and delivery.
+`bc-target-tests` performs static test discovery and `bc-api-spec` holds
+the pure API specification logic; the CLI owns test orchestration,
+execution policy, and delivery.
 
 ## Verifying
 

@@ -232,7 +232,7 @@ static SUSPENSION_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// handed over, not a handler being declared.
 ///
 /// Capturing only a real identifier is what keeps `return (req, res) =>
-/// { … }` — a parenthesised arrow being returned, which is how an Express
+/// { … }` — a parenthesized arrow being returned, which is how an Express
 /// middleware factory is written — and `async (req, res) => { … }` from
 /// reading as calls taking a callback: `return` and `async` are not in the
 /// allowlist, and a computed callee has no name to look up. A declaration
