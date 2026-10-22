@@ -1,0 +1,51 @@
+[package]
+name = "appsec-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-model = { path = "../appsec-model" }
+appsec-pipeline-core = { path = "../appsec-pipeline-core" }
+appsec-llm-client = { path = "../appsec-llm-client" }
+appsec-stage-s0 = { path = "../appsec-stage-s0" }
+appsec-stage-s1 = { path = "../appsec-stage-s1" }
+appsec-stage-s2 = { path = "../appsec-stage-s2" }
+appsec-stage-s3 = { path = "../appsec-stage-s3" }
+appsec-stage-s4 = { path = "../appsec-stage-s4" }
+appsec-stage-s5 = { path = "../appsec-stage-s5" }
+appsec-stage-s6 = { path = "../appsec-stage-s6" }
+appsec-stage-s7 = { path = "../appsec-stage-s7" }
+appsec-stage-s8 = { path = "../appsec-stage-s8" }
+appsec-enrich = { path = "../appsec-enrich" }
+appsec-metrics = { path = "../appsec-metrics" }
+appsec-redact = { path = "../appsec-redact" }
+appsec-report-md = { path = "../appsec-report-md" }
+appsec-repo-analysis = { path = "../appsec-repo-analysis" }
+appsec-sarif = { path = "../appsec-sarif" }
+appsec-stage-s10 = { path = "../appsec-stage-s10" }
+appsec-stage-s11 = { path = "../appsec-stage-s11" }
+appsec-validation-scoring = { path = "../appsec-validation-scoring" }
+appsec-policy-gate = { path = "../appsec-policy-gate" }
+appsec-checkpoint = { path = "../appsec-checkpoint" }
+appsec-compliance = { path = "../appsec-compliance" }
+appsec-pathjail = { path = "../appsec-pathjail" }
+appsec-pricing = { path = "../appsec-pricing" }
+appsec-thirdparty = { path = "../appsec-thirdparty" }
+appsec-thirdparty-api = { path = "../appsec-thirdparty-api" }
+appsec-yaml = { path = "../appsec-yaml" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = { workspace = true }
+appsec-sandbox-tools = { path = "../appsec-sandbox-tools" }
+wiremock = { workspace = true }

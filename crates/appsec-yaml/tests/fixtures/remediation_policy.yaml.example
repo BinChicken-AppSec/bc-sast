@@ -1,0 +1,245 @@
+# Copyright 2026 Visa, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ============================================================================
+# Remediation Policy — HARD GATES
+# ----------------------------------------------------------------------------
+# Loaded by the Remediation Agent BEFORE any LLM call. This is enforcement,
+# not guidance. A finding that matches `deny` is short-circuited to
+# guidance-only output; the patch agent is never invoked.
+#
+# Semantics:
+#   - default_action: what happens when a CWE matches NO rule. BINARY:
+#       * allow → every non-denied CWE is patched (pair with an empty allow list)
+#       * deny  → only CWEs on the allow list are patched (pair with empty deny)
+#   - deny:  CWEs (and all their descendants) that MUST NOT be patched
+#   - allow: CWEs eligible for patch generation
+#   - Evaluation order: kill_switch → deny → deny_paths → allow → default_action
+#   - Fail-closed: missing/invalid policy file ⇒ treat ALL as deny
+# ============================================================================
+
+schema_version: "1.0"
+
+default_action: deny        # anything not explicitly allowed → no patch
+
+# Global kill-switch. Either of these forces EVERY decide() to
+# GUIDANCE_ONLY regardless of the rules below — for stopping a
+# bad-patch batch run mid-flight without restart.
+kill_switch:
+  env_var: VVAHARNESS_REMEDIATE_DISABLE   # "1"/"true" → disable
+  file:    ./.vvaharness-remediate-off    # presence → disable
+
+# ----------------------------------------------------------------------------
+# DENY — never generate a patch. Emit prose guidance + route to human.
+# Includes the full descendant set so child CWEs can't slip through.
+# ----------------------------------------------------------------------------
+deny:
+
+  - id: CWE-284            # Improper Access Control (root)
+    reason: requires knowledge of intended authorization policy
+    include_descendants: true
+    descendants:           # explicit list so the gate has no runtime lookup
+      - CWE-285            # Improper Authorization
+      - CWE-639            # IDOR / Authorization Bypass via User-Controlled Key
+      - CWE-862            # Missing Authorization
+      - CWE-863            # Incorrect Authorization
+      - CWE-566            # Authz Bypass via SQL Primary Key
+      - CWE-732            # Incorrect Permission Assignment
+      - CWE-1390           # Weak Authentication (umbrella)
+
+  - id: CWE-287            # Improper Authentication (root)
+    reason: auth flow changes need architectural review
+    include_descendants: true
+    descendants:
+      - CWE-306            # Missing Authentication for Critical Function
+      - CWE-303            # Incorrect Implementation of Auth Algorithm
+      - CWE-304            # Missing Critical Step in Authentication
+      - CWE-620            # Unverified Password Change
+      - CWE-640            # Weak Password Recovery
+      - CWE-294            # Authentication Bypass by Capture-Replay
+      - CWE-302            # Auth Bypass by Assumed-Immutable Data
+      - CWE-307            # Improper Restriction of Auth Attempts
+
+  - id: CWE-840            # Business Logic Errors (category)
+    reason: no generic safe transformation exists
+    include_descendants: true
+    descendants:
+      - CWE-841            # Improper Enforcement of Behavioral Workflow
+      - CWE-770            # Allocation Without Limits (rate/quota logic)
+      - CWE-1284           # Improper Validation of Specified Quantity
+      - CWE-682            # Incorrect Calculation
+      - CWE-369            # Divide By Zero (when business-rule driven)
+
+  - id: CWE-310            # Cryptographic Issues (category, deprecated but still tagged)
+    reason: crypto choices need org policy + key-mgmt review
+    include_descendants: true
+    descendants:
+      - CWE-327            # Broken/Risky Crypto Algorithm
+      - CWE-326            # Inadequate Encryption Strength
+      - CWE-328            # Use of Weak Hash
+      - CWE-916            # Password Hash w/ Insufficient Effort
+      - CWE-329            # Missing/Predictable IV
+      - CWE-330            # Insufficiently Random Values
+      - CWE-338            # Weak PRNG for Security
+      - CWE-321            # Hard-coded Crypto Key
+      - CWE-323            # Nonce/Key Reuse
+      - CWE-757            # Algorithm Downgrade
+      - CWE-1240           # Risky Crypto Primitive
+
+  - id: CWE-269            # Improper Privilege Management
+    reason: privilege boundaries are policy decisions
+    include_descendants: true
+    descendants:
+      - CWE-250            # Execution with Unnecessary Privileges
+      - CWE-266            # Incorrect Privilege Assignment
+      - CWE-268            # Privilege Chaining
+      - CWE-271            # Privilege Dropping / Lowering Errors
+
+  - id: CWE-613            # Insufficient Session Expiration
+    reason: session lifetime is product/compliance policy
+    include_descendants: true
+    descendants:
+      - CWE-384            # Session Fixation
+
+  # ── Memory-safety (C/C++) ────────────────────────────────────────────
+  # The harness emits these via VulnClass (UAF, heap-overflow, …). There
+  # is NO safe generic source-level transformation — correct fixes need
+  # ownership/lifetime/bounds reasoning that is design-specific. Always
+  # route to a human; emit guidance citing the trace + sanitizer advice.
+  - id: CWE-119            # Improper Restriction of Operations within Memory Buffer (root)
+    reason: bounds/lifetime fixes are design-specific; no generic patch
+    include_descendants: true
+    descendants:
+      - CWE-120            # Classic Buffer Overflow (unchecked copy)
+      - CWE-121            # Stack-based Buffer Overflow
+      - CWE-122            # Heap-based Buffer Overflow
+      - CWE-124            # Buffer Underwrite
+      - CWE-125            # Out-of-bounds Read
+      - CWE-787            # Out-of-bounds Write
+      - CWE-126            # Buffer Over-read
+      - CWE-127            # Buffer Under-read
+      - CWE-131            # Incorrect Calculation of Buffer Size
+      - CWE-680            # Integer Overflow to Buffer Overflow
+      - CWE-805            # Buffer Access with Incorrect Length Value
+      - CWE-806            # Buffer Access Using Size of Source Buffer
+
+  - id: CWE-416            # Use After Free
+    reason: requires ownership/lifetime redesign
+    include_descendants: true
+    descendants:
+      - CWE-415            # Double Free
+
+  - id: CWE-476            # NULL Pointer Dereference
+    reason: correct fix depends on whether null is a valid state
+    include_descendants: true
+    descendants: []
+
+  - id: CWE-134            # Uncontrolled Format String
+    reason: often co-occurs with varargs ABI; needs caller-by-caller review
+    include_descendants: true
+    descendants: []
+
+  - id: CWE-190            # Integer Overflow or Wraparound
+    reason: correct overflow handling is domain-specific (saturate vs error vs widen)
+    include_descendants: true
+    descendants:
+      - CWE-191            # Integer Underflow
+      - CWE-128            # Wrap-around Error
+      - CWE-681            # Incorrect Conversion between Numeric Types
+
+  - id: CWE-843            # Type Confusion
+    reason: requires type-system / variant redesign
+    include_descendants: true
+    descendants: []
+
+  - id: CWE-362            # Race Condition (TOCTOU et al.)
+    reason: synchronization strategy is architectural
+    include_descendants: true
+    descendants:
+      - CWE-367            # TOCTOU Race Condition
+      - CWE-366            # Race within a Thread
+      - CWE-421            # Race in Signal Handler
+
+  - id: CWE-401            # Missing Release of Memory (leak)
+    reason: ownership fix; auto-inserting free() risks UAF/double-free
+    include_descendants: true
+    descendants:
+      - CWE-772            # Missing Release of Resource
+      - CWE-775            # Missing Release of File Descriptor
+
+# ----------------------------------------------------------------------------
+# ALLOW — CWEs eligible for patch generation. With default_action: deny above,
+# ONLY these CWEs are patched; everything else is denied.
+# ----------------------------------------------------------------------------
+allow:
+  - { id: CWE-89  }   # SQL Injection
+  - { id: CWE-943 }   # Improper Neutralization in a Query (e.g. JQL/NoSQL) — parameterize like SQLi
+
+  - { id: CWE-78  }   # OS Command Injection
+  - { id: CWE-22  }   # Path Traversal
+  - { id: CWE-611 }   # XXE
+  - { id: CWE-601 }   # Open Redirect
+  - { id: CWE-79  }   # XSS (context-sensitive)
+  - { id: CWE-502 }   # Unsafe Deserialization
+  - { id: CWE-918 }   # SSRF
+  - { id: CWE-798 }   # Hardcoded Credentials
+  - { id: CWE-1333 }  # ReDoS
+
+# ----------------------------------------------------------------------------
+# Secondary guards — even for ALLOWED CWEs, skip patch if finding touches
+# a sensitive path. Belt-and-suspenders for monorepos. Matched against BOTH
+# the finding location (pre-gate) AND the diff's changed-file set (post-gate);
+# a post-gate hit reverts the offending file and downgrades to guidance.
+# ----------------------------------------------------------------------------
+deny_paths:
+  # Sensitive subsystems — even an allowed CWE here needs human eyes.
+  - "**/auth/**"
+  - "**/authn/**"
+  - "**/authz/**"
+  - "**/security/**"
+  - "**/iam/**"
+  - "**/*crypto*"
+  - "**/*Permission*"
+  - "**/*Policy*"
+  - "**/middleware/access*"
+
+# ----------------------------------------------------------------------------
+# Patches that TOUCH any of these paths are hard-rejected, regardless of CWE.
+# Running build/test commands against an LLM-modified build script = arbitrary
+# code execution on the scanner host. This list is matched against the diff's
+# changed-file set, not the finding location. A post-gate hit reverts the
+# offending file on disk and downgrades the verdict to guidance.
+# ----------------------------------------------------------------------------
+forbid_patch_paths:
+  - "**/setup.py"
+  - "**/setup.cfg"
+  - "**/pyproject.toml"
+  - "**/conftest.py"
+  - "**/Makefile"
+  - "**/CMakeLists.txt"
+  - "**/*.gradle"
+  - "**/*.gradle.kts"
+  - "**/pom.xml"
+  - "**/build.sbt"
+  - "**/package.json"
+  - "**/.npmrc"
+  - "**/webpack.config.*"
+  - "**/Dockerfile*"
+  - "**/.github/**"
+  - "**/.gitlab-ci.*"
+  - "**/Jenkinsfile*"
+  - "**/*.sh"
+  - "**/*.ps1"
+  - "**/*.bat"
+  - "**/*.cmd"

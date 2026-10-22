@@ -1,0 +1,40 @@
+[package]
+name = "appsec-stage-s10"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-model = { path = "../appsec-model" }
+appsec-pipeline-core = { path = "../appsec-pipeline-core" }
+appsec-llm-client = { path = "../appsec-llm-client" }
+appsec-llm-agentic = { path = "../appsec-llm-agentic" }
+appsec-sandbox-tools = { path = "../appsec-sandbox-tools" }
+appsec-policy-gate = { path = "../appsec-policy-gate" }
+appsec-diffcapture = { path = "../appsec-diffcapture" }
+appsec-json-repair = { path = "../appsec-json-repair" }
+appsec-sarif = { path = "../appsec-sarif" }
+appsec-report-md = { path = "../appsec-report-md" }
+appsec-checkpoint = { path = "../appsec-checkpoint" }
+appsec-pathjail = { path = "../appsec-pathjail" }
+appsec-repo-analysis = { path = "../appsec-repo-analysis" }
+# Only for scrubbing the excerpt of an unparseable agent response that
+# goes into a verdict summary — see `unparseable_excerpt`.
+appsec-redact = { path = "../appsec-redact" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha1 = { workspace = true }
+# `process`/`time` only: the optional `verify_command` gate spawns
+# `sh -c <operator's command>` under a wall-clock timeout.
+tokio = { workspace = true, features = ["process", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+appsec-config = { path = "../appsec-config" }

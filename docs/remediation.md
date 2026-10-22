@@ -1,0 +1,748 @@
+# Remediation (`--remediate`, stage S10)
+
+Stage S10 (crate `appsec-stage-s10`) is `bc-sast`'s optional
+write-capable step: given a scan's ranked findings, it walks a selected
+subset one at a time and attempts an actual code fix via an agentic
+Read/Glob/Grep/Edit/Write tool loop. It runs only as part of a
+`appsec-scan --remediate` **or** `--remediate-from` invocation (the two are
+mutually exclusive). There is no standalone `remediate` subcommand.
+
+This stage's security posture, including its known gaps, is graded in
+[`docs/compliance/AI_AGENT_SECURITY_REVIEW.md`](compliance/AI_AGENT_SECURITY_REVIEW.md)
+and [`docs/compliance/CONTROL_MAPPING.md`](compliance/CONTROL_MAPPING.md) §9.
+
+## Enabling it
+
+Remediation is opt-in, per invocation, via a single CLI flag:
+
+| Flag | Field | Default | Notes |
+|---|---|---|---|
+| `--remediate` | `remediate: bool` | `false` | Bare `--remediate` = `true`; also accepts an explicit value (`--remediate false`) so `action.yml` can always pass it. |
+
+There is **no `step_remediate.enabled` key**. The config section tunes
+an already-enabled run (its model, turn cap, allowed tools, every safety
+gate below, `top_n_findings`, `enforce_policy`, and the policy/playbook
+paths) but cannot start one. Only `--remediate` or `--remediate-from`
+does that. A no-op if the scan doesn't reach a `FinalReport`.
+
+Every finding is processed **strictly sequentially**, never concurrently:
+concurrent agents with Edit/Write on the same working tree would race on
+file contents, git state, and diff capture.
+
+## Fix mode
+
+`Step10Config::new()` hardcodes `fix_mode: true`. **No CLI flag or config
+key in this port ever sets it to `false`** outside of unit tests, so
+`appsec-scan --remediate` gives S10 write access to the selected
+remediation workspace, subject to the gates below. That workspace is an
+isolated worktree or ZIP snapshot when those modes are active. Where report-only mode is reachable it is structural, not just textual:
+`effective_tools()` strips `Write`/`Edit` from the request itself when
+`fix_mode` is false, so the model is not asked not to edit, it is not
+given the means.
+
+`step_remediate.dry_run` is how you get a patch without keeping it: the
+agent edits normally, every gate runs, and then everything
+is rolled back while the diff is kept in the record (so
+`--out-remediation-json` / `--post-fixes-from` still produce PR fix
+suggestions).
+
+The tool set offered to the agent is `[Read, Glob, Grep, Edit, Write]`
+(`Step10Config::new()`'s default, overridable via
+`step_remediate.allowed_tools` in a loaded config). Bash is never in the
+default set. The session dispatcher rejects tools that were not advertised
+for that session, even if the executor implements them. `Edit` and `Write`
+resolve paths inside the repository jail and reject Git control paths,
+including aliases. The journal captures the existing bytes under the actual
+canonical repository-relative path before mutation and passes that resolved
+identity to the tool. An unreadable baseline or ambiguous path refuses the
+write. These controls apply independently of the optional remediation
+policy gate.
+
+## Remediating without rescanning (`--remediate-from`)
+
+`--remediate-from <findings.json>` reads a prior run's
+`--out-findings-json` export and remediates those findings directly. No
+pipeline stage runs at all. Everything below applies unchanged: finding
+selection, the agentic loop, the safety gates, worktree isolation, the
+policy gate, `--resume`, and S11 validation.
+
+- **Severity is reconstructed, not stored.** The export carries bare
+  `Finding`s, and `--top N` ranks by CVSS with a severity-band fallback,
+  so a wrong severity here remediates the wrong findings. It is rebuilt
+  with `appsec_stage_s8::final_severity`, the same function S8 used when it
+  assigned the severity originally, reading the same
+  `vsvs_rating`/`cvss_rating` bands the export carries.
+- **The staleness refusal still applies.** The report's `git_sha` is set
+  from the export's `commit_sha`, so `appsec_orchestrator::remediate`'s
+  check compares it against the repository's current HEAD exactly as it
+  does after a live scan. `--force` overrides it the same way.
+
+`report.md`/`report.sarif` **are** augmented in place in this mode when
+they exist, looked for at `--out-md`/`--out-sarif` when given, else the
+repo's own `security-scan/` defaults. They are appended to, never
+re-rendered: `report.md` gains a `#### Remediation` block per remediated
+finding, a `#### Validation` block per graded one, and a report-level
+`## Remediation Summary`; `report.sarif` is re-stamped with
+`remediationStatus`/`validationStatus` and friends, matched by
+`bc/findingId/v1` rather than by position. A report that already carries
+a remediation section is left alone rather than given a second,
+contradicting one, and a missing prior report is reported on stdout, not
+an error. `--out-remediation-json` and (in worktree mode)
+`security-scan/remediation.patch` are this mode's other output. See
+`USER_GUIDE.md` §1h.
+
+## Finding selection
+
+| Flag | Field | Default | Effect |
+|---|---|---|---|
+| `--top <N\|all\|*>` | `top: Option<String>` | `None` | Caps remediation to the N highest-CVSS findings; `all`/`*` remediates every finding, overriding a config default. |
+| `-i`, `--interactive` | `interactive: bool` | `false` | Arrow-key (or numbered-prompt fallback) picker instead of the automatic batch walk. Shows the full findings list, ignoring any profile `top_n_findings` default, unless `--top N` is *also* given explicitly on the same invocation. |
+
+Config-side default: `step_remediate.top_n_findings` (numeric or
+`"all"`/`"*"`), consulted only when `--top` is absent. **This port ships
+no default profile at all**, so with neither `--top` nor `--config`,
+remediation is uncapped: every finding gets attempted.
+
+Passing **any** `--config` at all applies the merged default
+`top_n_findings: 20`, even a file that never mentions `step_remediate`,
+because `appsec_config::load` always deep-merges `step_defaults()`
+underneath whatever it loads. An uncapped run therefore needs either no
+`--config` or an explicit `--top all`.
+
+Ranking (`appsec-stage-s10/src/select.rs`, `select_top_by_cvss`): a
+max-heap keyed by each finding's numeric CVSS base score, falling back
+to a severity-band score when no numeric score is available:
+
+| Band | Score |
+|---|---|
+| CRITICAL | 9.0 |
+| HIGH | 7.0 |
+| MEDIUM | 4.0 |
+| LOW | 1.0 |
+| INFO / unrecognized | 0.0 |
+
+Ties break by stable original (scan) order, smaller index first.
+
+### The `--diff-scope` boundary
+
+Selection ranks by severity and knows nothing about the pull request, so
+it is not what keeps remediation inside the diff. S10 does, with a hard
+refusal of its own.
+
+When the run is diff-scoped, **any finding whose file is not among the
+pull request's changed files is refused before the agent is called** and
+before anything is snapshotted. The refusal is recorded, never silent: the
+record carries the policy action `out_of_diff_scope`, the reason naming
+the file and the flag, and a `Denied` verdict whose summary reads
+`Out of diff scope (...)` rather than the policy gate's
+`Denied by policy (...)`, so an audit can tell the two apart. Nothing is
+written to disk, nothing is checkpointed (a refusal is not work done, so a
+later run re-evaluates it), and S11 has no diff to validate.
+
+The check lives on the S10 config every route into the loop has to build,
+so it holds on all of them:
+
+| Route | Where the boundary comes from |
+|---|---|
+| Batch `--top` walk (`--remediate` after a scan) | The pull request diff the scan itself fetched |
+| `-i` / `--interactive` picker | The same, threaded through the same config |
+| `--remediate-from` (prior-report remediation) | Its own `--diff-scope` fetch, with the same `--github-token`/`--github-repo`/`--pr-number` requirement and the same fail-hard-on-fetch-error posture |
+| A direct `appsec_stage_s10::remediate_finding` call | The config it is handed |
+
+- **An active diff scope with zero changed files remediates nothing.** A
+  pull request of only renames, deletions, mode changes or binary files is
+  legitimately scoped to nothing, so every candidate is refused. The flag
+  is what decides, never the changed-file count.
+- **Path matching fails closed.** Paths are compared exactly after
+  normalization (leading `./` and `/` stripped, backslashes folded), with
+  no suffix or basename matching, so a path that cannot be matched to a
+  changed file is refused rather than allowed.
+
+Without `--diff-scope` this is a complete no-op: every finding in the
+report is a candidate.
+
+## The agentic loop
+
+Each finding is rendered into a user prompt (the finding's own
+Markdown section, reused verbatim from the scan report renderer) plus
+the repo root, mode, and, when the policy gate below allows a patch,
+a "Required fix strategy" playbook block and a "do NOT edit" path-glob
+list. The system prompt requires the model to assess three self-reported
+**evidence gates** before fixing:
+
+- **Gate A (Source)**: the attacker/user-controlled input, with file:line.
+- **Gate B (Sink)**: the security-relevant sink reachable from that source, with file:line.
+- **Gate C (Missing control)**: why existing validation doesn't constrain it.
+
+Gates A/B/C are the *agent's own* triage self-report, defaulting to `Fail`
+when omitted, and feed only the post-gate's ACCEPT/REJECT audit label.
+They are distinct from the 4 weighted gates S11 validation scores against
+later (see `docs/validation.md`).
+
+The agent must respond with a single structured JSON verdict (`Fixed`,
+`Partially Fixed`, `Not Fixed`, `False Positive`, `Needs Review`, or
+`Denied`) plus a `changes[]` list, `remaining_risks`, `recommendations`,
+and a required 2-4 sentence `summary`. An unparseable-but-successful
+response degrades to `Needs Review` rather than erroring; an `LlmError`
+(network/rate-limit/etc.) is the only thing that propagates as an
+error, and even then it fails only that one finding: the sequential
+walk records it as `RemediationOutcome::Failed` and continues.
+
+Model/tunables: `models.remediate` config role (else `--model`),
+`step_remediate.max_turns` (default `40`), `step_remediate.allowed_tools`.
+`step_remediate.max_transient_retries` (`4`), `max_context_shrinks` (`16`)
+and `timeout` are all readable from the config too; only
+`retry_backoff_base` (`10s`) is a Rust-only knob with no config surface.
+
+`step_remediate.max_budget_usd` is **not** a budget control here: there is
+no `Step10Config` field for it, it is not shipped in
+`appsec_config::step_defaults()`, and a config that still sets it loads
+with a warning. The only real spend knobs are `--max-tokens` and
+`--max-scan-seconds`, which bound the whole run rather than this stage.
+
+## Safety gates
+
+> The agent's edits are a **proposal**, not a result. Every `Edit`/`Write`
+> lands on the real working tree the instant the model emits it, so the
+> only question left is whether it is allowed to stay. These gates decide
+> that. All are on by default except the policy post-gate (which needs
+> `--enforce-remediation-policy` or `step_remediate.enforce_policy`), the
+> verify command (which has no default value) and `dry_run`.
+
+| Gate | Config key | Default | What it does |
+|---|---|---|---|
+| Write journal | *(automatic)* | on | Every `Write`/`Edit` records the file's pre-edit **bytes** the first time it is touched, so a rollback is exact, on a non-git target too, and for files the finding never named. |
+| Policy post-gate | `enforce_policy` | off | Reverts edits that hit a `deny_paths`/`forbid_patch_paths` glob and forces `REJECT`. Runs first, so its compliance audit trail is never pre-empted by a later gate. |
+| Workflow-pin gate | *(automatic)* | on | A newly introduced `uses: owner/repo/.github/workflows/<name>.yml@<ref>` must be a non-placeholder 40-hex commit SHA that the pre-edit repository already pins that same workflow to. Anything else (a branch, a tag, an all-zero or repeating SHA, a plausible hash nobody established) rolls back the whole patch, sets the verdict to `Not Fixed` and the record to `REJECT` with `policy_reason: "unsafe_workflow_reference"`. See below. |
+| Syntax gate | `syntax_check` | `true` | Re-parses every touched file with tree-sitter. Any file that no longer parses rolls back **the whole patch** and downgrades the verdict to `Needs Review`. |
+| Verify command | `verify_command` / `verify_timeout_secs` | `null` / `600` | Runs an operator-supplied `sh -c` command (build/lint/tests) in the repo root. Non-zero exit or timeout rolls the patch back, with the last 40 lines of output in the note. The command runs as its own process group, and a timeout or a Ctrl-C kills the whole group, so nothing it started (a compiler, a test runner) keeps running behind the rollback. **Fails closed when there is no `sh` at all** (see below). |
+| Size caps | `max_diff_lines` / `max_files_touched` | `200` / `1` | A sprawling patch is a run that went wrong. At the shipped `max_files_touched: 1`, a fix reaching into a second file is refused outright: crossing a file boundary is a design decision about how two parts of the system talk to each other, and that is a reviewer's call. The finding is still reported, and the refusal and its reason are rendered on the finding's `Patch` line. Either cap at `0` disables that half. |
+| Dry run | `dry_run` | `false` | Run every gate, then roll everything back regardless, but keep the diff in the record. |
+| Unverified rollback | `keep_unverified` | `false` | Anything but a clean `Fixed` verdict rolls the patch back: `Not Fixed`, `Partially Fixed`, `Needs Review`, `False Positive` and `Denied` alike (the check is literally "not `Fixed`", so the list is exhaustive by construction). `true` restores the leave-it-applied behavior. |
+| LLM-error rollback | *(automatic)* | on | A network error / rate limit / provider failure mid-loop rolls back whatever had already been written before the error propagates. The outcome carries no diff, so an edit left behind would be invisible. |
+| S11 rollback | `keep_unverified` | `false` | After Phase 3 validation scores a fix `Not Fixed` or `UNVERIFIABLE`, that finding's changes are rolled back from **its own pre-remediation baseline**, byte-exact, no `git` needed (see below). Applies to both the `--top` batch walk and the `-i` picker. |
+
+Every configurable gate also has a CLI flag, which **always wins over
+the config file**:
+
+| Flag | Config key | Notes |
+|---|---|---|
+| `--no-syntax-check` | `step_remediate.syntax_check` | One-directional: the flag can only turn the gate OFF. Only worth reaching for on a language this workspace ships no tree-sitter grammar for. |
+| `--keep-unverified` | `step_remediate.keep_unverified` | One-directional: can only turn the rollback OFF. |
+| `--max-diff-lines <N>` | `step_remediate.max_diff_lines` | `0` disables. |
+| `--max-files-touched <N>` | `step_remediate.max_files_touched` | Default `1`. Raise it to allow a cross-file patch; `0` disables the cap entirely. |
+| `--remediate-dry-run` | `step_remediate.dry_run` | One-directional: can only turn dry run ON. |
+| `--verify-command <CMD>` | `step_remediate.verify_command` | Runs through `sh -c` in the repo root. **Operator-supplied only**. Nothing the model or the scanned repo can influence reaches it, and there is no default, so nothing runs unless it is set. |
+| `--verify-timeout <SECS>` | `step_remediate.verify_timeout_secs` | Default `600`. |
+
+- **A rolled-back finding is never checkpointed.** The checkpoint means
+  "done", and `--resume` skips anything it can load; saving one for a
+  patch a gate just removed would turn a bad fix into a permanently
+  skipped finding. Rolled-back records are marked in
+  `verdict.remaining_risks` with the `appsec_stage_s10::REVERT_NOTE_PREFIX`
+  marker (`appsec_stage_s10::was_reverted` reads it back).
+- **The user's own uncommitted work is never touched.** The rollback set
+  is the union of the write journal, `git status` *minus whatever was
+  already dirty before the agent ran*, and the agent's self-reported
+  `changes[]` restricted to files with a real captured baseline. A blanket
+  "revert everything git reports as changed" would `git checkout` the
+  user's in-progress edits, which is the exact failure these gates exist
+  to prevent.
+
+### The workflow-pin gate
+
+A finding such as "the privileged workflow delegates to
+`org/shared/.github/workflows/security.yml@develop`" invites the model to
+pin the call, and with no network access it can only invent a commit: an
+all-zero SHA, or a plausible hash that names nothing. Either breaks the
+pipeline, and a guessed SHA that happens to exist in a fork is worse than
+the mutable ref it replaced. The only commit S10 can vouch for is one the
+repository already pins the same workflow to, so that is the only one
+accepted.
+
+- Every top-level `.github/workflows/*.yml`/`*.yaml` file is snapshotted
+  before the agent runs, policy or not, so the gate can tell an introduced
+  reference from an existing one and a rollback has a baseline for a
+  workflow the model edited without listing it.
+- Only remote reusable-workflow calls are gated. An action
+  (`uses: actions/checkout@v4`) is not a workflow call, and a local call
+  (`uses: ./.github/workflows/x.yml`) carries no `@ref`.
+- Pre-existing references are never blamed on an unrelated edit: only
+  occurrences beyond what the same file already had are checked.
+- Reads are confined to the repository and bounded at 1 MiB per file; a
+  larger workflow cannot be verified, so it fails closed.
+- A SHA that repeats with a period of 20 characters or fewer (`deadbeef`
+  five times) counts as a placeholder.
+- The gate runs on every remediation, not only under
+  `--enforce-remediation-policy`: an invented SHA breaks CI whether or not
+  a CWE policy is loaded.
+- The S10 system prompt carries the matching rule ("WORKFLOW PINS: never
+  invent a commit SHA ... make no edit and report Not Fixed").
+
+### What `ACCEPT` means
+
+`final_verdict` is an audit label, present only when a policy context
+was supplied. On the clean post-gate path it is `ACCEPT` only when the
+agent's three evidence gates all passed, its verdict is `Fixed` or
+`Partially Fixed`, **and** the change produced a non-empty diff: a policy
+allow is permission to patch, never evidence that a patch happened. The
+label is then reconciled against the diff the record actually ends up
+with, so an `ACCEPT` whose patch a later gate rolled back becomes
+`REJECT` with `policy_reason: "no_diff_captured"`.
+
+### How the S11 rollback restores
+
+Every finding's **baseline** (the on-disk bytes of exactly the files its
+agent touched, as of the moment before it ran) travels out of
+`remediate_finding_with_baseline` alongside its record, in
+`RemediationRun::baselines`. It is held **in memory only**: it never
+enters a `RemediationRecord`, a `--resume` checkpoint,
+`--out-remediation-json`, or a PR comment. `appsec_orchestrator::remediate`
+and the `-i` picker both hand it to
+`appsec_stage_s10::revert_after_failed_validation`, which restores from it
+directly. No `git`, no shell, no VCS of any kind: the same mechanism
+S10's own in-loop gates use.
+
+- **A file a LATER finding's kept fix also edited is never restored.**
+  S10 remediates every selected finding before S11 validates any of
+  them, so this finding's baseline predates that later edit; restoring
+  the file would destroy a good fix to undo a bad one. Those
+  files are left applied, each is named in a
+  `[s11] WARNING: not rolling back <file> for finding N: finding M's kept
+  fix also touched it` line, and the record's summary says which. Leaving
+  a bad patch applied and saying so is recoverable; silently destroying a
+  good one is not. (The `-i` picker never hits this: it validates each
+  pick immediately, so no later finding exists yet, and an *earlier*
+  pick's fix is safe by construction; the baseline was captured after
+  it.)
+- **A rolled-back finding's record is marked and its `diff` cleared**
+  (`appsec_stage_s10::was_reverted` reads the marker), exactly as S10's own
+  gates do, so `--out-remediation-json` carries no diff for it and
+  `--post-fixes-from` posts no "Suggested fix" comment for a patch that
+  is no longer on disk. The one exception is the case above: when
+  *nothing* was restored because every file was held back, the diff stays,
+  because it is then the only record of a change that really is applied.
+
+`appsec_stage_s10::revert_record` remains as the **fallback**, for a record
+with no baseline, one loaded straight out of a `--resume` checkpoint,
+whose snapshot lived only in the process that created it. That path is
+git-only: `git checkout --` (tracked) / unlink (untracked). On a non-git
+target it can do nothing and returns an error the caller prints as
+`[s11] WARNING: ...`. The patch stays applied and the operator is told
+so.
+
+## The one retry: "described a fix but never wrote it"
+
+> **`step_remediate.retry_unapplied_fix`, default `true`.** Not a gate:
+> it runs *before* every gate, so a retry that does write is judged
+> exactly like a first-attempt fix.
+
+The most common live failure of this stage is an agent that narrates a
+change it never made. The downgrade (`reconcile_verdict_with_diff`) catches
+it every time, but the finding is then left unfixed, having spent a full
+agentic session.
+
+When the verdict is `Fixed`/`Partially Fixed` and the retry check finds no
+material diff for the claimed files, the session is re-run **once**. An
+empty `changes[]` does not exempt a claimed fix from this check. The retry
+includes:
+
+- the original per-finding prompt replayed in full (the retry is a fresh
+  session, so the finding, repo root, playbook strategy and policy path
+  lists all have to be present again);
+- the agent's own prior answer quoted back (the analysis was fine; the
+  doing was not);
+- a statement of ground truth: *"No Edit or Write tool call was recorded
+  for any of those files ... Apply the change now using the Edit tool"*,
+  together with an explicit invitation to answer `Not Fixed`/`Needs
+  Review` instead, so the nudge cannot trade one false claim for another.
+
+Capped at exactly one extra session, never a loop. If the second attempt
+also writes nothing, the downgrade lands unchanged. The retry is recorded
+in the record's `summary` (`Retried once after an unapplied fix: ...
+Retries used: 1`), so a two-session remediation is visible to both a
+reviewer and a cost-watching operator.
+
+`retry_unapplied_fix` is a field on `Step10Config`, has its default in
+`appsec_config::step_defaults()`'s `step_remediate` block alongside the gate
+keys, and is read from a `--config` file's
+`step_remediate.retry_unapplied_fix` by `appsec-cli`'s override layer. There
+is no CLI flag for it; `step_remediate.retry_unapplied_fix: false` in a
+config file turns it off.
+
+## Worktree isolation (the default)
+
+Every gate above is a mitigation for editing the user's own files. The
+structural fix is to stop editing them, which is the default: when `--repo` is a git worktree, `appsec-scan --remediate` checks
+the **same commit** out into a throwaway detached worktree, roots the
+write-capable executor there, runs S10 (and S11) against it, exports a
+unified diff, and deletes the checkout.
+
+**Your working tree is never modified in this mode.** The fix arrives as
+`<repo>/security-scan/remediation.patch`, applicable from the repo root
+with `git apply security-scan/remediation.patch`. The summary line names
+the path; `--out-remediation-json`'s per-finding `diff` fields are
+unchanged (they come from the record, not from the checkout).
+
+| Flag | Default | Effect |
+|---|---|---|
+| *(none, the default)* | on for a git `--repo` | Detached worktree under `$BC_STATE_DIR/remediation-worktrees/` (or the system temp dir if the state dir can't be resolved), removed afterwards. |
+| `--remediate-in-place` | `false` | Edit `--repo` itself. Use it when you want the fix applied to your checkout directly. |
+| `--keep-remediation-worktree` | `false` | Leave the checkout on disk to inspect. Remove it yourself with `git worktree remove --force <path>`; the path is printed. |
+
+In default patch mode without target testing, a non-Git `--repo` or a
+failed `git worktree add` falls back to in-place remediation with a warning.
+Target testing in patch mode and branch delivery instead require a clean
+Git checkout and successful isolation. ZIP delivery uses an isolated source
+snapshot, so it supports targets without Git and never uses this fallback.
+If combined-patch export fails, the worktree is retained for recovery; the
+warning prints its location.
+
+**The packaged container gets worktree isolation if the checkout is owned
+by its uid.** The runtime image is Chainguard's `wolfi-base` with `git`
+installed (see `Dockerfile`), so `is_git_worktree` gets a real answer for a
+containerized run. Isolation is decided by probing for `git` and a `.git`,
+never by assuming anything about the environment, so a mounted checkout
+gets a detached worktree and a mounted source tarball does not.
+
+The catch is git's own ownership check: a bind-mounted checkout keeps the
+CI runner's ownership, and git 2.35 and later refuse a repository owned
+by another user (`fatal: detected dubious ownership`). `is_git_worktree`
+then answers false. Default patch mode without target testing can fall back
+to in-place; modes that require a Git worktree refuse instead.
+`docs/deployment.md` has the two fixes (`chown` the checkout to uid 65532,
+or set `safe.directory` for that one path), and `appsec-scan --doctor` says
+which of the two states a given mount is in. The GitHub Action already
+applies the second fix for its own workspace (`docs/github-action.md`). The
+image deliberately does not ship a global `safe.directory=*`.
+
+Gate behavior on a system with no `git` and no shell, which a scanned tree
+that is not a checkout also hits:
+
+| Gate | Needs `git`? | Needs a shell? | Behavior with neither |
+|---|---|---|---|
+| Write journal | no | no | Unaffected. It reads and writes files directly, and is the reason everything below still has a baseline. |
+| Policy post-gate | no | no | Its `git status` cross-check yields nothing, so the candidate set is the journal + the agent's `changes[]`; reverts restore from the journal's bytes. |
+| Syntax gate | no | no | tree-sitter parses in-process; rollback is from the journal. |
+| Verify command | no | **yes** | The packaged image ships a `sh`, so this gate runs there. Where there is no `sh` it **fails closed**: it cannot run the operator's build/test command, so it rolls the patch back, downgrades to `Needs Review`, and records `verify_command could not run: no shell. 'sh' is not present on this system`. "Could not check" is never reported as "checked and fine". Nothing runs at all unless `verify_command` is explicitly set, so this affects only operators who set it. |
+| Size caps | no | no | `git diff` is unavailable, so the diff is synthesized from the journal baseline (`synth_unified_diff`) and measured the same way. |
+| Dry run | no | no | Rollback is from the journal. |
+| Unverified rollback | no | no | Rollback is from the journal. |
+| LLM-error rollback | no | no | Rollback is from the journal. |
+| S11 rollback | no | no | Restores from the finding's own in-memory baseline. Only a `--resume`d record, which carries no baseline, falls through to the git path, which on a non-git target does nothing but warn. |
+
+**The verify gate only helps a project whose toolchain is in the image.**
+The packaged image ships a shell and `git`, and nothing else: no
+compilers, no test runners, no package managers for any of the languages
+it scans. `verify_command: cargo test` in a container with no `cargo`
+fails, the gate fails closed, and every fix comes back `Needs Review`,
+which is correct but useless. Build your own image from this one and add
+what your `verify_command` needs:
+
+```dockerfile
+FROM ghcr.io/<your-org>/bc-sast:<tag>
+USER root
+RUN apk add --no-cache python-3.12 py3.12-pip
+USER nonroot
+```
+
+The gates run inside the remediation workspace. In-place runs print a
+warning that source files will be edited; isolated worktree runs print the
+workspace location. Dry-run output states that edits will be rolled back.
+
+`RemediationWorktree` cleans up temporary checkouts on ordinary completion
+and failure. Successful patch export is followed by cleanup unless
+`--keep-remediation-worktree` was selected. A failed patch export instead
+retains the worktree and prints its location for recovery.
+
+The file list the patch is built from comes from `git status` inside the
+worktree, not from the agents' self-reported `changes[]`. A model
+under-reporting what it edited is exactly the case an export must not
+miss, and the throwaway checkout contains nothing but this run's own
+edits, so (unlike the in-place gates) there is no pre-existing dirty
+state to exclude.
+
+## Diff capture and revert (`appsec-diffcapture`)
+
+Before the agent runs, `snapshot_files` captures the pre-edit content
+(or "didn't exist yet") of the finding's own file, plus, only when
+policy enforcement is on, every worktree file matching a
+`forbid_patch_paths`/`deny_paths` glob (a bounded walk, capped at
+20,000 files). Snapshots hold raw **bytes**, so restoring a non-text file
+is exact rather than a lossy UTF-8 round-trip. Beyond that pre-agent
+snapshot, `appsec_sandbox_tools::WriteJournal` captures the original bytes of
+every file the agent actually writes to, at the moment it writes. That is
+what makes a file outside the finding's own scope recoverable at all.
+Finding references may carry a trailing line suffix and are normalized
+before path confinement. Actual tool writes use stricter canonical paths:
+ambiguous names, escaping paths and Git control paths are refused. Rollback
+uses canonical repository-relative identities, including for absolute path
+aliases, and Git checkout errors propagate to the caller. These controls
+avoid passing raw model-supplied paths directly to Git.
+
+After the run, the actual on-disk diff is captured via `git diff`
+(after `git add -N` so new files show up) with a `synth_unified_diff`
+fallback for a non-git target, and, for the policy post-gate
+specifically, cross-checked against `git status --porcelain -z
+--untracked-files=all` (a zero-side-effect scan of literally everything
+that changed) and the diff text's own file list. This union, not the
+agent's self-reported `changes[]` alone, is what the post-gate inspects,
+specifically to defeat an under-reporting bypass where a compromised
+agent edits a file but omits it from its own JSON. The stored remediation
+diff also uses the actual touched set, so S11 and exported records receive
+edits omitted from the model's `changes[]`. A claimed fix without a material
+diff becomes `NeedsReview`; a supplied policy context also records `REJECT`.
+
+## The policy gate (`appsec-policy-gate`)
+
+> **`--enforce-remediation-policy` defaults to `false`.** In the
+> default configuration this deterministic gate never runs at all.
+> Repository path confinement, Git control-path protection, session tool
+> allowlists and baseline journalling still apply. CWE/path policy rules
+> require explicit opt-in.
+
+Enabling it with **neither** `--remediation-policy` nor
+`--remediation-playbook` (nor their config equivalents) means EVERY
+finding fails closed to guidance-only: no patches at all.
+
+`enforce_remediation_policy` and a loaded config's
+`step_remediate.enforce_policy: true` are **OR'd together** in
+`build_remediate_settings`: either source turning it on is sufficient,
+and once either has said yes, nothing can force it back off from the
+other source on the same invocation.
+
+| Flag | Field | Default | Effect |
+|---|---|---|---|
+| `--enforce-remediation-policy` | `enforce_remediation_policy: bool` | `false` | Turns the gate on for this run. |
+| `--remediation-policy <path>` | `remediation_policy: Option<PathBuf>` | `None` | The deny/allow CWE + `deny_paths`/kill-switch YAML. Only consulted when the gate is on. |
+| `--remediation-playbook <path>` | `remediation_playbook: Option<PathBuf>` | `None` | Per-CWE fix-strategy YAML, injected into the ALLOW-path prompt. Only consulted when the gate is on; a missing/unparseable file silently falls back to an empty playbook. |
+
+Config-side equivalents, consulted only when the matching flag is
+absent: `step_remediate.policy_file` and `step_remediate.playbook_file`.
+A **relative** value resolves against the directory holding the
+`--config` file, not the process CWD and not the scan target, so a profile
+can ship its own `./inputs/...` next to itself. An absolute value is used
+verbatim.
+
+A configured path that does not exist is **not** silently discarded:
+`RemediationGate::load` fails closed on an unreadable file, so a typo
+cannot produce a run that looks permissive from the outside.
+
+Enabling the gate with **neither** source of a policy or playbook path
+prints an explicit warning naming both keys, because "policy says no" and
+"you never gave me a policy" produce byte-identical output otherwise. The
+fail-closed behavior itself is unchanged: every finding is still
+guidance-only.
+
+**No shipped default policy file exists in this repo**, only test
+fixtures (`crates/appsec-yaml/tests/fixtures/remediation_policy.yaml.example`,
+`.../remediation_playbook.yaml`). Passing `--enforce-remediation-policy`
+without `--remediation-policy` runs `RemediationGate::new(None)`, which
+fails closed to `GuidanceOnly` for *every* finding. An operator who
+enables enforcement without also supplying a real policy file gets
+silent no-op patching (guidance only, no edits), not an error
+(`AI_AGENT_SECURITY_REVIEW.md` finding #7; flagged there as safe, but
+worth knowing since it looks identical to a working strict policy from
+the outside).
+
+### `RemediationGate::decide`'s exact evaluation order
+
+An earlier rule always wins over a later one:
+
+1. **Missing/unparseable policy**: fail-closed to `GuidanceOnly` (`no_policy_loaded`).
+2. **Kill-switch active** (checked on *every* call, never cached): `GuidanceOnly` (`kill_switch`).
+3. **Unrecognized/unmapped CWE id**: `GuidanceOnly` (`unmapped_cwe`).
+4. **CWE (or a declared descendant) is deny-listed**: `GuidanceOnly`, reason from the policy's own `deny` entry. This wins over an allow-list entry for the *same* CWE.
+5. **File path matches a `deny_paths` glob**: `GuidanceOnly` (`sensitive_path:<pattern>`). This blocks even an allow-listed CWE.
+6. **CWE is allow-listed**: `Patch` (`allow_list`).
+7. **Otherwise**: the policy's own `default_action` (`default_action`).
+
+`default_action: allow` is the only YAML value that parses to
+`Action::Patch`; a missing key, `"deny"`, or any unrecognized value all
+resolve to `GuidanceOnly`, fail-closed at the field level.
+
+### Kill-switch
+
+Two independent triggers, either sufficient, both defined in the
+policy YAML's own `kill_switch:` block and checked fresh on every
+`decide()` call:
+
+- An **environment variable** (name from `kill_switch.env_var`, e.g.
+  `BC_REMEDIATE_DISABLE` in the crate's own example schema) set to
+  `1`/`true`/`yes`/`on`, case-insensitive.
+- A **sentinel file** (path from `kill_switch.file`, e.g.
+  `./.bc-remediate-off` in the example schema). Mere existence trips
+  it, regardless of content.
+
+### Post-gate revert: write-then-inspect, not prevent-then-write
+
+The CWE/path *pre*-gate above (steps 1-7) runs before the agent ever
+sees the finding, a genuine pre-execution block. The
+`deny_paths`/`forbid_patch_paths` check that runs *after* the agent's
+turn is different: it inspects what actually landed on disk (via the
+union of git diff / git status / self-reported changes described
+above), and only then reverts. A forbidden edit briefly exists on disk
+before being undone (`AI_AGENT_SECURITY_REVIEW.md` finding #4; AARM
+R1). Concretely, for each file the post-gate flags:
+
+1. `appsec_diffcapture::revert` restores the pre-edit snapshot (or deletes
+   the file, if the snapshot recorded it as new).
+2. That file is dropped from `verdict.changes`.
+3. `Fixed`/`Partially Fixed` is downgraded to `Needs Review`.
+4. `remaining_risks` gets an explanatory note naming the reverted files
+   and the globs they matched.
+5. `final_verdict` is forced to `"REJECT"`.
+
+On the clean path (nothing forbidden touched), `final_verdict` is
+`cap_verdict(decision.action, gates_passed)`, an `ACCEPT`/`REJECT` audit
+label distinct from the agent's own `verdict` enum, where `gates_passed`
+also requires a claimed fix and a non-empty diff (see
+[What `ACCEPT` means](#what-accept-means)).
+
+When no git status is available, the post-gate finds forbidden files by
+walking the working tree itself. That walk never enters a symlinked
+directory, so a repository containing `loop -> .` or `root -> /` cannot
+make it walk forever or walk the host, and it stops as soon as it has seen
+20,000 files or 20,000 directories.
+
+## `--resume` / checkpointing
+
+| Flag | Field | Default | Effect |
+|---|---|---|---|
+| `--resume` | `resume: bool` | `false` | Skip a finding whose checkpoint's stored identity and engine still match it exactly. |
+| `--force` | `force: bool` | `false` | Overrides S10's git-HEAD-staleness safety refusal (remediation otherwise refuses to run if HEAD has moved since the scan, since stale line numbers would misdirect the agent's file:line evidence). |
+
+A finding's identity (`finding_identity`) is a SHA-1 hex digest over
+its `finding_index`, `title`, `file`, and rendered body,
+NUL-separated. SHA-1 is used purely as a staleness-detection mechanism,
+not a security control. Checkpoints are **always written** when a
+checkpoint store is available, regardless of `--resume`; `--resume` only
+gates whether a prior checkpoint is *consulted* before re-running a
+finding, so a later `--resume` run always has something to load from an
+earlier non-resume run.
+
+Checkpoints are **engine-keyed**: the step is `remediate_<digest>`, where
+the digest covers the finding's identity and the engine that produced the
+record (this stage, this release, the model, the API dialect and the
+gateway host), and the payload records the same engine fields. A record
+written under one model or endpoint is therefore never served as
+another's. A batch walk prunes every `remediate_*` row of the run that no
+selected finding claims. The checkpointed diff is stored redacted
+(`appsec_redact::redact_diff`). S11 has its own checkpoints: see
+docs/validation.md.
+
+## Outcome counts and exit codes
+
+A remediation run is summarized as `attempted` findings, of which
+`fixed` stand as fixes (verdict `Fixed`, a non-empty diff, not rolled back
+by an S10 gate or by S11: `appsec_stage_s10::is_kept_fix`), `not_fixed` were
+processed without one (denied, out of scope, declined, rolled back, or
+answered with anything but `Fixed`), and `failed` were agentic calls that
+errored. The one-line summary prints them
+(`Remediation: N processed, M failed. Outcome: F fixed, X not fixed.`) and
+`remediation.json` carries them under `totals`, with a `rollup` of case
+states and validator decisions (docs/outputs.md).
+`appsec_stage_s10::RemediationCounts` and
+`appsec_validation_scoring::ValidationCounts` expose the same numbers for a
+progress line.
+
+The process exit code of a `--remediate` run:
+
+- `1` when an S10 call failed or an S11 validation errored;
+- `3` (`EXIT_NOT_REMEDIATED`) when S11 validated nothing as fixed and
+  graded at least one fix partially or not fixed (an all-inconclusive run
+  does not trip it);
+- `0` otherwise, including a refused (stale-HEAD) run.
+
+A run without `--remediate` is unaffected, and
+`--remediation-exit-code false` restores `0` for any run whose scan
+succeeded. The GitHub Action defaults to that (`fail-on-remediation:
+"false"`) so an existing workflow does not start failing; see
+docs/github-action.md.
+
+## Output
+
+`--out-remediation-json <path>` writes a `RemediationExport` (`{refused,
+results[], totals, rollup}`); each result is either `Processed`
+(finding_index, finding_id, verdict, policy_action/reason, final_verdict,
+changes, summary, diff, and, if S11 validation ran, its score) or `Failed
+{finding_index, error}`. Every diff in it is redacted structure-aware
+(`appsec_redact::redact_diff`): hunk headers, line prefixes and line endings
+survive, so the patch still parses, while PEM bodies and hardcoded
+credentials are masked and a credential read from configuration
+(`os.environ["DB_PASSWORD"]`) stays readable. `--post-fixes-from <path>` is a separate,
+scan-skipping mode that reads this JSON back and posts/updates GitHub
+fix-suggestion comments from it (needs `--github-token`/
+`--github-repo`/`--pr-number`); see `docs/github-action.md`.
+
+`report.md` and `report.sarif` are also re-written after remediation:
+
+- Each remediated finding gains a `#### Remediation` block (status,
+  summary, approach, whether a patch was produced, root cause, changed
+  files, remaining risks, recommendations, and, when S11 ran, its
+  validation status), and the report gains a `## Remediation Summary`
+  section. When a gate rolled the patch back, the `Patch` line names the
+  gate's own reason rather than reading `no patch produced`, so a fix that
+  was attempted and refused (over the file cap, breaking the parse,
+  failing the verify command) cannot be mistaken for a finding the agent
+  had nothing to say about. This happens **whenever any finding was
+  remediated**, not only when S11 validation also ran.
+- Each SARIF result gains a `properties.remediationStatus` string: the
+  S10 verdict (or the policy gate's capped `final_verdict` when it
+  overrode it). It is deliberately distinct from
+  `properties.validationStatus`, which is S11's independent grade *of*
+  a fix: a consumer needs both to tell "no fix was attempted" (a work
+  item) from "a fix was attempted and rejected" (a triage signal).
+
+Records are matched back to findings by the stable content-based
+`finding_id`, never by `finding_index`. That field is a 1-based
+*selection* ordinal (`--top N` picks by CVSS, not report order), so
+using it directly would file a fix under the wrong finding.
+
+In default worktree-isolated patch mode,
+`<repo>/security-scan/remediation.patch` contains all accepted edits,
+including generated tests and extensions to existing suites. Individual
+finding exports are not a substitute for this combined patch. Branch and
+ZIP delivery carry the updated files directly.
+
+## Target application tests
+
+Use `--target-tests [LEVEL]` (alias `--testing-level`) with a full scan and
+`--remediate`. A bare flag selects `comprehensive`. The built-in levels do
+not execute target code; execution requires a vetted compiled container and
+command policy, so adding approved before/after execution requires a source
+change and rebuild. Generated, reviewed, executed, passed and blocked are
+separate states, and test presence alone does not establish adequate
+coverage.
+
+This workflow rejects diff-scoped scans, prior-report remediation, resume,
+in-place remediation and `--stop-after`. Default patch and branch modes
+require a clean Git checkout; ZIP mode uses an isolated source snapshot.
+Tests follow target conventions and remain ordinary source-controlled test
+files after the combined patch is applied, the branch is merged, or the ZIP
+is imported. The `target-tests.json` report records assurance and remaining
+gaps; it is not the reusable suite itself.
+
+See [target testing](target-testing.md) for the levels, validation states,
+limits and execution restrictions, and [built-in policies](built-in-policies.md)
+for source locations.
+
+## Full-scan delivery
+
+`--remediation-delivery patch` is the default. For a full scan with
+`--remediate`, select `branch` to commit and push all accepted source and
+test changes together, or `zip` to export the updated isolated source copy.
+Both modes require non-interactive isolated remediation and enforce scan
+completion, remediation and configured target-test gates before delivery.
+
+Branch delivery requires `--delivery-remote <NAME>` and
+`--delivery-branch <NEW-BRANCH>`. Selecting it explicitly authorizes one
+commit and push; an existing branch is never replaced. A run with no changes
+records `no_changes` without creating a branch. ZIP delivery works without
+Git and writes `security-scan/remediated-source.zip`; CI must upload that
+file itself. Recognized credential paths, Git metadata and dependency/build
+outputs are excluded from the source snapshot, with exclusions recorded.
+Neither delivery mode is proof that tests passed or that remediation is safe.
+
+See [remediation delivery](remediation-delivery.md) for commands, restrictions,
+receipts, failure handling and CI upload examples.

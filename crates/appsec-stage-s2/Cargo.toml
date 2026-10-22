@@ -1,0 +1,28 @@
+[package]
+name = "appsec-stage-s2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-model = { path = "../appsec-model" }
+appsec-pipeline-core = { path = "../appsec-pipeline-core" }
+appsec-llm-client = { path = "../appsec-llm-client" }
+appsec-llm-agentic = { path = "../appsec-llm-agentic" }
+appsec-json-repair = { path = "../appsec-json-repair" }
+appsec-repo-analysis = { path = "../appsec-repo-analysis" }
+appsec-pathjail = { path = "../appsec-pathjail" }
+appsec-redact = { path = "../appsec-redact" }
+tracing = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+rstest = { workspace = true }

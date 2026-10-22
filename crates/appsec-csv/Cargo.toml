@@ -1,0 +1,17 @@
+[package]
+name = "appsec-csv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-model = { path = "../appsec-model" }
+appsec-cwe = { path = "../appsec-cwe" }
+appsec-sarif = { path = "../appsec-sarif" }
+
+[dev-dependencies]
+rstest = { workspace = true }

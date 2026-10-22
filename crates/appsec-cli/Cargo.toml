@@ -1,0 +1,72 @@
+[package]
+name = "appsec-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "appsec-scan"
+path = "src/main.rs"
+
+[dependencies]
+tempfile = { workspace = true }
+appsec-pathjail = { path = "../appsec-pathjail" }
+appsec-target-tests = { path = "../appsec-target-tests" }
+appsec-api-spec = { path = "../appsec-api-spec" }
+appsec-llm-agentic = { path = "../appsec-llm-agentic" }
+appsec-model = { path = "../appsec-model" }
+appsec-cvss = { path = "../appsec-cvss" }
+appsec-pipeline-core = { path = "../appsec-pipeline-core" }
+appsec-llm-client = { path = "../appsec-llm-client" }
+appsec-llm-openai = { path = "../appsec-llm-openai" }
+appsec-llm-anthropic = { path = "../appsec-llm-anthropic" }
+appsec-gateway-http = { path = "../appsec-gateway-http" }
+appsec-sandbox-tools = { path = "../appsec-sandbox-tools" }
+appsec-orchestrator = { path = "../appsec-orchestrator" }
+appsec-pricing = { path = "../appsec-pricing" }
+appsec-stage-s0 = { path = "../appsec-stage-s0" }
+appsec-stage-s1 = { path = "../appsec-stage-s1" }
+appsec-stage-s2 = { path = "../appsec-stage-s2" }
+appsec-stage-s3 = { path = "../appsec-stage-s3" }
+appsec-stage-s4 = { path = "../appsec-stage-s4" }
+appsec-stage-s5 = { path = "../appsec-stage-s5" }
+appsec-stage-s6 = { path = "../appsec-stage-s6" }
+appsec-stage-s7 = { path = "../appsec-stage-s7" }
+appsec-stage-s8 = { path = "../appsec-stage-s8" }
+appsec-stage-s10 = { path = "../appsec-stage-s10" }
+appsec-stage-s11 = { path = "../appsec-stage-s11" }
+appsec-validation-scoring = { path = "../appsec-validation-scoring" }
+appsec-policy-gate = { path = "../appsec-policy-gate" }
+appsec-github = { path = "../appsec-github" }
+appsec-compliance = { path = "../appsec-compliance" }
+appsec-config = { path = "../appsec-config" }
+appsec-repo-analysis = { path = "../appsec-repo-analysis" }
+appsec-report-md = { path = "../appsec-report-md" }
+appsec-sarif = { path = "../appsec-sarif" }
+appsec-csv = { path = "../appsec-csv" }
+appsec-redact = { path = "../appsec-redact" }
+appsec-metrics = { path = "../appsec-metrics" }
+appsec-checkpoint = { path = "../appsec-checkpoint" }
+appsec-diffcapture = { path = "../appsec-diffcapture" }
+appsec-interactive = { path = "../appsec-interactive" }
+appsec-thirdparty-api = { path = "../appsec-thirdparty-api" }
+clap = { workspace = true }
+reqwest = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "process", "time", "io-util", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+indicatif = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+rstest = { workspace = true }
+wiremock = { workspace = true }

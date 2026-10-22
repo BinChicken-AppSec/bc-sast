@@ -1,0 +1,42 @@
+[package]
+name = "appsec-stage-s4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-model = { path = "../appsec-model" }
+appsec-pipeline-core = { path = "../appsec-pipeline-core" }
+appsec-llm-client = { path = "../appsec-llm-client" }
+appsec-llm-agentic = { path = "../appsec-llm-agentic" }
+appsec-json-repair = { path = "../appsec-json-repair" }
+appsec-repo-analysis = { path = "../appsec-repo-analysis" }
+appsec-redact = { path = "../appsec-redact" }
+appsec-prompts = { path = "../appsec-prompts" }
+appsec-yaml = { path = "../appsec-yaml" }
+appsec-pathjail = { path = "../appsec-pathjail" }
+regex = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
+tracing = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+
+[dev-dependencies]
+# `test-util`: `start_paused` clocks for the shard-gate caps (15 s and
+# 240 s), so those tests run in virtual time. A feature of an existing
+# dependency, not a new crate.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "test-util"] }
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+# Tests only, and only to hold one number to one number: the confidence
+# floor QUALITY_BAR hands the model for an unverifiable route guard must
+# stay at or above `Step5Config::min_pre_confidence`, or S5 drops every
+# such finding before a verifier with file access can adjudicate it. Not a
+# cycle — s5 does not depend on s4. Mirrors appsec-stage-s6's own dependency
+# on s5, which holds its LANGUAGE FACTS to `route_gates`.
+appsec-stage-s5 = { path = "../appsec-stage-s5" }

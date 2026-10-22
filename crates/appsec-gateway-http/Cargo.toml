@@ -1,0 +1,17 @@
+[package]
+name = "appsec-gateway-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+reqwest = { workspace = true }
+rustls-pki-types = { workspace = true }
+appsec-pathjail = { path = "../appsec-pathjail" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
