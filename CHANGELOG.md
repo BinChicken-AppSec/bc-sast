@@ -4,6 +4,32 @@ All notable changes to this project are recorded here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-10-22
+
+Documentation only. No change to detection, verification, remediation or
+any output schema.
+
+### Changed
+
+- `docs/comparison.md`: the feature comparison against upstream v1.5.0 now
+  opens each cell with a Yes / No / Partial / Both verdict before the
+  prose, and leads with a table of where each project is ahead. Previously
+  every cell was prose, so telling who led a row meant reading both sides
+  of it. Partial is never rounded up to Yes: the text after it names what
+  is missing. No row was added or removed, and no benchmark number changed.
+- Two rows in that table were reworded. "A failed graph build aborts the
+  scan" was phrased as a negative, which made its verdict read backwards,
+  and is now "Scan survives a failed structural build".
+  "`findings.json` versioned" is now "carries a schema version". Both keep
+  their original verdicts.
+
+### Note for anyone resuming a 1.0.0 run
+
+S10 and S11 checkpoints are keyed by engine version, which comes from the
+package version. A checkpoint written by 1.0.0 will not be resumed by
+1.0.1; the affected stage re-runs from the start. This is the existing
+checkpoint contract, not a change to it.
+
 ## [1.0.0] - 2026-10-22
 
 First public release. A Rust port of
