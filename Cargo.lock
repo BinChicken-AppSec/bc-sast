@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-api-spec"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-redact",
  "appsec-xml",
@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-callgraph"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-json-repair",
  "appsec-yaml",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-checkpoint"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rusqlite",
  "sha1",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-cli"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-api-spec",
  "appsec-checkpoint",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-compliance"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-model",
  "appsec-pathjail",
@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-config"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-pathjail",
  "appsec-yaml",
@@ -195,7 +195,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-csv"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-cwe",
  "appsec-model",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-cvss"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "proptest",
  "regex",
@@ -214,18 +214,18 @@ dependencies = [
 
 [[package]]
 name = "appsec-cwe"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rstest",
 ]
 
 [[package]]
 name = "appsec-dedup-core"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "appsec-diffcapture"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-pathjail",
  "tempfile",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-enrich"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-cvss",
  "appsec-model",
@@ -245,7 +245,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-gateway-http"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-pathjail",
  "reqwest",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-github"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-model",
  "appsec-redact",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-interactive"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-checkpoint",
  "appsec-llm-client",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-json-repair"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "regex",
  "rstest",
@@ -298,7 +298,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-llm-agentic"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-llm-client",
  "async-trait",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-llm-anthropic"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-llm-agentic",
  "appsec-llm-client",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-llm-client"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-redact",
  "async-trait",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-llm-openai"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-llm-agentic",
  "appsec-llm-client",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-metrics"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rstest",
  "time",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-model"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rstest",
  "serde",
@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-orchestrator"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-checkpoint",
  "appsec-compliance",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-parity-tests"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-config",
  "appsec-cvss",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-pathjail"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "proptest",
  "rstest",
@@ -434,11 +434,11 @@ dependencies = [
 
 [[package]]
 name = "appsec-pipeline-core"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "appsec-policy-gate"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-pathjail",
  "appsec-repo-analysis",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-pricing"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -459,11 +459,11 @@ dependencies = [
 
 [[package]]
 name = "appsec-prompts"
-version = "1.0.0"
+version = "1.0.1"
 
 [[package]]
 name = "appsec-redact"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "fancy-regex",
  "proptest",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-repo-analysis"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-model",
  "appsec-pathjail",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-report-md"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-cwe",
  "appsec-model",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-sandbox-tools"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-llm-client",
  "appsec-pathjail",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-sarif"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-cwe",
  "appsec-model",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-stage-s0"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-callgraph",
  "appsec-llm-client",
@@ -562,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-stage-s1"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-json-repair",
  "appsec-llm-agentic",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-stage-s10"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-checkpoint",
  "appsec-config",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-stage-s11"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-checkpoint",
  "appsec-json-repair",
@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-stage-s2"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-json-repair",
  "appsec-llm-agentic",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-stage-s3"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-config",
  "appsec-json-repair",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-stage-s4"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-json-repair",
  "appsec-llm-agentic",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-stage-s5"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-llm-client",
  "appsec-model",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-stage-s6"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-cvss",
  "appsec-llm-agentic",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-stage-s7"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-dedup-core",
  "appsec-llm-agentic",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-stage-s8"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-json-repair",
  "appsec-llm-agentic",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-target-tests"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-api-spec",
  "serde",
@@ -780,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-thirdparty"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-model",
  "appsec-pathjail",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "appsec-thirdparty-api"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "appsec-model",
  "appsec-thirdparty",
@@ -808,21 +808,21 @@ dependencies = [
 
 [[package]]
 name = "appsec-validation-scoring"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rstest",
 ]
 
 [[package]]
 name = "appsec-xml"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "appsec-yaml"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rstest",
  "serde_json",

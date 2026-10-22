@@ -29,7 +29,7 @@ separate crates for stages, tools and shared logic.
 
 ## Status
 
-The package version is **1.0.0**.
+The package version is **1.0.1**.
 
 Two limits matter before you rely on target testing or remote delivery.
 The container execution path used by target testing has not been observed
