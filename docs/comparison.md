@@ -65,65 +65,84 @@ everything else: VVAH wins `c-cli` (100% against 91.7%) and `php-laravel`
 ## Feature comparison against v1.5.0
 
 Current as of **2026-10-20**, read from both codebases rather than from
-release notes. Every row was checked against the source on both sides; where
-a capability is partial, the cell says what is missing rather than taking a
-tick or a cross.
+release notes. Every row was checked against the source on both sides.
+
+Each cell opens with a verdict so the tables scan, then says what that
+verdict actually means. **Both** marks a row where the two take different
+approaches rather than one being ahead. **Partial** is never rounded up to
+a **Yes** -- the text after it names what is missing.
 
 No benchmark number appears in this section. Nothing here has been measured
 head-to-head against v1.5.0, and that is stated rather than implied.
+
+### Where each is ahead, in one view
+
+| | `bc-sast` leads | VVAH v1.5.0 leads |
+|---|---|---|
+| **Detection** | multi-run voting on the deep dive | graph exposed to the model as tools, four more model-free stages, deterministic detectors that add findings, 17 injected skills |
+| **Verification** | 5 third-party vendors vs 1, assessments written back to the vendor | live exploit verification, a plugin SDK |
+| **Remediation** | validation on by default, target-repository test execution, an API specification step | configurable cross-file application |
+| **Operations** | single static binary, any Rust target, partial-report Ctrl-C contract, diff scope extended over imported findings | coded exhaustion errors, per-stage reasoning effort, a schema version on `findings.json` |
+
+Read that as a split rather than a scoreboard: v1.5.0 is ahead on detection
+architecture, this port is ahead on operations, remediation and ingestion
+breadth. Neither column is a measurement -- see
+[the polyglot results](#results-the-polyglot-test-bed) for what was
+actually measured, and note that v1.5.0's detection changes could move its
+own numbers in its favour.
 
 ### Detection
 
 | | `bc-sast` | VVAH v1.5.0 |
 |---|---|---|
-| Structural analysis | In-process call graph and taint walk over tree-sitter | Embedded ArcadeDB code graph, queried by agent tools |
-| Token-free seed plane | Yes | Yes |
-| Model-free stages | S0 | S0, S1, S3, S5, and S8 ranking |
-| Graph exposed to the model as tools | No | Yes, for S2/S4/S6 |
-| Multi-run voting on the deep dive | Configurable, defaults to one run | Removed in v1.5.0 |
-| Deterministic detectors that add findings | No, S5 gates only suppress | Yes |
-| Injected detection skills | No | 17 |
-| Languages in the seed plane | 11 | Tree-sitter grammars, pinned exactly |
+| Structural analysis | **Both** In-process call graph and taint walk over tree-sitter | **Both** Embedded ArcadeDB code graph, queried by agent tools |
+| Token-free seed plane | **Yes** | **Yes** |
+| Model-free stages | **Partial** S0 | **Yes** S0, S1, S3, S5, and S8 ranking |
+| Graph exposed to the model as tools | **No** | **Yes** For S2/S4/S6 |
+| Multi-run voting on the deep dive | **Yes** Configurable, defaults to one run | **No** Removed in v1.5.0 |
+| Deterministic detectors that add findings | **No** S5 gates only suppress | **Yes** |
+| Injected detection skills | **No** | **Yes** 17 |
+| Languages in the seed plane | **Yes** 11 | **Yes** Tree-sitter grammars, pinned exactly |
 
 ### Verification and triage
 
 | | `bc-sast` | VVAH v1.5.0 |
 |---|---|---|
-| Adversarial verification stage | Yes, S6 | Yes, S6 |
-| Semantic dedup | Yes, S7 | Yes, S7 |
-| Exploit chaining | Yes, S8 | Yes, S8 |
-| Live exploit verification | No, deliberately not ported | Yes, since v1.4.0 |
-| Third-party scan ingestion | 5 vendors: Aikido, Checkmarx, Semgrep, Snyk, Sonatype | Semgrep, as a reference plugin |
-| Assessments written back to the vendor | Yes | No |
-| Plugin SDK for outside enrichers and tools | No | Yes |
+| Adversarial verification stage | **Yes** S6 | **Yes** S6 |
+| Semantic dedup | **Yes** S7 | **Yes** S7 |
+| Exploit chaining | **Yes** S8 | **Yes** S8 |
+| Live exploit verification | **No** Deliberately not ported: it sends attack traffic at a running application, which is dynamic testing | **Yes** Since v1.4.0 |
+| Third-party scan ingestion | **Yes** 5 vendors: Aikido, Checkmarx, Semgrep, Snyk, Sonatype | **Partial** Semgrep, as a reference plugin |
+| Assessments written back to the vendor | **Yes** | **No** |
+| Plugin SDK for outside enrichers and tools | **No** | **Yes** |
 
 ### Remediation
 
 | | `bc-sast` | VVAH v1.5.0 |
 |---|---|---|
-| Agentic fix loop | Yes, S10 | Yes |
-| Worktree isolation | Yes | Yes |
-| Validation panel | Yes, S11, on by default | Yes, opt-in |
-| Rollback when a fix cannot be verified | Yes | Yes |
-| Cross-file fixes applied automatically | No, reported only | Configurable |
-| Target-repository test execution | Yes, opt-in, no execution in shipped profiles | No |
-| API specification step | Yes, 8 standards | No |
+| Agentic fix loop | **Yes** S10 | **Yes** |
+| Worktree isolation | **Yes** | **Yes** |
+| Validation panel | **Yes** S11, on by default | **Partial** Opt-in |
+| Rollback when a fix cannot be verified | **Yes** | **Yes** |
+| Cross-file fixes applied automatically | **No** Reported only, deliberately | **Partial** Configurable |
+| Target-repository test execution | **Yes** Opt-in, no execution in shipped profiles | **No** |
+| API specification step | **Yes** 8 standards | **No** |
 
 ### Operations
 
 | | `bc-sast` | VVAH v1.5.0 |
 |---|---|---|
-| Install | Single static binary, or a container | Python 3.11+, plus native wheels |
-| Platform matrix | Any target Rust builds | macOS arm64, Linux x86_64/aarch64 (glibc 2.34+), Windows amd64 |
-| A failed graph build aborts the scan | No graph to fail | Yes |
-| Cooperative Ctrl-C, partial report, exit 130 | Yes | Cancellation, without the partial-report contract |
-| Diff scope enforced end to end | Yes, including imported third-party findings | Diff scope, not extended over imports |
-| Per-call cost reporting | Yes, priced per context tier | Yes |
-| Token and wall-clock budgets that degrade | Yes | Yes, plus coded exhaustion errors |
-| Per-stage model routing | Yes, `models.<role>` | Yes, plus per-stage reasoning effort |
-| SARIF built from typed data | Yes, since 1.0.0 | Yes, as of v1.5.0 |
-| `findings.json` versioned | No | Yes, `schema_version: "1.0"` |
-| Resumable checkpoints | Yes, engine-keyed | Yes, typed schema |
+| Install | **Yes** Single static binary, or a container | **Partial** Python 3.11+, plus native wheels |
+| Platform matrix | **Yes** Any target Rust builds | **Partial** macOS arm64, Linux x86_64/aarch64 (glibc 2.34+), Windows amd64 |
+| Scan survives a failed structural build | **Yes** No separate graph build to fail | **No** A graph build failure aborts the scan |
+| Cooperative Ctrl-C, partial report, exit 130 | **Yes** | **Partial** Cancellation, without the partial-report contract |
+| Diff scope enforced end to end | **Yes** Including imported third-party findings | **Partial** Not extended over imports |
+| Per-call cost reporting | **Yes** Priced per context tier | **Yes** |
+| Token and wall-clock budgets that degrade | **Yes** | **Yes** Plus coded exhaustion errors |
+| Per-stage model routing | **Yes** `models.<role>` | **Yes** Plus per-stage reasoning effort |
+| SARIF built from typed data | **Yes** Since 1.0.0 | **Yes** As of v1.5.0 |
+| `findings.json` carries a schema version | **No** | **Yes** `schema_version: "1.0"` |
+| Resumable checkpoints | **Yes** Engine-keyed | **Yes** Typed schema |
 
 ### No longer a difference
 
