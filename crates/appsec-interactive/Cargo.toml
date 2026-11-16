@@ -1,0 +1,25 @@
+[package]
+name = "appsec-interactive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-model = { path = "../appsec-model" }
+appsec-llm-client = { path = "../appsec-llm-client" }
+appsec-stage-s10 = { path = "../appsec-stage-s10" }
+appsec-stage-s11 = { path = "../appsec-stage-s11" }
+appsec-validation-scoring = { path = "../appsec-validation-scoring" }
+appsec-checkpoint = { path = "../appsec-checkpoint" }
+crossterm = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+appsec-sandbox-tools = { path = "../appsec-sandbox-tools" }

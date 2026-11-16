@@ -1,0 +1,18 @@
+[package]
+name = "appsec-llm-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-redact = { path = "../appsec-redact" }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+# Already a workspace dependency (and pulled in by appsec-redact); used for the
+# shared auth/proxy error classifiers.
+regex = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,12 @@
+{
+  "_comment": "Files over the code-line limit, as measured by scripts/loc_audit.py --check. Code lines only: test blocks, comments and blanks are excluded, because none of them is what a refactor has to move. Regenerate with --update-baseline.",
+  "threshold": 2000,
+  "files": {},
+  "fn_threshold": 250,
+  "functions": {
+    "crates/appsec-callgraph/src/graph.rs::build_taint_paths": 339,
+    "crates/appsec-cli/src/remediate.rs::dispatch_remediation": 291,
+    "crates/appsec-orchestrator/src/lib.rs::run_scan": 577,
+    "crates/appsec-stage-s10/src/lib.rs::remediate_finding_with_baseline": 429
+  }
+}

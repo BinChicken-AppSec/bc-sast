@@ -1,0 +1,29 @@
+# Postgres for exercising db/schema.sql and db/test/rls_test.sql.
+#
+# This is a test harness, not a deployment. It carries a throwaway
+# password on a loopback-only port because nothing here outlives the
+# test: `docker compose down -v` discards the volume. A real deployment
+# gets its credentials from the platform's secret store, and the design
+# doc's "Deployment and operations" section is the reference for that.
+#
+#   docker compose -f db/docker-compose.yml up -d
+#   ./db/test/run.sh
+#   docker compose -f db/docker-compose.yml down -v
+services:
+  postgres:
+    # Pinned by digest-bearing tag rather than `latest`, so the schema is
+    # always verified against a known server version. 14 is the floor the
+    # design doc commits to; this is deliberately NOT the newest, because
+    # the point is to prove nothing here needs a newer feature.
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_DB: bcsast
+      POSTGRES_USER: bcsast
+      POSTGRES_PASSWORD: bcsast-test-only
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bcsast -d bcsast"]
+      interval: 2s
+      timeout: 3s
+      retries: 30

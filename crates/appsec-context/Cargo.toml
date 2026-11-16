@@ -1,0 +1,23 @@
+[package]
+name = "appsec-context"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-model = { path = "../appsec-model" }
+appsec-enrich = { path = "../appsec-enrich" }
+appsec-yaml = { path = "../appsec-yaml" }
+appsec-pathjail = { path = "../appsec-pathjail" }
+appsec-doctext = { path = "../appsec-doctext" }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The score the four facts move; used only to assert they move it.
+appsec-cvss = { path = "../appsec-cvss" }

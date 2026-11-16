@@ -1,0 +1,19 @@
+[package]
+name = "appsec-enrich"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-model = { path = "../appsec-model" }
+appsec-cvss = { path = "../appsec-cvss" }
+appsec-pathjail = { path = "../appsec-pathjail" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }

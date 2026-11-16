@@ -1,0 +1,47 @@
+[package]
+name = "appsec-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-redact = { path = "../appsec-redact" }
+# In-workspace, so no supply-chain decision: it ships on the same
+# release, CI and vetting posture as this crate. It is a separate crate
+# rather than a module here because it parses attacker-controlled binary
+# input and deserves to be bounded, fuzzed and reviewed on its own --
+# and because it has no dependencies at all, which is only visible if it
+# has its own manifest.
+appsec-doctext = { path = "../appsec-doctext" }
+serde_json = { workspace = true }
+# The wire shell in `http.rs`. No new third-party dependency: both are
+# already pinned in the workspace manifest and vetted there. No extra
+# reqwest features -- the body is read as chunks and parsed by
+# `serde_json`, so the `json` feature is not needed, and `blocking` is
+# not used (the runtime is owned by the transport, see `http.rs`).
+reqwest = { workspace = true }
+# `new_current_thread().enable_all()` needs the runtime plus the IO and
+# time drivers.
+tokio = { workspace = true, features = ["rt", "net", "time"] }
+
+[dev-dependencies]
+# `tests/server_process.rs` drives the built binary as a subprocess and
+# parses its JSON-RPC replies.
+serde_json = { workspace = true }
+# A real local HTTP server, so the transport is tested over a socket
+# rather than against a mock of itself.
+wiremock = { workspace = true }
+# `Runtime::new()` is multi-threaded, which keeps the mock server
+# answering while the synchronous transport runs on the test thread.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+# The binary is `src/main.rs`, auto-detected by cargo. It is glue only:
+# `server::run` wires the pieces and `server::serve` does the work, both
+# in the library where tests can reach them. The crate now carries its own
+# coverage gate (see docs/coverage-exceptions.md#appsec-mcp) rather than
+# sitting under the workspace's 100%-functions gate, because two builder
+# error paths in `http.rs` cannot fail with this crate's fixed config.

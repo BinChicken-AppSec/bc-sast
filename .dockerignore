@@ -1,0 +1,7 @@
+target
+.git
+.github
+*.profraw
+lcov.info
+.DS_Store
+.docker

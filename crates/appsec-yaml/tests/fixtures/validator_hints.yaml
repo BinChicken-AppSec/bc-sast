@@ -1,0 +1,81 @@
+# Copyright 2026 Visa, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Per-CWE adversarial bypass hints for the validation agent's penetration-tester persona.
+# Injected into the launch prompt so the agent focuses on realistic attacks for each class.
+# Keep each list short (<=6) — the agent is told to TRY these, not merely read them.
+#
+# This is the sole hints source. The s11 validator reads only this file
+# (./inputs/validator_hints.yaml, relative to where you run `vvaharness validate`);
+# there is no packaged fallback. If it is absent the validator simply runs without
+# per-CWE bypass hints. Edit freely to tune the hints for your environment; a
+# malformed file is ignored (with a warning) rather than aborting the run.
+
+CWE-89:    # SQL Injection
+  - "stacked queries via ; if driver allows multi-statement"
+  - "second-order: value stored then later concatenated elsewhere"
+  - "numeric context with no quotes — wrong variable parameterised"
+  - "ORDER BY / LIMIT / identifier position (cannot be parameterised)"
+  - "comment terminator -- or /* to truncate the intended clause"
+
+CWE-78:    # OS Command Injection
+  - "argument injection (leading -, --flag=val) when array-form used"
+  - "shell metachar in a value the callee itself passes to a shell"
+  - "$(...)/ backtick if any downstream eval"
+  - "newline / CRLF splitting into a second command"
+
+CWE-79:    # XSS
+  - "context mismatch: HTML-encoded value placed in JS string or URL"
+  - "javascript: / data: URI in href/src"
+  - "DOM clobbering, SVG <script>, template-literal injection"
+  - "mXSS via innerHTML round-trip"
+  - "event-handler attribute (onerror, onload)"
+
+CWE-22:    # Path Traversal
+  - "URL-encoded ..%2f, double-encoded ..%252f"
+  - "Windows: ..\\, mixed / and \\, UNC \\\\host\\share"
+  - "null byte truncation on legacy runtimes"
+  - "symlink inside base dir pointing outside"
+  - "absolute path bypass when only ../ is filtered"
+
+CWE-918:   # SSRF
+  - "decimal/octal/hex IP (2130706433, 0x7f000001, 0177.0.0.1)"
+  - "IPv6 [::ffff:127.0.0.1], [::], 0.0.0.0"
+  - "DNS rebinding / TOCTOU between resolve and connect"
+  - "redirect chain to internal host, gopher:// or file:// scheme"
+  - "cloud metadata endpoints (169.254.169.254 etc.)"
+
+CWE-502:   # Unsafe Deserialization
+  - "gadget chain in an allowed type's transitive deps"
+  - "polymorphic type field (@class, $type) pointing to dangerous type"
+  - "nested/wrapped payload that passes outer allowlist"
+
+CWE-611:   # XXE
+  - "parameter entities (% ent) when general entities disabled"
+  - "external DTD via SYSTEM with redirect"
+  - "XInclude, XSLT document(), schemaLocation"
+
+CWE-601:   # Open Redirect
+  - "scheme-relative //evil.com, backslash /\\evil.com"
+  - "userinfo trick https://trusted.com@evil.com"
+  - "whitespace / control chars before scheme"
+  - "case / unicode normalisation of host"
+
+CWE-798:   # Hard-coded Credentials
+  - "credential moved but old literal still referenced via fallback"
+  - "env var read but default value is the old secret"
+
+CWE-1333:  # ReDoS
+  - "input length not bounded before the regex"
+  - "alternation still nests under a quantifier"

@@ -1,0 +1,33 @@
+[package]
+name = "appsec-stage-s6"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-redact = { path = "../appsec-redact" }
+tracing = { workspace = true }
+appsec-model = { path = "../appsec-model" }
+appsec-pipeline-core = { path = "../appsec-pipeline-core" }
+appsec-llm-client = { path = "../appsec-llm-client" }
+appsec-llm-agentic = { path = "../appsec-llm-agentic" }
+appsec-repo-analysis = { path = "../appsec-repo-analysis" }
+appsec-cvss = { path = "../appsec-cvss" }
+appsec-prompts = { path = "../appsec-prompts" }
+regex = { workspace = true }
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
+
+[dev-dependencies]
+# Test-only, and in this direction only (S5 does not depend on S6): the
+# LANGUAGE FACTS block in `prompts.rs` states in prose the same rules
+# `appsec_stage_s5::lang_gates` and `::route_gates` decide mechanically, so two
+# tests run those gates and assert the prompt agrees with their verdicts.
+appsec-stage-s5 = { path = "../appsec-stage-s5" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+async-trait = { workspace = true }
+rstest = { workspace = true }
+serde_json = { workspace = true }

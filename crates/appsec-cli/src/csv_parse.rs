@@ -1,0 +1,111 @@
+pub(crate) fn parse_csv(text: &str) -> Vec<Vec<String>> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut rows = Vec::new();
+    let mut row: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = normalized.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+        } else {
+            match c {
+                '"' => in_quotes = true,
+                ',' => row.push(std::mem::take(&mut field)),
+                '\n' => {
+                    row.push(std::mem::take(&mut field));
+                    rows.push(std::mem::take(&mut row));
+                }
+                _ => field.push(c),
+            }
+        }
+    }
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_input_yields_no_rows() {
+        assert_eq!(parse_csv(""), Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn simple_comma_separated_fields() {
+        assert_eq!(parse_csv("a,b,c\n"), vec![vec!["a", "b", "c"]]);
+    }
+
+    #[test]
+    fn multiple_rows() {
+        assert_eq!(
+            parse_csv("a,b\nc,d\n"),
+            vec![vec!["a", "b"], vec!["c", "d"]]
+        );
+    }
+
+    #[test]
+    fn a_row_with_no_trailing_newline_is_still_flushed() {
+        assert_eq!(parse_csv("a,b"), vec![vec!["a", "b"]]);
+    }
+
+    #[test]
+    fn quoted_field_with_an_embedded_comma() {
+        assert_eq!(
+            parse_csv("\"Acme, Inc.\",yes\n"),
+            vec![vec!["Acme, Inc.", "yes"]]
+        );
+    }
+
+    #[test]
+    fn escaped_double_quote_inside_a_quoted_field() {
+        assert_eq!(
+            parse_csv("\"say \"\"hi\"\"\",b\n"),
+            vec![vec!["say \"hi\"", "b"]]
+        );
+    }
+
+    #[test]
+    fn quoted_field_with_an_embedded_newline() {
+        assert_eq!(
+            parse_csv("\"line1\nline2\",b\n"),
+            vec![vec!["line1\nline2", "b"]]
+        );
+    }
+
+    #[test]
+    fn crlf_and_bare_cr_line_endings_are_normalized() {
+        assert_eq!(
+            parse_csv("a,b\r\nc,d\r"),
+            vec![vec!["a", "b"], vec!["c", "d"]]
+        );
+    }
+
+    #[test]
+    fn a_blank_line_yields_a_single_empty_field_row() {
+        assert_eq!(
+            parse_csv("a,b\n\nc,d\n"),
+            vec![vec!["a", "b"], vec![""], vec!["c", "d"]]
+        );
+    }
+
+    #[test]
+    fn empty_fields_between_commas_are_preserved() {
+        assert_eq!(parse_csv("a,,c\n"), vec![vec!["a", "", "c"]]);
+    }
+}

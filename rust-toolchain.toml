@@ -1,0 +1,12 @@
+[toolchain]
+# Pinned to an exact version, not `stable`, because this workspace gates
+# on coverage and that measurement comes from rustc's own bundled LLVM. A
+# toolchain bump can move coverage with no code change.
+#
+# It did. CI run 43143817118 on commit 9cea4e8 passed on attempt 1 under
+# 1.99.1 and failed on attempt 2 under 1.100.0 -- same commit, same
+# workflow, 85 lines across twelve untouched crates, because the runner
+# image had picked up the new release in between. Pinning makes the next
+# such change a decision instead of a surprise on someone's pull request.
+channel = "1.100.0"
+components = ["rustfmt", "clippy", "llvm-tools"]

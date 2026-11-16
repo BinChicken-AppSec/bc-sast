@@ -1,0 +1,30 @@
+[package]
+name = "appsec-stage-s3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-model = { path = "../appsec-model" }
+appsec-pipeline-core = { path = "../appsec-pipeline-core" }
+appsec-llm-client = { path = "../appsec-llm-client" }
+appsec-llm-agentic = { path = "../appsec-llm-agentic" }
+appsec-json-repair = { path = "../appsec-json-repair" }
+appsec-repo-analysis = { path = "../appsec-repo-analysis" }
+appsec-pathjail = { path = "../appsec-pathjail" }
+regex = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+# Test-only: `step_defaults_agree_with_step3_config_new_on_pack_merge_underfilled`
+# pins this crate's own default against the config layer's, same as
+# `appsec-stage-s10` does for `step_remediate`.
+appsec-config = { path = "../appsec-config" }

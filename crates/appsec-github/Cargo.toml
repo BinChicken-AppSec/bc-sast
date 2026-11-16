@@ -1,0 +1,22 @@
+[package]
+name = "appsec-github"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-model = { path = "../appsec-model" }
+appsec-redact = { path = "../appsec-redact" }
+appsec-sarif = { path = "../appsec-sarif" }
+reqwest = { workspace = true, features = ["json"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+wiremock = { workspace = true }

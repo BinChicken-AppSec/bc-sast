@@ -1,0 +1,22 @@
+[package]
+name = "appsec-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+regex = { workspace = true }
+appsec-yaml = { path = "../appsec-yaml" }
+appsec-pathjail = { path = "../appsec-pathjail" }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }

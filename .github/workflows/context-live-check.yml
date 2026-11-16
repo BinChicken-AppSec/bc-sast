@@ -1,0 +1,156 @@
+# Proves the context plane against the real Confluence / Microsoft Graph APIs.
+#
+# Everything about that plane is tested against fakes, the published API
+# documentation, and captured real files. Three Graph response shapes are
+# parsed defensively because the documentation does not settle them:
+#
+#   1. the outer envelope of POST /search/query
+#   2. whether a hit carries the reference needed to address its item
+#   3. which region codes are accepted
+#
+# A fake cannot settle any of those. This workflow is the difference between
+# "tested" and "known to work", so it runs against a real tenant.
+#
+# It is workflow_dispatch only, on purpose. It spends a real credential and
+# real model tokens, so it never fires on push.
+name: context plane live check
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Which document source to prove
+        required: true
+        default: sharepoint
+        type: choice
+        options: [sharepoint, confluence]
+      spaces:
+        description: Confluence space keys or SharePoint site paths, comma separated
+        required: true
+        type: string
+      repo_name:
+        description: Application name to search for (the relevance gate's subject)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  live-check:
+    name: gather, extract and gate against a real tenant
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.100.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the scanner and the context server
+        run: cargo build --release -p appsec-cli -p appsec-mcp
+
+      - name: Refuse to run without the credential this is meant to exercise
+        env:
+          SOURCE: ${{ inputs.source }}
+          SP_TENANT: ${{ secrets.BC_SHAREPOINT_TENANT_ID }}
+          SP_CLIENT: ${{ secrets.BC_SHAREPOINT_CLIENT_ID }}
+          SP_SECRET: ${{ secrets.BC_SHAREPOINT_CLIENT_SECRET }}
+          CF_BASE: ${{ secrets.BC_CONFLUENCE_BASE_URL }}
+          CF_EMAIL: ${{ secrets.BC_CONFLUENCE_EMAIL }}
+          CF_TOKEN: ${{ secrets.BC_CONFLUENCE_TOKEN }}
+        run: |
+          missing=""
+          if [ "$SOURCE" = "sharepoint" ]; then
+            [ -n "$SP_TENANT" ] || missing="$missing BC_SHAREPOINT_TENANT_ID"
+            [ -n "$SP_CLIENT" ] || missing="$missing BC_SHAREPOINT_CLIENT_ID"
+            [ -n "$SP_SECRET" ] || missing="$missing BC_SHAREPOINT_CLIENT_SECRET"
+          else
+            [ -n "$CF_BASE" ]  || missing="$missing BC_CONFLUENCE_BASE_URL"
+            [ -n "$CF_EMAIL" ] || missing="$missing BC_CONFLUENCE_EMAIL"
+            [ -n "$CF_TOKEN" ] || missing="$missing BC_CONFLUENCE_TOKEN"
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error::missing repository secret(s):$missing"
+            echo "A green run without these would prove nothing, so this fails rather than skips."
+            exit 1
+          fi
+
+      # A tiny target. The point is the context plane, not the scan: S0-S2 is
+      # the cheapest path that still runs the gather, the typed extraction,
+      # the relevance gate and the threat model that consumes the result.
+      - name: Make a minimal scan target
+        run: |
+          mkdir -p /tmp/target
+          cat > /tmp/target/app.py <<'EOF'
+          import sqlite3
+
+          def lookup(conn, user_id):
+              return conn.execute("SELECT * FROM users WHERE id = " + user_id).fetchone()
+          EOF
+
+      - name: Scan with the context plane attached
+        id: scan
+        env:
+          BC_CONTEXT_SOURCE: ${{ inputs.source }}
+          BC_CONFLUENCE_BASE_URL: ${{ secrets.BC_CONFLUENCE_BASE_URL }}
+          BC_CONFLUENCE_EMAIL: ${{ secrets.BC_CONFLUENCE_EMAIL }}
+          BC_CONFLUENCE_TOKEN: ${{ secrets.BC_CONFLUENCE_TOKEN }}
+          BC_SHAREPOINT_TENANT_ID: ${{ secrets.BC_SHAREPOINT_TENANT_ID }}
+          BC_SHAREPOINT_CLIENT_ID: ${{ secrets.BC_SHAREPOINT_CLIENT_ID }}
+          BC_SHAREPOINT_CLIENT_SECRET: ${{ secrets.BC_SHAREPOINT_CLIENT_SECRET }}
+          BC_SHAREPOINT_REGION: ${{ secrets.BC_SHAREPOINT_REGION }}
+          BC_OPENAI_API: ${{ secrets.BC_OPENAI_API }}
+          BC_GATEWAY_API_KEY: ${{ secrets.BC_GATEWAY_API_KEY }}
+          RUST_LOG: info
+        run: |
+          set -o pipefail
+          # --context-mcp-space is singular and repeatable, so the comma-separated
+          # input is expanded into one flag per space.
+          spaces=()
+          IFS=',' read -ra parsed <<< "${{ inputs.spaces }}"
+          for s in "${parsed[@]}"; do
+            trimmed="$(echo "$s" | xargs)"
+            [ -n "$trimmed" ] && spaces+=(--context-mcp-space "$trimmed")
+          done
+          if [ ${#spaces[@]} -eq 0 ]; then
+            echo "::error::no spaces parsed from '${{ inputs.spaces }}'"
+            exit 1
+          fi
+          # RUST_LOG=info is required: the default filter is warn, and the line
+          # this workflow asserts on is logged at info.
+          ./target/release/appsec-scan \
+            --repo /tmp/target \
+            --repo-name "${{ inputs.repo_name }}" \
+            --context-mcp-server ./target/release/appsec-mcp \
+            "${spaces[@]}" \
+            --stop-after s2 \
+            --skip-preflight 2>&1 | tee /tmp/scan.log
+
+      # appsec-orchestrator::providers::log_context emits this line at info,
+      # with fetched/admitted fields, and ONLY when fetched > 0. So its absence
+      # is exactly the failure this workflow exists to catch: a response shape
+      # that did not parse yields no documents and therefore no line.
+      - name: Prove documents were actually gathered
+        run: |
+          echo "--- problems reported by the gather ---"
+          grep "gathering deployment context was incomplete" /tmp/scan.log || echo "(none)"
+          echo "--- what the gather admitted ---"
+          if ! grep -q "read deployment documents and admitted typed facts" /tmp/scan.log; then
+            echo "::error::the gather returned zero documents"
+            echo "Either the search genuinely matched nothing, or a response shape did not parse."
+            echo "Read the problem lines above before assuming it is the former."
+            exit 1
+          fi
+          grep "read deployment documents and admitted typed facts" /tmp/scan.log
+
+      - name: Keep the log for the write-up
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: context-live-check-log
+          path: /tmp/scan.log
+          retention-days: 7

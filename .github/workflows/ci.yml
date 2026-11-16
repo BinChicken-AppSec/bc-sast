@@ -1,0 +1,481 @@
+name: CI
+
+# Runs on every PR and every push to main: format/lint/test/100%-coverage
+# gate, cargo-deny (advisories/bans/licenses/sources), and a build-only
+# (never pushed) container build to catch a broken Dockerfile early.
+# Weekly schedule re-runs cargo-deny against the *unchanged* lockfile so a
+# newly disclosed advisory against a dependency nobody touched still trips
+# the build (advisory disclosure lags publication).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # Monday 06:17 UTC, an arbitrary off-peak minute
+
+# Least privilege: no job here writes to the repository, and none uses a
+# secret, so a pull request from a fork runs every check with a read-only
+# token. Deliberately `pull_request`, never `pull_request_target`, which
+# would run a contributor's code with a writable token.
+permissions:
+  contents: read
+
+# A new push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test + 100% coverage gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # This job builds the whole workspace twice (plain, then instrumented
+      # for coverage). With full debug info that outgrew the runner's disk
+      # once the workspace reached 1.1.0: the runner vanished mid-step with
+      # no log. Line tables keep backtraces readable, and coverage
+      # instrumentation needs no debug info at all.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Preinstalled SDKs this job never uses, removed for the same reason.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install Rust toolchain (per rust-toolchain.toml)
+        run: rustup show
+
+      # `aws-lc-sys` (the resolved rustls crypto backend, see Dockerfile) needs
+      # cmake + a C/C++ compiler + libclang-dev (for `bindgen`) to build from
+      # source. `clang`/`perl` ship on GitHub-hosted Ubuntu runners already,
+      # but `cmake` and, more importantly, the `-dev` libclang package are not
+      # reliably present. Install explicitly rather than assume the image.
+      - name: Install native build dependencies (aws-lc-sys)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake libclang-dev
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@84f5ac3124727fb3d284d4d22ee9ab3654fd09a6 # v2.87.7
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Discard any cached coverage artifacts
+        # `Swatinem/rust-cache` above restores `target/`, which on a branch
+        # is whatever a previous run left. Stale instrumented binaries and
+        # `.profraw` merged into this run attribute coverage for code that
+        # has since changed to lines the current tests never execute.
+        #
+        # `cargo llvm-cov clean --workspace` does NOT remove all of it --
+        # measured here: the same crate read 94.25% lines after that clean
+        # and 100% after the `rm -rf` below, same code, same commit. So the
+        # directory goes explicitly; the subcommand alone is not enough.
+        #
+        # This is insurance, not the explanation for any particular number.
+        # An earlier revision of this comment claimed the 86 uncovered
+        # lines the workspace gate reports came from cache pollution. They
+        # do not: a fully cleaned tree reproduces that same line set
+        # exactly. They are real under rustc 1.100 -- see the threshold
+        # comment on the per-crate gates below.
+        run: |
+          rm -rf target/llvm-cov-target target/llvm-cov
+          cargo llvm-cov clean --workspace
+
+      - name: cargo llvm-cov (100% functions, 99.8% lines, everything but appsec-cli)
+        id: workspace-coverage
+        # Every crate excluded below (and the one file-level exclusion,
+        # `appsec-interactive/src/blocking_io.rs`) has its full rationale
+        # (tool artifact vs. genuinely-unreachable defensive branch,
+        # verification method, and observed numbers) in
+        # docs/coverage-exceptions.md. Keep that doc in sync with this
+        # file's own thresholds when either changes.
+        run: |
+          # One definition of the excluded set, exported so the diagnostic
+          # below measures exactly what this gate measured. They used to
+          # carry separate lists -- `--exclude` here, a filename regex
+          # there -- which report different file sets from the same
+          # profdata, so the diagnostic named lines this gate had not
+          # failed on.
+          echo "BC_COV_EXCLUDES=--exclude appsec-cli --exclude appsec-checkpoint --exclude appsec-callgraph --exclude appsec-repo-analysis --exclude appsec-stage-s0 --exclude appsec-stage-s1 --exclude appsec-validation-scoring --exclude appsec-thirdparty-api --exclude appsec-diffcapture --exclude appsec-sandbox-tools --exclude appsec-orchestrator --exclude appsec-parity-tests --exclude appsec-mcp" >> "$GITHUB_ENV"
+          echo "BC_COV_IGNORE=appsec-interactive/src/blocking_io\.rs" >> "$GITHUB_ENV"
+          cargo llvm-cov --workspace --exclude appsec-cli --exclude appsec-checkpoint --exclude appsec-callgraph --exclude appsec-repo-analysis --exclude appsec-stage-s0 --exclude appsec-stage-s1 --exclude appsec-validation-scoring --exclude appsec-thirdparty-api --exclude appsec-diffcapture --exclude appsec-sandbox-tools --exclude appsec-orchestrator --exclude appsec-parity-tests --exclude appsec-mcp \
+            --ignore-filename-regex 'appsec-interactive/src/blocking_io\.rs' \
+            --fail-under-lines 99.8 --fail-under-functions 100 \
+            --lcov --output-path lcov-workspace.info
+
+      - name: Show what the workspace coverage gate missed
+        # The gate writes lcov only, so a failure there names no file or
+        # line. Report the same run's data, ignoring the crates the gate
+        # excludes: the total, every uncovered line, and the start of every
+        # function that never ran (which --show-missing-lines omits when
+        # its lines are shared with code that did run).
+        if: failure() && steps.workspace-coverage.outcome == 'failure'
+        run: |
+          # Re-runs with the GATE's own package selection, from
+          # $BC_COV_EXCLUDES, so these numbers are the numbers that failed.
+          # `cargo llvm-cov report` over existing profdata without the same
+          # --exclude set reports a different file set: on one failure it
+          # showed 95,312 regions where the gate had measured 124,950, and
+          # named uncovered lines the gate had not failed on.
+          cargo llvm-cov --workspace $BC_COV_EXCLUDES \
+            --ignore-filename-regex "$BC_COV_IGNORE" \
+            --summary-only --show-missing-lines \
+            | sed -n '/^TOTAL/p;/Uncovered Lines/,$p'
+          cargo llvm-cov --workspace $BC_COV_EXCLUDES \
+            --ignore-filename-regex "$BC_COV_IGNORE" \
+            --json --output-path coverage-workspace.json
+          python3 scripts/coverage_gaps.py coverage-workspace.json
+
+      - name: cargo llvm-cov (appsec-cli, ~99.3% functions, ~99.0% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-cli.
+        #
+        # ---------------------------------------------------------------
+        # The per-crate thresholds here and below were re-measured against
+        # rustc 1.100 (pinned in rust-toolchain.toml) on 2026-11-15, after
+        # the 1.99 -> 1.100 bump moved every number without a line of code
+        # changing. 1.100's line attribution counts regions the previous
+        # release did not: a bare closing brace, each argument line of a
+        # multi-line `tracing::warn!`, each continuation line of a
+        # multi-line format string or method chain. Those lines execute --
+        # the gate's own `--show-missing-lines` output names them -- so no
+        # test can cover them and a 100% line target is unreachable.
+        #
+        # Each threshold is the measured value floored to one decimal and
+        # dropped 0.1, so the gate catches a regression without failing on
+        # platform jitter (a local macOS run reads very slightly lower
+        # than CI's Linux: 99.02 vs 99.040 for this crate). Thresholds
+        # that already passed were left alone rather than loosened.
+        #
+        # To re-measure, `rm -rf target/llvm-cov-target` first: the
+        # `clean` subcommand alone leaves data behind and reads low.
+        # ---------------------------------------------------------------
+        run: |
+          cargo llvm-cov -p appsec-cli \
+            --ignore-filename-regex 'appsec-interactive/src/blocking_io\.rs' \
+            --fail-under-lines 98.9 --fail-under-functions 99.1 \
+            --lcov --output-path lcov-appsec-cli.info
+
+      - name: cargo llvm-cov (appsec-checkpoint, 100% functions, ~100% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-checkpoint.
+        run: |
+          cargo llvm-cov -p appsec-checkpoint \
+            --fail-under-lines 99.5 --fail-under-functions 100 \
+            --lcov --output-path lcov-appsec-checkpoint.info
+
+      - name: cargo llvm-cov (appsec-callgraph, ~98.8% functions, ~98.75% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-callgraph.
+        run: |
+          cargo llvm-cov -p appsec-callgraph \
+            --fail-under-lines 98.0 --fail-under-functions 98.5 \
+            --lcov --output-path lcov-appsec-callgraph.info
+
+      - name: cargo llvm-cov (appsec-repo-analysis, 100% functions, ~99.8% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-repo-analysis.
+        run: |
+          cargo llvm-cov -p appsec-repo-analysis \
+            --fail-under-lines 99.5 --fail-under-functions 100 \
+            --lcov --output-path lcov-appsec-repo-analysis.info
+
+      - name: cargo llvm-cov (appsec-validation-scoring, 100% functions, ~99.7% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-validation-scoring.
+        run: |
+          cargo llvm-cov -p appsec-validation-scoring \
+            --fail-under-lines 99.5 --fail-under-functions 100 \
+            --lcov --output-path lcov-appsec-validation-scoring.info
+
+      - name: cargo llvm-cov (appsec-stage-s0, 100% functions, ~99.7% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-stage-s0.
+        run: |
+          cargo llvm-cov -p appsec-stage-s0 \
+            --fail-under-lines 99.3 --fail-under-functions 100 \
+            --lcov --output-path lcov-appsec-stage-s0.info
+
+      - name: cargo llvm-cov (appsec-stage-s1, 100% functions, ~100% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-stage-s1.
+        run: |
+          cargo llvm-cov -p appsec-stage-s1 \
+            --fail-under-lines 99.1 --fail-under-functions 98 \
+            --lcov --output-path lcov-appsec-stage-s1.info
+
+      - name: cargo llvm-cov (appsec-thirdparty-api, ~99.5% functions, ~99.8% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-thirdparty-api.
+        run: |
+          cargo llvm-cov -p appsec-thirdparty-api \
+            --fail-under-lines 99.5 --fail-under-functions 99.0 \
+            --lcov --output-path lcov-appsec-thirdparty-api.info
+
+      - name: cargo llvm-cov (appsec-diffcapture, ~99.3% functions, ~99.85% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-diffcapture.
+        run: |
+          cargo llvm-cov -p appsec-diffcapture \
+            --fail-under-lines 99.3 --fail-under-functions 99.0 \
+            --lcov --output-path lcov-appsec-diffcapture.info
+
+      - name: cargo llvm-cov (appsec-sandbox-tools, 100% functions, ~99.94% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-sandbox-tools.
+        run: |
+          cargo llvm-cov -p appsec-sandbox-tools \
+            --fail-under-lines 99.6 --fail-under-functions 100 \
+            --lcov --output-path lcov-appsec-sandbox-tools.info
+
+      - name: cargo llvm-cov (appsec-orchestrator, ~99.3% functions, ~99.6% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-orchestrator.
+        #
+        # Lines moved 99.7 -> 99.5 when context gathering landed. What it
+        # added that no test reaches is the four-line tail of
+        # `gather_typed_context`, which runs only once documents are in
+        # hand -- and getting documents needs a live MCP server process.
+        # Both halves either side of it are covered directly:
+        # `gather_documents`/`drive` by scripted transcripts and a real
+        # child process, `extract_and_merge` by hand-made documents and a
+        # scripted model, including the merge rules. What is left is the
+        # glue between them, the same shape as `server::run`.
+        run: |
+          cargo llvm-cov -p appsec-orchestrator \
+            --fail-under-lines 99.5 --fail-under-functions 99.1 \
+            --lcov --output-path lcov-appsec-orchestrator.info
+
+      - name: cargo llvm-cov (appsec-mcp, ~97.8% functions, ~98.8% lines)
+        # Full rationale: docs/coverage-exceptions.md#appsec-mcp.
+        #
+        # Lower than its neighbours because this crate owns a binary, and
+        # the uncovered parts are the ones a unit test cannot enter:
+        #
+        #   - `main.rs` (6 lines): the binary's glue. The subprocess tests
+        #     in tests/server_process.rs do drive it -- they assert it
+        #     answers on stdout, exits non-zero when misconfigured and
+        #     keeps serving after a malformed frame -- but coverage is not
+        #     collected across a process boundary, so it reads as 0%.
+        #   - `server::run` (9 lines): reads the real environment and locks
+        #     the real stdin. Everything it decides is decided by
+        #     `config_from_env` or `serve`, both fully covered.
+        #   - two error closures in `http.rs` on builders that cannot fail
+        #     with this crate's fixed configuration (`reqwest`'s client
+        #     and tokio's current-thread runtime). Returning an error
+        #     beats `expect` in a server process, so the paths stay.
+        #   - three in `client.rs`: a spawned child with no stdin or no
+        #     stdout (both are always piped) and a failing `wait`.
+        #   - the `panic!` arms of test assertions, which run only when a
+        #     test fails. Functions dipped 96.6 -> 96.3 when the security
+        #     review's fixes landed, because each fix brought tests whose
+        #     failure path is a `panic!` the gate counts as a function.
+        #
+        # `lib.rs`, `confluence.rs` and `sharepoint.rs` are all at 100%
+        # lines -- including a mid-stream truncated body driven by a raw
+        # TCP listener, because `wiremock` cannot sever a connection.
+        #
+        # Raised 98.3/96.3 -> 98.6/97.5 when the SharePoint source landed
+        # (2026-11-16). The crate roughly doubled and the new half is at
+        # 100% lines, so the untestable binary glue is now a smaller
+        # fraction of the whole. Four gaps the old threshold would have
+        # hidden were found by reading the lines the gate named and closed
+        # with real tests rather than excused: a site resolved on demand
+        # rather than from the search's cache, a term that cleans away to
+        # nothing, a 401 on the search POST (a second code path from the
+        # one a GET takes), and a 200 carrying a non-JSON body. A fifth
+        # was the Confluence CQL terms clause, which no test reached at
+        # all despite now being on the path of every scan.
+        run: |
+          cargo llvm-cov -p appsec-mcp \
+            --fail-under-lines 98.6 --fail-under-functions 97.5 \
+            --lcov --output-path lcov-appsec-mcp.info
+
+      - name: What every coverage gate actually measured
+        # `always()`, not `failure()`: every gate here writes lcov and
+        # nothing else, so none of them says what it measured even when it
+        # passes. On a toolchain bump there are twelve thresholds to
+        # re-tune and no numbers to re-tune them against -- re-running each
+        # gate to find out costs a full coverage pass apiece. The lcov
+        # files are already on disk by this point, so this just reads them.
+        #
+        # A gate that failed stops the job, so later gates write no file;
+        # the script reports those as not written rather than as zero.
+        if: always()
+        run: python3 scripts/lcov_summary.py lcov-*.info
+
+      - name: Disk usage at the end of the job
+        if: always()
+        run: df -h / && du -sh target 2>/dev/null || true
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lcov.info
+          path: |
+            lcov-workspace.info
+            lcov-appsec-cli.info
+            lcov-appsec-checkpoint.info
+            lcov-appsec-callgraph.info
+            lcov-appsec-repo-analysis.info
+            lcov-appsec-validation-scoring.info
+            lcov-appsec-stage-s0.info
+            lcov-appsec-stage-s1.info
+            lcov-appsec-thirdparty-api.info
+            lcov-appsec-diffcapture.info
+            lcov-appsec-sandbox-tools.info
+            lcov-appsec-orchestrator.info
+          retention-days: 14
+
+  parity:
+    name: parity harness (appsec-parity-tests vs real Python vvaharness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Read-only oracle source (never modified, see docs/parity-harness.md)
+      # for appsec-parity-tests, checked out into a workspace subdirectory
+      # rather than the sibling-checkout layout parity/README.md describes
+      # for local dev, since CI has no reason to match a local disk
+      # convention. Pinned to a specific commit, not `main`: this repo has
+      # no control over what that upstream, unrelated project pushes next,
+      # and an upstream-only change would otherwise fail (or silently
+      # start skipping) THIS repo's CI for a reason having nothing to do
+      # with any change actually made here. Bump deliberately. Re-running
+      # the harness against a newer vvaharness commit is itself how a real
+      # parity drift would be caught, so don't bump reflexively.
+      - name: Checkout vvaharness (pinned)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: visa/visa-vulnerability-agentic-harness
+          ref: 287e735b182b11ecdf8de7422b4e70d6ad8bc03a # v1.4.0
+          path: vvaharness
+
+      - name: Install Rust toolchain (per rust-toolchain.toml)
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build the parity venv
+        run: ./parity/setup.sh python3
+
+      - name: cargo test -p appsec-parity-tests
+        # `--nocapture` so a SKIPPED note (venv/repo not resolved) is
+        # actually visible in the log rather than swallowed by cargo
+        # test's default per-passing-test output capture. This job just
+        # set both up explicitly, so a real run must never skip; the grep
+        # below turns a silent no-op pass into a hard failure instead, the
+        # same distinction docs/parity-harness.md tells a human to check
+        # by hand ("grep its output for SKIPPED").
+        env:
+          BC_PARITY_PYTHON: ${{ github.workspace }}/parity/.venv/bin/python3
+          BC_PARITY_REPO: ${{ github.workspace }}/vvaharness
+        run: |
+          # pipefail because the default shell for a `run:` step is `bash -e`
+          # without it: piping into tee would otherwise make this step report
+          # tee's exit status, so a genuinely failing parity test passed CI and
+          # only a SKIPPED note could fail the job.
+          set -o pipefail
+          cargo test -p appsec-parity-tests -- --nocapture 2>&1 | tee parity-output.log
+          if grep -q "SKIPPED:" parity-output.log; then
+            echo "::error::parity tests were skipped despite this job setting up the venv/repo explicitly. See the SKIPPED note above for which one failed to resolve"
+            exit 1
+          fi
+
+  # Deliberately its own job rather than a step in `test`: it needs only
+  # a checkout and the preinstalled python3, so it finishes in seconds
+  # and reports while the 45-minute coverage job is still compiling.
+  # Bolting it onto `test` would have hidden a one-second answer behind
+  # the slowest thing in the workflow.
+  size:
+    name: module size gate (no file over 2000 code lines may grow)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: scripts/loc_audit.py --check
+        # Fails on two things only: a file already over the limit that
+        # grew, and a file that newly crossed it. A file that SHRANK
+        # passes and is reported, because failing a build on an
+        # improvement during the refactor this gate exists to encourage
+        # is how a gate gets switched off.
+        run: python3 scripts/loc_audit.py --check
+      - name: Current sizes, for the log
+        if: always()
+        run: python3 scripts/loc_audit.py --threshold 800 --kind rust
+
+  schema:
+    name: findings-history schema + row-level security (PG 14)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      # 14 deliberately, not the newest. The design doc commits to a PG 14
+      # floor and claims nothing here needs a later feature; testing on 17
+      # would prove the schema runs somewhere, not that the floor is real.
+      postgres:
+        image: postgres:14-alpine
+        env:
+          POSTGRES_DB: bcsast
+          POSTGRES_USER: bcsast
+          POSTGRES_PASSWORD: bcsast-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bcsast -d bcsast"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Apply the schema and run the RLS tests
+        # The suite's first assertion is that it is NOT running as a
+        # superuser or a BYPASSRLS role. POSTGRES_USER above is a
+        # superuser, so the tests SET ROLE to a dedicated application
+        # role; without that, every isolation assertion would pass
+        # against a database with no isolation at all.
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: bcsast
+          PGPASSWORD: bcsast-test-only
+          PGDATABASE: bcsast
+        run: ./db/test/run.sh
+
+  deny:
+    name: cargo-deny (advisories, bans, licenses, sources)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check advisories bans licenses sources
+
+  container:
+    name: build container image (validation only, never pushed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - name: Build (no push)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          tags: bc-sast:ci-validation
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

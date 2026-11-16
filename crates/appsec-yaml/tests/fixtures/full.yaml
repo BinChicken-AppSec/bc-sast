@@ -1,0 +1,352 @@
+# Copyright 2026 Visa, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# pipeline configuration
+#
+# Each model role chooses its own backend:
+#   via: cli    → `claude` CLI subprocess (auth: run `claude` then `/login`).
+#                 Provides Read/Glob/Grep/Bash natively. The only backend
+#                 with Bash — use it if a role needs to shell out.
+#   via: sdk    → Anthropic Python SDK (auth: ANTHROPIC_SDK_API_KEY).
+#                 Temperature control + connection pooling. Agentic roles
+#                 (preprocess, verify) use a local sandboxed Read/Glob/Grep
+#                 tool-loop — no Bash.
+#   via: openai → OpenAI Chat Completions API (auth: OPENAI_API_KEY).
+#                 Same agentic Read/Glob/Grep tool-loop as `sdk`; no Bash.
+#
+# A bare string (e.g. `deepdive: claude-opus-4-6`) is still accepted and
+# defaults to `via: cli` for backward compatibility.
+
+models:
+  # --auto-step1: repo survey is pre-packed in Python → single CLI prompt
+  autoexclude: {id: claude-opus-4-8,       via: cli}
+
+  # Step 1: Prefer to use cli approch for step1 if your model supports it.
+  # agentic repo exploration — needs filesystem tools. via:sdk and via:openai use the sandboxed Read/Glob/Grep loop in
+  # vvaharness/backends/localtools.py (no Bash — keep it out of step1.allowed_tools below).
+  # Swap to via: cli to restore the CLI path (which also grants Bash).
+  # since it can use Bash for more efficient repo inventory and flexible evidence retrieval. 
+  # The SDK/OpenAI approach is more limited (Read/Glob/Grep only) but still effective, 
+  # and is the only option for models that reject `temperature` (Opus 4.7+).
+
+  preprocess:  {id: claude-opus-4-8, via: sdk}
+
+  # Step 2: threat model — single-shot SDK reasoning over packed evidence
+  threatmodel: {id: gpt-5.5, via: openai}
+
+  # Step 3: strategic decomposition — pure reasoning over the ContextPackage,
+  # no tools needed → SDK for direct max_tokens / connection pooling.
+  decompose:   {id: gpt-5.5, via: openai}
+
+  # Step 4: deep-dive — Sonnet 4.6 via sdk @ T0.4 enables s4 majority voting
+  # (step4.runs / vote_threshold below). For single-pass, point deepdive at a
+  # via:cli or temperature-rejecting model.
+  # Swap the line below to switch backend — all three are interchangeable here:
+  #   {id: claude-opus-4-7, via: cli}     ← Claude CLI subprocess
+  #   {id: claude-opus-4-7,       via: sdk,}     ← Anthropic SDK
+  #   {id: gpt-4o, via: openai}  ← OpenAI SDK
+
+  deepdive:    {id: claude-sonnet-4-6, via: sdk, temperature: 0.4}  # Step-4 deep dive (risk/catchall/specialist chunk analysis); T>0 enables step4 majority voting (runs/vote_threshold)
+
+  # Step 6: adversarial verification — needs Read/Glob/Grep.
+  # cli and openai both provide them; swap freely:
+  verify:      {id: gpt-5.5, via: openai}
+
+  # Step 7: semantic deduplication
+  dedup:       {id: claude-opus-4-8,   via: sdk}
+
+  # Step 8: chain analysis
+  chain:       {id: claude-opus-4-8,  via: cli}
+
+  # Step 10: remediation — the Remediation Agent proposes a minimal fix for
+  # each verified finding and writes per-finding artefacts under
+  # <repo>/security-remediation/.
+  remediate:   {id: claude-opus-4-8, via: sdk}
+
+  # models.validate: used by `vvaharness validate` / `s11` (standalone validator).
+  # MUST be an Anthropic model: the validate agent requires via:sdk or via:cli.
+  validate:    {id: claude-sonnet-4-6, via: sdk}
+  # Per-persona model overrides for the s11 validator (unset a line to inherit models.validate):
+  validate_security_architect: {id: claude-opus-4-8}
+  validate_penetration_tester: {id: claude-sonnet-4-6}
+  validate_cross_repo_analyzer: {id: claude-sonnet-4-6}
+
+
+sdk:
+  # Required for via:sdk roles. Set in .env — NEVER hardcode here.
+  api_key: ${ANTHROPIC_SDK_API_KEY}
+  base_url:   ${ANTHROPIC_SDK_BASE_URL}
+  verify_ssl: true
+  ca_cert:     ${ANTHROPIC_SDK_CA_CERT}     # CA bundle for the gateway (env-overridable)
+  client_cert: ${ANTHROPIC_SDK_CLIENT_CERT}              # client cert for mTLS; empty = off
+
+openai:
+  # Required for via:openai roles. Set in .env — NEVER hardcode here.
+  api_key:    ${OPENAI_API_KEY}
+  base_url:   ${OPENAI_BASE_URL}
+  verify_ssl: true
+  ca_cert:    ${OPENAI_CA_CERT}        # CA bundle for the OpenAI endpoint (env-overridable)
+  # organization: org-xxxx
+
+cli:
+  # TLS/proxy for the `claude` CLI subprocess (via:cli roles). The CLI hits the
+  # same Anthropic gateway as via:sdk — point this at the same private root CA
+  # only if your gateway uses one. All keys are OPTIONAL: unset env vars expand
+  # to empty and inject nothing, so the subprocess inherits the ambient env
+  # exactly as before. Auth/endpoint stay delegated to the CLI's own precedence.
+  verify_ssl: true
+  ca_cert:    ${CLAUDE_CLI_CA_CERT}    # CA bundle -> NODE_EXTRA_CA_CERTS; empty = off
+  # client_cert: NOT supported on the CLI backend (Node has no env path); use via:sdk for mTLS.
+  # Reasoning effort pinned for the `claude -p` subprocess so the scan never
+  # inherits the operator's interactive /effort default (e.g. 'xhigh', which
+  # some models reject). Opus-tier models support high|low|max|medium.
+  effort: high
+
+step1:
+  # ── AI auto-exclude (per-target Step-1 overlay) ──
+  # When true, after each clone the harness AI-surveys the target and derives a
+  # per-target exclude overlay (dirs/exts/globs) BEFORE s1 — same behaviour as
+  # the --auto-step1 CLI flag. Flag and config OR together; --no-auto-step1
+  # hard-disables for a run; --step1-config still wins over both.
+  auto_exclude: true
+  auto_exclude_max_tokens: 8000     # output cap for the auto-exclude survey call (models.autoexclude)
+
+  # ── Agentic-phase quality vs cost ──
+  max_budget_usd: 25.0              # agentic exploration budget cap (via:cli only; sdk/openai ignore it)
+
+  max_turns: 40                     # tool-loop cap — enforced on via:sdk and via:openai.
+                                    # via:cli manages its own loop and ignores this.
+                                    # Raise it for large repos where exploration force-finalises at the cap.
+
+  allowed_tools:                    # tools the explorer may use. Read/Glob/Grep
+                                    # are sufficient for repo survey on every
+                                    # backend. Bash is intentionally NOT listed
+                                    # (prompt-injection → host shell risk on
+                                    # untrusted targets); add it ONLY if you
+                                    # accept that risk for a trusted repo.
+    - Read
+    - Glob
+    - Grep
+
+  # Deterministic repo walk (ground-truth file inventory).
+  # These APPEND to the built-in defaults in vvaharness/pipeline/stages/s1_preprocess.py — they
+  # don't replace them. Leave null/[] for defaults only.
+  # App/repo-specific exclusions come from --step1-config <file> or are
+  # auto-derived per target by --auto-step1. Keep ONLY org-wide,
+  # language-agnostic noise here.
+  exclude_dirs:
+    - .vs
+    - .settings                    # Eclipse IDE metadata
+    - .vscode
+    - .idea                        # IntelliJ IDE metadata
+    - node_modules
+   
+  exclude_exts:
+    # compiled / packaged binaries (complements built-in .exe/.dll/.so/.jar/.class/.o/.a/.obj)
+    - .msi
+    - .nupkg
+    - .pdb
+    - .lib
+    - .aar
+    - .ser
+    - .pbix
+    # binary keystores / certs (.pem stays in scope — text, may hold secrets)
+    - .p12
+    - .pfx
+    - .jks
+    - .der
+    - .cer
+    # office binaries
+    - .doc
+    - .docx
+    - .xls
+    - .xlsx
+    - .xlsm
+    - .bmp
+    # opaque data stores
+    - .sqlite
+    - .db
+  exclude_globs:
+    - "**/._*"                            # macOS resource forks
+    
+  max_file_kb: 1024                       # skip files larger than this (catches data dumps; lets normal CSV/JSON through)
+
+  # Deterministic call-graph hardening (runs AFTER the agentic exploration):
+  # Nodes are file-qualified (`rel/path.ext::name`) so save()/process() in
+  # different files don't collide in BFS / connected-components / neighbor ctx.
+  call_graph_validate: true        # drop agent-emitted caller/callee names that don't appear in any source file
+  call_graph_supplement: true      # regex-scan source for calls to known fns; iteratively expand edges
+  call_graph_rounds: 4             # max expansion rounds (each round adds newly-discovered callers as targets)
+  call_graph_max_targets: 3        # when a bare callee resolves to N def-sites, keep top-N by dir-prefix affinity to caller
+
+  # Structural dedup of per-environment config files (yml/json/ini/…).
+  # Clusters files with identical key-structure, keeps one representative
+  # per cluster (per top-level dir), and force-keeps any dropped file that
+  # contains a literal secret or insecure value. Repo-agnostic — no path
+  # assumptions. Set enabled: false to disable.
+  config_dedup:
+    enabled: true
+    min_cluster_size: 5            # only dedup if ≥N files share identical key-shape
+    keep_per_top_dir: true         # keep ≥1 representative per first-level dir
+    promote_on_secret_hit: true    # never drop a file containing a literal credential
+    promote_on_insecure_value: true  # …or verify:false / auth:none / debug:true etc.
+
+step2:                              # threat-model (assets, trust boundaries, ranked threats)
+  enabled: true                     # set false to skip threat modelling entirely
+  max_tokens: 64000
+  max_threats: 50                   # cap on emitted ranked threats
+  baseline: auto                    # auto | owasp | none — inject kind-specific minimum-threat checklist (OWASP/CWE/MASVS/IaC)
+  max_doc_chars: 20000              # README/SECURITY/ARCHITECTURE budget
+  max_manifest_chars: 4000          # per-manifest cap (pom.xml, package.json, …)
+  # Evidence caps for the s1-derived blocks (s2 runs AFTER s1):
+  max_modules: 100                   # ctx.modules[] lines in the prompt
+  max_entry_points: 400             # ctx.entry_points[] (STRIDE-tagged) lines
+  max_config_reps: 80               # representative config files (post-dedup)
+  max_api_artefacts: 100             # openapi/swagger/proto/graphql/wsdl/META-INF
+
+step3:
+  max_tokens: 64000
+  timeout: 3600                     # seconds; cli.prompt subprocess deadline (decompose can exceed 10m on large repos)
+  taint_chunks: true                # emit entry→sink data-flow chunks (taint-NN) ranked above LLM risk chunks
+  taint_max_hops: 10                 # max call-graph depth when walking entry→sink
+  taint_max_chunks: 60              # cap on emitted taint chunks
+  taint_files_per_hop: 5            # max files per hop fn (ranked by package-affinity to entry/sink); 0 = uncapped
+  pack_by: loc                      # loc | tokens — shard-boundary metric for risk/catchall/specialist packing.
+                                    #   loc    → legacy: respects risk_chunk_loc / catchall_chunk_loc / specialist_chunk_loc below (back-compat default)
+                                    #   tokens → single budget: cuts at (chunk_token_budget − chunk_overhead_tokens) × 4 bytes; *_chunk_loc caps ignored
+  chunk_token_budget: 180000        # (pack_by: tokens) model context window available to one s4 prompt
+  chunk_overhead_tokens: 80000      # (pack_by: tokens) reserved for SYSTEM + RESEARCH-LENS + neighbor-ctx + step4.max_tokens output
+  
+  risk_chunk_loc: 10000             # split LLM-emitted chunk-NN into chunk-NN-a/b/… if total LOC exceeds this (0 = off)
+  catchall_enabled: true            # emit catchall-NN coverage-sweep chunks for files no risk/taint chunk claimed (off for giant 3rd-party trees e.g. Hadoop)
+  catchall_chunk_loc: 4000          # max LOC per auto-generated coverage chunk
+  catchall_max_files: 100           # file cap for catch-all packing (separate from specialists)
+  max_files_per_chunk: 80           # hard cap for risk/specialist chunks
+  specialists:                      # repo-wide specialist passes appended after risk chunks
+    - crypto
+    - logic-bug
+    - access-control
+    - batch-etl
+    - iac                           # Terraform/Dockerfile/k8s/Helm/GH-Actions/Ansible — gated off if no IaC files present
+  specialist_chunk_loc: 10000       # shard specialist scope by this many LOC
+
+step4:
+  parallel: 5                       # concurrent chunks processed at once (1 = sequential)
+  timeout: 1800                     # seconds; per-chunk deadline. via:cli (claude subprocess) hard-kills at this; via:sdk uses streaming so it rarely matters. 
+  runs: 3                           # same chunk run N× at T>0; auto-forced to 1 if deepdive.via != sdk OR if the model rejects `temperature`.
+  vote_threshold: 2                 # finding must appear in ≥N runs to survive → drops T>0 hallucinations
+  specialist_runs: 1                # specialist chunks run once (s6 verifies them)
+  line_bucket: 10                   # canonical key buckets lines to +/- this many
+  max_findings_per_run: 10          # keep top-N by confidence per run
+  max_tokens: 64000                 # output token cap per deep-dive run
+  neighbor_context_lines: 25        # ±lines of out-of-chunk callers/callees appended to each prompt (0 = off)
+  neighbor_context_max: 50          # cap on neighbor excerpts per chunk
+
+step5_prefilter:                    # deterministic gates applied BEFORE s6 verify
+  # These gates complement s4 majority voting (enabled in this profile): they
+  # drop hallucinated / unproven findings before paying the per-finding s6
+  # verifier budget. (They are the *primary* FP defence in profiles where voting
+  # is off — the all-cli default.yaml, or any temperature-rejecting deepdive.)
+  min_pre_confidence: 0.6           # drop s4 findings with self-rated confidence below this
+  require_evidence: true            # drop findings missing source_ref or sink_ref (data flow unproven)
+  # Legacy: these two knobs used to live under `step6_verify`. s5 still reads
+  # there as a fallback for older configs.
+
+step6_verify:                       # adversarial verification (one verifier per finding)
+  parallel: 5                       # concurrent verifier subprocesses (429 backoff is automatic)
+  min_confidence: 7                 # TRUE_POSITIVE below this → dropped as UNCONFIRMED
+  max_budget_usd: 10.0              # per-finding agentic budget cap
+  max_turns: 30                     # THIS to cap via:sdk / via:openai verifier loop
+  allowed_tools:
+    - Read
+    - Glob
+    - Grep
+
+step7_dedup:                        # deduplication (deterministic + semantic)
+  line_tolerance: 3                 # trivial-dup line distance (was 10 — too wide; collapsed distinct sinks in same method)
+  semantic: true                    # set false to skip the LLM dedup pass
+  max_tokens: 64000
+
+step8:
+  max_tokens: 64000
+  timeout: 3600                     # seconds; chain pass on large finding sets can exceed the 600s CLI default
+
+step_remediate:                     # Remediation Agent — ON by default. Set `enabled: false` to opt out (`--remediate` forces on).
+  enabled: true
+  enforce_policy: false             # opt-in: deny-list/playbook gate + diff post-gate (revert forbidden-path edits)
+  # policy_file:  null              # override path to remediation_policy.yaml (default: shipped repo-root inputs/)
+  # playbook_file: null             # override path to remediation_playbook.yaml (default: shipped repo-root inputs/)
+
+  top_n_findings: 20                # top-N by CVSS — bounds cost on large reports (source of truth; --top N overrides ad-hoc; set 'all'/'*'/null to remediate EVERY finding)
+  max_budget_usd: 10.0              # per-repo soft cap (token accounting via TOKENS.phase)
+  max_turns: 40                     # tool-loop cap (via:sdk / via:openai)
+  allowed_tools:                    # fix mode needs file-write — Edit/Write are
+                                    # used instead of Bash so the agent can apply
+                                    # diffs without a host shell. cwd-confined.
+    - Read
+    - Glob
+    - Grep
+    - Edit
+    - Write
+
+step_validate:                      # s11 validator — ON by default (mirrors step_remediate). Set `enabled: false` to opt out.
+  enabled: true
+  effort: high
+  max_turns: 50
+  max_budget_usd: 15.0
+  max_findings: 20                  # top-N validatable (awaiting_validation / needs_review / validation_failed) by CVSS; --all bypasses, --finding ignores
+  allowed_tools:                    # reviewer-persona tools for inspecting remediated code (read-only). Bash is not available in validation sessions; Write/Edit/Agent always denied.
+    - Read
+    - Grep
+    - Glob
+
+inject:
+  cve_file:       ./inputs/known_cves.json
+  controls_file:  ./inputs/design_controls.yaml
+  # Single CMDB export. Optional: if unset or the file is absent, VulContextSeverity environmental scoring is skipped
+  # (CVSS base + OffensivePriority are still computed). No legacy fallback.
+  
+  cmdb_file:      ./inputs/cmdb.csv
+  policy_file:    ./inputs/remediation_policy.yaml              # override path to remediation_policy.yaml (default: shipped repo-root inputs/)
+  playbook_file:  ./inputs/remediation_playbook.yaml             # override path to remediation_playbook.yaml (default: shipped repo-root inputs/)
+
+
+batch:
+  # PAT for cloning private repos over HTTPS in --repo-file mode.
+  # Injected as https://x-access-token:<PAT>@host/org/repo.git
+  # Leave blank to fall back to git's own credential helper / SSH.
+  git_token: ${GITHUB_TOKEN}
+  # Base clone URL used when a .csv batch row supplies only (AppID, RepoName).
+  # RepoName is the full repo slug → {git_base_url}/{RepoName}.git
+  git_base_url: ${GIT_BASE_URL}
+  # Rows whose RepoName matches any of these case-insensitive globs are
+  # dropped at parse time — never cloned, never scanned. Use for UI-test /
+  # automation / perf harnesses that have no production attack surface.
+  skip_repo_patterns:
+    - "*automation*"
+    - "*-playwright*"
+    - "*-selenium*"
+    - "*-karate*"
+    - "*perf-script*"
+    - "*perf-test*"
+    - "*test-buddy*"
+    - "*-e2e*"
+    - "*-mock-*"
+
+output:
+  # Folders inside the clone kept when source is purged after a scan (the
+  # cloned source is deleted unless --keep-clones). Checkpoints live in
+  # $VVAHARNESS_STATE_DIR (~/.vvaharness/state), not the clone, so --resume
+  # is unaffected by cleanup.
+  preserve_on_cleanup: [security-scan, security-remediation]

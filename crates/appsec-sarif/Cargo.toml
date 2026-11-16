@@ -1,0 +1,22 @@
+[package]
+name = "appsec-sarif"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+appsec-model = { path = "../appsec-model" }
+appsec-cwe = { path = "../appsec-cwe" }
+appsec-validation-scoring = { path = "../appsec-validation-scoring" }
+appsec-pathjail = { path = "../appsec-pathjail" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha1 = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }

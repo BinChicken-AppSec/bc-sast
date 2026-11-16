@@ -1,0 +1,67 @@
+# syntax=docker/dockerfile:1
+#
+# The CI check environment, runnable locally. This is NOT the shipped image --
+# that is `Dockerfile`, which builds the scanner binary and nothing else.
+#
+# Why this exists: the coverage gates are platform-sensitive. The workspace
+# gate requires 100% functions and counts fewer generic instantiations on
+# macOS than on Linux, so it fails on a developer machine and passes on the
+# runner. `appsec-enrich/src/cmdb.rs` has a documented macOS-only gap for the
+# same reason. The result was that "green locally" meant nothing for the one
+# gate that is hardest to satisfy, and CI minutes were being spent discovering
+# what a Linux container could have said in advance.
+#
+# The toolchain is pinned by `rust-toolchain.toml` (1.100.0), which rustup
+# honours automatically inside this image. That pin is load-bearing: the same
+# commit passed under 1.99.1 and failed under 1.100.0 with no code change,
+# because coverage comes from rustc's own bundled LLVM. An image on a
+# different rustc would reproduce nothing.
+FROM rust:1.100.0-slim-bookworm
+
+# Build-time requirements of `aws-lc-sys`, which `reqwest` pulls in via
+# rustls's default crypto provider. Same set and same reasoning as the
+# builder stage in `Dockerfile`; see the long comment there.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      clang libclang-dev cmake pkg-config perl \
+      git ca-certificates \
+      python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup component add rustfmt clippy llvm-tools
+
+# Deliberately unpinned, because CI installs these the same way
+# (`taiki-e/install-action` with no version) and a pin here would drift from
+# what CI actually runs -- which is the one thing this image exists to match.
+# Neither tool ships in any artifact; they run and are discarded.
+RUN cargo install cargo-llvm-cov --locked \
+    && cargo install cargo-deny --locked
+
+# The repository is bind-mounted here at run time. The target directory is a
+# separate named volume mounted over `/work/target-linux`, so a Linux build
+# never shares object files with the host's macOS `target/` -- sharing one
+# directory across two targets means every switch triggers a full rebuild.
+# One difference from CI that is left in deliberately: on an Apple Silicon
+# host this builds linux/arm64, while the runner is linux/amd64. The gap this
+# image exists to close is macOS vs Linux -- the `cmdb.rs` exception is gated
+# on `target_os`, not on architecture -- and the workspace contains no
+# `target_arch` cfg at all, so coverage does not move with it. Forcing
+# --platform=linux/amd64 would match the runner exactly at the cost of QEMU
+# emulation for every compile, which is not worth it unless architecture-
+# specific code is ever introduced.
+# The container runs as the HOST user, not root, which `scripts/checks.sh`
+# arranges with --user. This is not a hardening nicety, it is required for the
+# coverage numbers to mean anything: several tests probe whether a 0o000 file
+# is actually unreadable (`permissions_enforced` in appsec-target-tests) and
+# skip themselves when it is not. Root reads such a file happily, so running
+# as root skips those tests and reports lines as uncovered that CI -- which
+# runs as a normal user -- covers. A root container is a WORSE proxy for CI
+# than no container at all, because it fails for reasons CI never will.
+#
+# CARGO_HOME and CARGO_TARGET_DIR are pointed at host-owned directories under
+# /work/.docker at run time, so an arbitrary uid can write them. The tools
+# installed above stay reachable because /usr/local/cargo/bin is on PATH from
+# the base image, independent of CARGO_HOME.
+WORKDIR /work
+ENV CARGO_TERM_COLOR=never
+
+CMD ["bash"]
